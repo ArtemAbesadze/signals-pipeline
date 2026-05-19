@@ -1,30 +1,60 @@
 # Potion Perps Bot
 
-Automated trading pipeline that takes signals from the Potion Perps Discord bot, parses them in real-time, and executes perpetual futures trades on Hyperliquid with configurable strategy presets and risk controls.
+Multi-user automated trading service that ingests Potion Perps signals from Discord, parses them in real time, and executes perpetual futures trades on Hyperliquid on behalf of each registered user — with per-user strategy presets, encrypted credentials, risk guardrails, and a Telegram bot for onboarding, configuration, approval, and monitoring.
 
-**Status:** Phase 2 complete — fully functional on testnet. End-to-end verified: signal ingestion, order execution, lifecycle management, position sync, and risk guardrails all working.
+**Status:** Phase 4 complete — multi-user pipeline, Discord signal ingestion, encrypted per-user credentials, full Telegram bot UI, admin REST API, Docker deploy, ~370 tests. **Testnet only** (mainnet registration is intentionally blocked).
 
 ---
 
-## How It Works
+## Architecture
 
 ```
-Discord Signal → Input Adapter → Classifier → Parser → Risk Gate → Position Sizer
-    → Order Builder → Position Manager → Hyperliquid API
-                                              ↓
-                                        SQLite Database
+Discord (Potion Perps)
+        │
+        ▼
+┌─────────────────┐
+│ Discord Adapter │  (one process, listens to one channel + source bot)
+└────────┬────────┘
+         │  asyncio.Queue
+         ▼
+┌──────────────────────────────────────────────────────────────┐
+│                       Orchestrator                           │
+│  one signal in → fan out to every active user pipeline       │
+│                                                              │
+│  ├── User Pipeline (alice) ─→ Hyperliquid (alice's creds)    │
+│  ├── User Pipeline (bob)   ─→ Hyperliquid (bob's creds)      │
+│  └── User Pipeline (…)     ─→ Hyperliquid (…)                │
+└────────────────────┬─────────────────────────────────────────┘
+                     │
+        ┌────────────┼────────────┬────────────┬────────────┐
+        ▼            ▼            ▼            ▼            ▼
+   SQLite        Telegram     Admin REST    Health      PnL +
+   (state +     Bot (users)   API (8081)    (8080)      Expiry
+   encrypted                                             monitors
+   creds)
 ```
 
-1. A signal arrives (from CLI, file replay, or Discord)
-2. The **classifier** identifies the message type (new signal, TP hit, SL hit, cancel, etc.)
-3. The **parser** extracts structured data into typed dataclasses
-4. For new signals:
-   - **Risk gate** checks: max positions, daily loss limit, total exposure cap
-   - **Position sizer** calculates USD allocation based on balance, risk level, and preset
-   - **Order builder** creates entry + SL + TP orders using real exchange metadata
-   - **Position manager** submits to Hyperliquid and records everything in SQLite
-5. For lifecycle events (TP hit, stop hit, cancel, SL update):
-   - The pipeline updates orders on the exchange and DB state accordingly
+A single Discord adapter feeds one signal into the orchestrator, which dispatches it to each active user's pipeline. Each pipeline runs the same classify → parse → size → build → submit flow, but uses that user's credentials, config, and database scope. The Telegram bot is the user-facing layer for registration, approval, and monitoring; the admin REST API is the operator-facing layer for user management and emergency control.
+
+---
+
+## Components
+
+| Component | Responsibility |
+|-----------|---------------|
+| `main.py` | Loads config, wires the orchestrator, starts adapter / admin API / health / Telegram bot / background monitors, runs the main message loop, handles graceful shutdown. |
+| `src/orchestrator.py` | Multi-user fan-out. Manages per-user `Pipeline` contexts, activate/deactivate, pause/resume, kill switch. |
+| `src/pipeline.py` | Per-user signal processor. Classifies messages, dispatches to handlers, runs the size + risk + order-build + submit flow. |
+| `src/input/` | Signal source adapters: `discord` (live), `simulation` (file replay), `cli` (paste), `file` (stub). |
+| `src/parser/` | `classifier.py` (10 message types) and parsers that turn raw text into typed dataclasses (`ParsedSignal`, `TpHit`, `StopHit`, etc.). |
+| `src/strategy/position_sizer.py` | USD allocation based on balance, risk level, preset; pre-trade risk gate. |
+| `src/exchange/` | `HyperliquidClient` (SDK wrapper + retries + rate-limit handling), `order_builder` (signal → orders), `position_manager` (submit / cancel / close / move SL / startup sync). |
+| `src/state/` | SQLite. `TradeDatabase` (trades + orders, user-scoped) and `UserDatabase` (users, encrypted creds, per-user config, invite codes, Telegram admins). |
+| `src/crypto.py` | Fernet symmetric encryption for credentials at rest. |
+| `src/telegram/` | Telegram bot: registration flow, menu UI, approval callbacks, trade notifications, admin commands, PnL + expiry background monitors. |
+| `src/api/admin.py` | aiohttp REST API for user management and kill switch (port 8081, `X-API-Key` auth). |
+| `src/health.py` | Zero-dependency async HTTP health endpoint (port 8080). |
+| `src/utils/` | Structured logging (structlog → JSON), symbol mapping (Potion pair → Hyperliquid coin). |
 
 ---
 
@@ -36,143 +66,275 @@ pip install -r requirements.txt
 cp .env.example .env
 cp config/config.example.yaml config/config.yaml
 
-# Edit .env with your Hyperliquid credentials
-# Edit config/config.yaml with your strategy preferences
+# Edit .env with your secrets (see below)
+# Edit config/config.yaml with your input adapter and risk preferences
 
-# Run (simulation mode — replays sample signals)
+# Run
 python main.py
-
-# Run with a specific user ID
-python main.py alice
 
 # Run tests
 python -m pytest tests/ -v
 ```
 
-### Credentials (.env)
+### `.env` secrets
 
-```
+```bash
+# Hyperliquid (used by single-user fallback mode and admin operations)
 HL_ACCOUNT_ADDRESS=0x_your_master_account_address
 HL_API_WALLET=0x_your_api_wallet_address
 HL_API_SECRET=0x_your_api_wallet_private_key
+
+# Discord signal source
+DISCORD_BOT_TOKEN=your_discord_bot_token
+
+# Telegram bot (omit to run without Telegram)
+TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
+TELEGRAM_ADMIN_IDS=12345678,87654321
+
+# Admin REST API
+ADMIN_API_KEY=long_random_string
+ADMIN_API_PORT=8081
+
+# Credential encryption (auto-generated to data/.encryption_key if unset)
+ENCRYPTION_KEY=base64_fernet_key
 ```
 
-Hyperliquid uses a **master account + API wallet** architecture:
-- **Master account** — owns the funds, used for all queries
-- **API wallet** — only signs transactions on behalf of the master account
+Hyperliquid uses a **master account + API wallet** model:
+- **Master account** — owns the funds, used for all queries.
+- **API wallet** — only signs transactions on behalf of the master account.
+
+Per-user credentials submitted via Telegram registration are validated against Hyperliquid before being stored Fernet-encrypted in SQLite. The master `.env` credentials are only used in single-user fallback mode (when the user DB is empty).
 
 ---
 
-## Strategy Presets
+## Telegram Bot
 
-A "strategy" is just 3 settings — not a separate algorithm:
+The Telegram bot is the user-facing interface. Users only interact with the bot — they never touch the admin API or config files.
 
-| Setting | What it controls |
-|---------|-----------------|
-| `tp_split` | How much to close at each TP level (e.g. [0.33, 0.33, 0.34]) |
-| `move_sl_to_breakeven_after` | When to move SL to entry price (`tp1`, `tp2`, or `never`) |
-| `size_pct` | % of account balance per trade |
+### User onboarding
 
-### Built-in Presets
+1. Admin runs `/generate_code 30` and shares the resulting `PPB-XXXX-XXXX` code with a paying member.
+2. User sends `/register` to the bot in a DM.
+3. Multi-step `ConversationHandler` collects: invite code → master account address → API wallet address → API private key → network. Credential messages are deleted on receipt.
+4. Bot validates credentials against Hyperliquid, encrypts them, creates the user row, marks the code redeemed, and activates a pipeline for them.
+
+### Main menu
+
+`/menu` opens an inline-keyboard menu with screens:
+
+| Screen | Purpose |
+|--------|---------|
+| **Account** | Masked wallet info, network, subscription status, expiry, code used, "Renew Access" button. |
+| **Calls View** | Live feed of the last 10 signals (≤3 days old) as full signal cards. In manual-approve mode, each pending signal gets Approve / Reject buttons. The view auto-refreshes when new signals arrive. |
+| **Trading** | Balance, open positions (with close buttons), active trades (paginated), trade history (last 15). |
+| **Statistics** | Win rate, total / average / best / worst PnL %, wins / losses / breakeven counts. |
+| **Dashboard** | Pipeline status, preset, leverage cap, risk limits, expiry. |
+| **Configuration** | Change preset, toggle auto-execute, set max leverage, set risk limits, activate/deactivate the pipeline. |
+
+### Approval flow
+
+When `auto_execute` is **OFF**, new signals are recorded as `PENDING` and only surfaced as Approve/Reject buttons if the user is currently in Calls View (so push notifications never spam users who aren't actively monitoring). Approving rebuilds the order set from the stored trade and submits it. Rejecting marks the trade `CANCELED`.
+
+When `auto_execute` is **ON**, signals are submitted immediately and users receive informational push notifications (no buttons).
+
+### Push notifications
+
+Per-user notifications fire on: new signal, trade opened, trade failed, TP hit, all TPs hit, stop hit, trade canceled, trade closed, SL moved to breakeven, SL adjusted, PnL alert (±5% / -3%), signal skipped, risk warning, access expiry warnings (3d / 1d), expired.
+
+### Admin commands
+
+| Command | Description |
+|---------|-------------|
+| `/generate_code [days]` / `/generate_codes <count> [days]` | Generate single or batch invite codes. |
+| `/list_codes` / `/revoke_code <code>` | Inspect / revoke invite codes. |
+| `/users` | List all registered users with status, preset, expiry. |
+| `/extend <user_id> <days>` / `/revoke <user_id>` | Adjust user access. |
+| `/add_admin <id>` / `/remove_admin <id>` / `/list_admins` | Manage who can run admin commands. |
+| `/kill` / `/resume` | Emergency switch — cancels all orders, market-closes all positions across all users, blocks new signals until resumed. |
+| `/broadcast <message>` | Send a message to all active users. |
+| `/inject` | ⚠️ Testing only — inject synthetic signals into the pipeline using live testnet prices. |
+
+DM-only and per-user rate limiting (30 commands / 60s) are enforced via pre-processing middleware.
+
+---
+
+## Admin REST API
+
+`aiohttp` server on `ADMIN_API_PORT` (default 8081), authenticated via `X-API-Key`.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/api/users` | Create user (credentials + optional config). |
+| `GET` | `/api/users` | List users (filter by `?status=`). |
+| `GET` | `/api/users/{user_id}` | User detail (no secrets). |
+| `PUT` | `/api/users/{user_id}` | Update display name / config / credentials. |
+| `POST` | `/api/users/{user_id}/activate` | Mark active + spin up pipeline. |
+| `POST` | `/api/users/{user_id}/deactivate` / `DELETE /api/users/{user_id}` | Mark inactive + tear down pipeline. |
+| `POST` | `/api/kill` | Kill switch — close everything, block new signals. |
+| `POST` | `/api/resume` | Resume signal processing after kill. |
+
+---
+
+## Configuration
+
+Two sources of truth:
+- `.env` — secrets only (HL credentials, Discord/Telegram tokens, admin API key, encryption key).
+- `config/config.yaml` — non-secret defaults (input adapter, risk limits, logging, network). Per-user values override these from the `user_config` table.
+
+### Strategy presets
+
+A "strategy" is just three settings: `tp_split`, `move_sl_to_breakeven_after`, `size_pct`. Built-in presets:
 
 | Preset | TP Split | SL to BE | Size % | Description |
 |--------|----------|----------|--------|-------------|
-| `runner` | 33/33/34 | After TP1 | 2% | Default — let winners run |
-| `conservative` | 100/0/0 | Never | 2% | Close everything at TP1 |
-| `tp2_exit` | 50/50/0 | After TP1 | 2% | Exit fully at TP2 |
-| `tp3_hold` | 0/0/100 | After TP1 | 2% | Hold everything for TP3 |
-| `breakeven_filter` | 33/33/34 | After TP1 | 1.5% | Smaller size, same split |
-| `small_runner` | 33/33/34 | After TP1 | 0.5% | Minimal risk runner |
+| `runner` | 33 / 33 / 34 | After TP1 | 2% | Default — let winners run. |
+| `conservative` | 100 / 0 / 0 | Never | 2% | Close everything at TP1. |
+| `tp2_exit` | 50 / 50 / 0 | After TP1 | 2% | Exit fully at TP2. |
+| `tp3_hold` | 0 / 0 / 100 | After TP1 | 2% | Hold everything for TP3. |
+| `breakeven_filter` | 33 / 33 / 34 | After TP1 | 1.5% | Smaller size, same split. |
+| `small_runner` | 33 / 33 / 34 | After TP1 | 0.5% | Minimal risk runner. |
 
-### Custom Presets (config.yaml)
+Custom presets are defined in `config.yaml` and override built-ins with the same name. Each user can also override `size_pct` per risk level via `size_by_risk` (e.g. `LOW: 4.0`, `MEDIUM: 2.0`, `HIGH: 1.0`).
 
-```yaml
-strategy_presets:
-  my_strategy:
-    tp_split: [0.5, 0.3, 0.2]
-    move_sl_to_breakeven_after: tp1
-    size_pct: 1.5
+### Risk controls (enforced before every new trade)
 
-strategy:
-  active_preset: my_strategy
-  auto_execute: true
-```
+| Guard | Config key | Default | What it does |
+|-------|-----------|---------|--------------|
+| Max open positions | `risk.max_open_positions` | 10 | Reject new trades when reached. |
+| Daily loss circuit breaker | `risk.max_daily_loss_pct` | 10% | Stop trading when cumulative daily losses exceed threshold. |
+| Total exposure cap | `risk.max_total_exposure_usd` | $2,000 | Cap combined USD across all open positions. |
+| Max position size | `risk.max_position_size_usd` | $500 | Per-trade USD cap. |
+| Min order value | `risk.min_order_usd` | $10 | Hyperliquid minimum notional. |
+| Leverage cap | `strategy.max_leverage` | 20× | `min(signal_leverage, config_max, exchange_max)`. |
 
----
-
-## Risk Controls
-
-All enforced automatically before every trade:
-
-| Guard | Config Key | Default | What it does |
-|-------|-----------|---------|-------------|
-| Max open positions | `risk.max_open_positions` | 10 | Rejects new trades when limit reached |
-| Daily loss circuit breaker | `risk.max_daily_loss_pct` | 10% | Stops all trading if cumulative daily losses exceed threshold |
-| Total exposure cap | `risk.max_total_exposure_usd` | $2,000 | Caps combined USD across all open positions |
-| Max position size | `risk.max_position_size_usd` | $500 | Per-trade USD cap |
-| Min order value | `risk.min_order_usd` | $10 | Hyperliquid's minimum notional |
-| Leverage cap | `strategy.max_leverage` | 20x | Overrides signal leverage (also capped by exchange per-asset max) |
+Per-user values override these defaults via the Telegram Configuration menu.
 
 ---
 
-## Supported Message Types
+## Signal Handling
 
-The parser handles all 10 message types from the Potion Perps Discord bot:
+### Supported message types
 
-| Type | Action | Example |
-|------|--------|---------|
-| `SIGNAL_ALERT` | Parse, size, build orders, execute | New trade signal with entry/SL/TP |
-| `TP_HIT` | Log, optionally move SL to breakeven | "TP TARGET 1 HIT" |
-| `ALL_TP_HIT` | Mark trade closed with profit | "ALL TAKE-PROFIT TARGETS HIT" |
-| `BREAKEVEN` | Move SL to entry price | "BREAK EVEN HIT AFTER TP1" |
-| `STOP_HIT` | Mark trade closed with loss | "STOP TARGET HIT" |
-| `CANCELED` | Cancel orders, close position | "Trade #1268 Canceled" |
-| `TRADE_CLOSED` | Market-close remaining position | "TRADE CLOSED OUT" |
-| `PREPARATION` | Log only — do NOT execute | "Trade #1284 Incoming..." |
-| `MANUAL_UPDATE` | Detect SL moves, otherwise log | "Move SL to 1985" or free-text |
-| `NOISE` | Ignore | Bot pings, announcements |
+| Type | Action |
+|------|--------|
+| `SIGNAL_ALERT` | Parse → size → build orders → submit (or record as pending if auto-execute is off). |
+| `TP_HIT` | Notify + optionally move SL to breakeven. |
+| `ALL_TP_HIT` | Mark trade closed with profit. |
+| `BREAKEVEN` | Move SL to entry price. |
+| `STOP_HIT` | Mark trade closed with loss. |
+| `CANCELED` | Cancel orders, market-close any position. |
+| `TRADE_CLOSED` | Market-close remaining position. |
+| `PREPARATION` | Log only — do NOT execute (heads-up message). |
+| `MANUAL_UPDATE` | Detect SL moves (`Move SL to 1985`, `SL → 0.025`, etc.), otherwise log. |
+| `NOISE` | Ignore. |
 
-### Dynamic SL Adjustment
+### Symbol mapping
 
-Manual update messages are parsed for SL-move instructions:
-- "Move SL to 1985"
-- "Adjust stop loss to 0.025"
-- "New SL: 510.5"
-- "SL → 0.178"
-
-If detected, the bot cancels the old SL order and places a new one at the specified price.
-
----
-
-## Symbol Mapping
-
-110+ pairs mapped from Potion Perps format to Hyperliquid format:
+110+ pairs mapped from Potion Perps format to Hyperliquid coin names:
 
 | Pattern | Example | Handling |
 |---------|---------|----------|
-| Direct 1:1 | ETH/USDT → ETH | Strip /USDT |
-| Kilo-prefix | 1000BONK/USDT → kBONK | Convert 1000X to kX |
-| Bare meme coins | BONK/USDT → kBONK | Override table |
-| Rebrands | MATIC/USDT → POL, FTM/USDT → S | Override table |
+| Direct 1:1 | `ETH/USDT` → `ETH` | Strip `/USDT`. |
+| Kilo-prefix | `1000BONK/USDT` → `kBONK` | Convert `1000X` to `kX`. |
+| Bare meme coins | `BONK/USDT` → `kBONK` | Explicit override. |
+| Rebrands | `MATIC/USDT` → `POL`, `FTM/USDT` → `S` | Explicit override. |
 
-Validated against live exchange metadata at runtime. Assets not listed on Hyperliquid (e.g. BCH, CRV, DOT) are caught and rejected with a clear error.
+Validated against live exchange metadata at runtime. Assets not listed on Hyperliquid are caught and rejected with a clear error.
 
----
+### Startup position sync
 
-## Position Sync (Restart Recovery)
-
-On startup, the bot reconciles local DB state with the actual exchange:
+On startup, every active user's pipeline reconciles its local DB state with the actual exchange:
 
 | Scenario | Action |
 |----------|--------|
-| OPEN in DB, position exists | Verified — no change |
-| OPEN in DB, no position | Marked CLOSED (SL/TP filled while offline) |
-| PENDING in DB, entry still resting | Verified — no change |
-| PENDING in DB, position exists | Promoted to OPEN (filled while offline) |
-| PENDING in DB, no order/position | Marked CANCELED (expired while offline) |
-| Position on exchange, no DB record | Logged as orphan warning |
+| `OPEN` in DB, position exists on exchange | Verified — no change. |
+| `OPEN` in DB, no position | Marked `CLOSED` (SL/TP filled while offline). |
+| `PENDING` in DB, entry still resting | Verified — no change. |
+| `PENDING` in DB, position exists | Promoted to `OPEN` (filled while offline). |
+| `PENDING` in DB, no order / no position | Marked `CANCELED` (expired while offline). |
+| Position on exchange, no DB record | Logged as orphan (never auto-managed). |
 
-Conservative approach — only updates DB state, never auto-opens or auto-closes positions during sync.
+Conservative — only updates DB state, never auto-opens or auto-closes positions during sync.
+
+---
+
+## Multi-User Model
+
+Every runtime component is instance-scoped — no globals.
+
+| Component | Scope |
+|-----------|-------|
+| `HyperliquidClient` | Per-user credentials and SDK clients. |
+| `Pipeline` | Per-user config, client, database. |
+| `TradeDatabase` | All queries filtered by `user_id`; composite PK `(user_id, trade_id)`. |
+| `PositionManager` | Per-user (carries client + DB). |
+| `TelegramNotifier` | Per-user (carries chat ID + calls-view checker). |
+| Parsers + order builder | Stateless pure functions. |
+| Input adapter | Single shared instance — one signal source for everyone. |
+
+Users share one SQLite file safely (WAL mode + composite keys). The orchestrator dispatches each incoming signal to every active user's pipeline in a try/except so one user's error never affects another.
+
+---
+
+## Database Schema
+
+One SQLite file (`data/trades.db` by default). Tables:
+
+**`trades`** — one row per signal
+```
+(user_id, trade_id) PRIMARY KEY
+pair, coin, side, risk_level, trade_type, size_hint
+entry_price, stop_loss, tp1, tp2, tp3
+leverage, signal_leverage, position_size_usd, position_size_coin
+status (preparing | pending | open | closed | canceled)
+created_at, updated_at, closed_at, close_reason, pnl_pct, notes
+```
+
+**`orders`** — one row per exchange order
+```
+id PRIMARY KEY AUTOINCREMENT
+trade_id, user_id  → FK to trades
+order_type (entry | stop_loss | tp1 | tp2 | tp3)
+coin, side, size, price, oid (Hyperliquid order ID)
+status (pending | submitted | filled | canceled | rejected)
+fill_price, created_at, updated_at
+```
+
+**`users`** — registered users
+```
+user_id PRIMARY KEY, display_name, status (active | inactive)
+created_at, updated_at
+```
+
+**`user_credentials`** — Fernet-encrypted secrets
+```
+user_id PRIMARY KEY → FK users
+account_address_enc, api_wallet_enc, api_secret_enc
+network, created_at, updated_at
+```
+
+**`user_config`** — per-user overrides
+```
+user_id PRIMARY KEY → FK users
+active_preset, auto_execute, max_leverage
+size_by_risk_json, custom_presets_json
+max_open_positions, max_daily_loss_pct,
+max_position_size_usd, max_total_exposure_usd, min_order_usd
+telegram_chat_id, invite_code, access_expires_at
+created_at, updated_at
+```
+
+**`invite_codes`**
+```
+code PRIMARY KEY, created_by, created_at
+duration_days, redeemed_by, redeemed_at, expires_at
+status (active | redeemed | revoked | expired)
+```
+
+**`telegram_admins`** — dynamically added admins
+```
+telegram_id PRIMARY KEY, added_by, created_at
+```
 
 ---
 
@@ -180,268 +342,139 @@ Conservative approach — only updates DB state, never auto-opens or auto-closes
 
 ```
 potion-perps-bot/
-├── main.py                           # Entry point — async main loop
-├── src/
-│   ├── pipeline.py                   # Core orchestrator — classify → parse → size → execute
-│   ├── config/
-│   │   └── settings.py               # YAML + .env loader, typed dataclasses, validation
-│   ├── exchange/
-│   │   ├── hyperliquid.py            # HyperliquidClient — wraps SDK Info + Exchange
-│   │   ├── order_builder.py          # ParsedSignal → Hyperliquid order params
-│   │   └── position_manager.py       # Submit, cancel, close, move SL, position sync
-│   ├── input/
-│   │   ├── base_adapter.py           # Abstract adapter interface (asyncio.Queue)
-│   │   ├── cli_adapter.py            # Paste signals into terminal
-│   │   ├── simulation_adapter.py     # Replay .txt files from a directory
-│   │   ├── file_adapter.py           # (stub) Watch folder for new files
-│   │   └── discord_adapter.py        # (stub) Discord bot listener
-│   ├── parser/
-│   │   ├── classifier.py             # 10-type MessageType enum + classify()
-│   │   ├── signal_parser.py          # TRADING SIGNAL ALERT → ParsedSignal
-│   │   └── update_parser.py          # All lifecycle events → typed dataclasses
-│   ├── state/
-│   │   ├── models.py                 # TradeRecord, OrderRecord, enums
-│   │   └── database.py               # SQLite wrapper — trades + orders, user-scoped
-│   ├── strategy/
-│   │   └── position_sizer.py         # Position sizing + risk gate (check_risk_limits)
-│   └── utils/
-│       └── symbol_mapper.py          # Potion pair → Hyperliquid coin (110+ mappings)
-├── tests/
-│   ├── test_classifier.py            # 33 tests — all 28 samples + edge cases
-│   ├── test_signal_parser.py         # 8 tests — 4 signals with all fields + errors
-│   ├── test_update_parser.py         # 38 tests — all update types + SL parsing + errors
-│   ├── test_symbol_mapper.py         # 62 tests — direct, kilo, rebrands, validation
-│   └── test_risk_controls.py         # 17 tests — position sizing + risk gate
-├── signals/
-│   └── samples/                      # 28 real Discord signal samples (all 10 types)
+├── main.py                              # Entry point — wires everything, runs the loop
+├── Dockerfile, docker-compose.yml       # Container deployment
+├── requirements.txt
 ├── config/
-│   ├── config.example.yaml           # Full config template with comments
-│   └── config.yaml                   # Active config (gitignored)
-├── .env.example                      # Credential template
-└── requirements.txt
+│   ├── config.example.yaml              # Template with comments
+│   └── config.yaml                      # Active config (gitignored)
+├── src/
+│   ├── orchestrator.py                  # Multi-user fan-out
+│   ├── pipeline.py                      # Per-user signal processor
+│   ├── crypto.py                        # Fernet encryption
+│   ├── health.py                        # Health endpoint
+│   ├── api/
+│   │   └── admin.py                     # Admin REST API
+│   ├── config/
+│   │   └── settings.py                  # YAML + .env loader, typed dataclasses, validation
+│   ├── exchange/
+│   │   ├── hyperliquid.py               # SDK wrapper + retries + rate-limit handling
+│   │   ├── order_builder.py             # ParsedSignal → Hyperliquid orders
+│   │   └── position_manager.py          # Submit / cancel / close / move SL / startup sync
+│   ├── input/
+│   │   ├── base_adapter.py              # Abstract interface
+│   │   ├── discord_adapter.py           # Live Discord listener
+│   │   ├── simulation_adapter.py        # Replay .txt files
+│   │   ├── cli_adapter.py               # Paste from terminal
+│   │   └── file_adapter.py              # (stub)
+│   ├── parser/
+│   │   ├── classifier.py                # 10 MessageType enum + classify()
+│   │   ├── signal_parser.py             # TRADING SIGNAL ALERT → ParsedSignal
+│   │   └── update_parser.py             # All lifecycle events → typed dataclasses
+│   ├── state/
+│   │   ├── models.py                    # TradeRecord, OrderRecord, enums
+│   │   ├── database.py                  # SQLite trades + orders, user-scoped
+│   │   └── user_db.py                   # Users, encrypted creds, config, invite codes
+│   ├── strategy/
+│   │   └── position_sizer.py            # Sizing + pre-trade risk gate
+│   ├── telegram/
+│   │   ├── bot.py                       # Application setup, handler registration
+│   │   ├── keyboards.py                 # Inline keyboard builders
+│   │   ├── formatters.py                # Message formatting helpers
+│   │   ├── middleware.py                # Auth, admin check, DM-only, rate limit, error handler
+│   │   ├── notifications.py             # TelegramNotifier — push trade events
+│   │   ├── expiry_checker.py            # Hourly background task — expiry + warnings
+│   │   ├── pnl_monitor.py               # 60s background task — PnL threshold alerts
+│   │   ├── invite_codes.py              # Code generation
+│   │   └── handlers/
+│   │       ├── help.py                  # /start, /help, /cancel, unknown
+│   │       ├── registration.py          # /register ConversationHandler
+│   │       ├── menu.py                  # Main menu + screen routing
+│   │       ├── account.py               # /balance, /positions, /status, /activate, /deactivate
+│   │       ├── trades.py                # /trades, /history, /stats, notes, sub-views
+│   │       ├── config.py                # /config, /preset, /auto, inline edits
+│   │       ├── approval.py              # Approve / Reject / Close Position callbacks
+│   │       └── admin.py                 # Invite codes, user management, kill, broadcast, /inject
+│   └── utils/
+│       ├── logger.py                    # structlog → JSON file + console
+│       └── symbol_mapper.py             # Potion pair → Hyperliquid coin (110+ mappings)
+├── tests/                               # ~370 tests across 24 files
+└── signals/
+    ├── samples/                         # Real Discord signal samples (all 10 types)
+    └── test/                            # End-to-end test fixtures
 ```
 
 ---
 
-## Database Schema
-
-Two tables, both scoped by `user_id` for multi-user isolation:
-
-**trades** — one row per signal trade
-```
-(user_id, trade_id) PRIMARY KEY
-pair, coin, side, risk_level, trade_type, size_hint
-entry_price, stop_loss, tp1, tp2, tp3
-leverage, signal_leverage, position_size_usd, position_size_coin
-status (pending → open → closed/canceled)
-created_at, updated_at, closed_at, close_reason, pnl_pct
-```
-
-**orders** — one row per exchange order
-```
-id PRIMARY KEY AUTOINCREMENT
-trade_id, user_id → FOREIGN KEY to trades
-order_type (entry, stop_loss, tp1, tp2, tp3)
-coin, side, size, price, oid (Hyperliquid order ID)
-status (pending → submitted → filled/canceled/rejected)
-fill_price, created_at, updated_at
-```
-
----
-
-## Multi-User Design
-
-Every component is instance-scoped with no global state:
-
-| Component | Isolation |
-|-----------|-----------|
-| HyperliquidClient | Per-user credentials and client instance |
-| Pipeline | Per-user config, client, and database |
-| TradeDatabase | All queries filtered by `user_id`; composite PK `(user_id, trade_id)` |
-| PositionManager | Scoped via client + database |
-| Parsers & Order Builder | Stateless pure functions |
-| Input Adapters | Instance-scoped queues |
-
-Multiple users can share the same SQLite database file safely. Each user gets their own `main.py` process with their own config.
-
----
-
-## Hyperliquid Integration Notes
-
-Lessons learned from testnet testing:
-
-- **szDecimals**: Each asset has a fixed number of size decimal places (e.g. ETH=4, ADA=0, ZK=0). Using the wrong precision causes "invalid size" rejection. Always fetch from `get_asset_meta()`.
-- **Price precision**: Hyperliquid uses 5 significant figures for prices. IOC close orders with too many decimals get "invalid price" rejection.
-- **Minimum notional**: $10 minimum per order (sz * mid_price, not limit_price).
-- **Trigger orders**: `triggerPx` must be a float, not a string. SL/TP orders use `{"trigger": {"triggerPx": float, "isMarket": True, "tpsl": "sl"|"tp"}}`.
-- **Portfolio margin**: USDC lives in the spot clearinghouse but is available for perps. Query both spot and perps state for the full balance picture.
-- **maxLeverage**: Per-asset from metadata. The bot caps leverage at `min(signal_leverage, config_max, exchange_max)`.
-
----
-
-## End-to-End Test Results (2026-02-11)
-
-Full pipeline verified on Hyperliquid testnet:
-
-| Step | Test | Result |
-|------|------|--------|
-| 1 | Connect, check balance ($999.96 USDC) | Pass |
-| 2 | Position sync on startup (clean state) | Pass |
-| 3 | Process ADA LONG — entry filled, SL + 3 TPs placed | Pass |
-| 4 | Verify exchange: 1 position, 4 resting orders | Pass |
-| 5 | Duplicate signal rejected | Pass |
-| 6 | Process ZK SHORT — second position opened | Pass |
-| 7 | 2 positions, 8 orders, $60 exposure tracked | Pass |
-| 8 | Cancel trade — 4 orders canceled, position market-closed | Pass |
-| 9 | Dynamic SL update — old SL canceled, new SL placed | Pass |
-| 10 | Close remaining position — orders canceled, position closed | Pass |
-| 11 | Restart sync — clean state, no orphans | Pass |
-
----
-
-## Implementation Progress
-
-### Phase 1: Foundation — Complete
-
-| Task | Description | Status |
-|------|-------------|--------|
-| 1.1 | Repo setup, scaffold, requirements | Done |
-| 1.2 | Input adapter interface + CLI adapter | Done |
-| 1.3 | Simulation adapter (replay signals from files) | Done |
-| 1.4 | Collect real signal samples (all message types) | Done — 28 samples |
-| 1.5 | Message classifier (10 types) | Done |
-| 1.6 | Signal parser (TRADING SIGNAL ALERT → 12 fields) | Done |
-| 1.7 | Update parser (TP hit, SL, breakeven, cancel, etc.) | Done |
-| 1.8 | Hyperliquid testnet connection + balance check | Done |
-| 1.9 | Order builder (uses exchange metadata for szDecimals) | Done |
-| 1.10 | Basic execution on testnet (entry + SL + TPs) | Done |
-| 1.11 | SQLite state persistence (multi-user isolated) | Done |
-| 1.12 | Config system (YAML + .env, typed dataclasses) | Done |
-| 1.13 | Unit tests for parsers (68 tests) | Done |
-
-### Phase 2: Strategy Engine & Full Lifecycle — Complete
-
-| Task | Description | Status |
-|------|-------------|--------|
-| 2.1 | Strategy presets (6 built-in + user-defined) | Done |
-| 2.2 | Position sizer (balance-based, risk-level overrides) | Done |
-| 2.3 | Pipeline orchestrator (classify → parse → size → build → submit) | Done |
-| 2.4 | Dynamic SL adjustment (move_stop_loss + manual update parsing) | Done |
-| 2.5 | Trade cancellation (cancel orders + close position) | Done |
-| 2.6 | Symbol mapper (110+ pairs, rebrands, kilo-prefix) | Done |
-| 2.7 | Position sync on startup (survive restarts) | Done |
-| 2.8 | Risk controls (daily loss breaker, exposure cap, 158 tests) | Done |
-
-### Phase 3A: Server-Ready Pipeline — Next
-
-Make the existing pipeline deployable and reliable on a server.
-
-| Task | Description |
-|------|-------------|
-| 3A.1 | Graceful shutdown & signal handling (SIGTERM, SIGINT) |
-| 3A.2 | Retry logic for exchange API calls (transient failures, rate limits) |
-| 3A.3 | Health check endpoint (simple HTTP — "am I alive?") |
-| 3A.4 | Structured logging (JSON format for server log aggregation) |
-| 3A.5 | Docker container + docker-compose for deployment |
-
-### Phase 3B: Multi-User Architecture
-
-Fan-out layer so one signal source serves all users.
-
-| Task | Description |
-|------|-------------|
-| 3B.1 | Per-user config stored in DB (replace per-user YAML files) |
-| 3B.2 | Encrypted credential storage (user API keys at rest) |
-| 3B.3 | User registry: add/remove/activate/deactivate users |
-| 3B.4 | Multi-user orchestrator: one signal → dispatch to all active user pipelines |
-| 3B.5 | Discord adapter: connect to Potion Perps channel, feed signals into the system |
-
-### Phase 4: Telegram Bot
-
-User-facing interface for trade management.
-
-| Task | Description |
-|------|-------------|
-| 4.1 | Bot setup + user registration flow |
-| 4.2 | Credential onboarding ("paste your HL API key") |
-| 4.3 | Strategy configuration via Telegram (preset picker, custom params) |
-| 4.4 | Signal notifications with approve/reject buttons |
-| 4.5 | Three execution modes: manual approval, preset auto, full auto |
-| 4.6 | Status commands: /balance, /trades, /pnl, /exposure |
-| 4.7 | Admin commands: /kill (emergency stop), /users |
-
-### Phase 5: Polish & Mainnet
-
-| Task | Description |
-|------|-------------|
-| 5.1 | Mainnet migration with safety checks |
-| 5.2 | Rate limiting & abuse prevention |
-| 5.3 | Database backup/restore |
-| 5.4 | CI/CD pipeline |
-| 5.5 | Monitoring dashboard (optional) |
-
----
-
-## Production Architecture
-
-```
-Discord (Potion Perps) → [Signal Ingestion Service] → Signal Queue
-                                                          ↓
-                                              ┌──── User Pipeline (alice) ──→ Hyperliquid
-                                              ├──── User Pipeline (bob)   ──→ Hyperliquid
-                                              └──── User Pipeline (...)   ──→ Hyperliquid
-                                                          ↕
-                                                   Telegram Bot
-                                              (notifications, config, approval)
-```
-
-- **Signal source**: One process scrapes/receives Potion Perps signals from Discord
-- **Multi-user dispatch**: Each signal fans out to every active user's pipeline
-- **Per-user pipeline**: Exactly what we built (Phase 1-2), running per-user with their own config and credentials
-- **Telegram bot**: User-facing interface for onboarding, strategy config, trade approval, and monitoring
-- **Server**: Everything runs on a VPS via Docker, always on
-
----
-
-## Test Suite
-
-158 tests, all passing (~0.1s):
-
-```
-tests/test_classifier.py       — 33 tests (all 28 samples + 5 edge cases)
-tests/test_signal_parser.py    — 8 tests (4 signals with all 12 fields + 4 error cases)
-tests/test_update_parser.py    — 38 tests (all update types + SL parsing + error cases)
-tests/test_symbol_mapper.py    — 62 tests (direct, kilo, rebrands, validation, edge cases)
-tests/test_risk_controls.py    — 17 tests (position sizing + risk gate)
-```
+## Testing
 
 ```bash
 python -m pytest tests/ -v
 ```
 
+~370 tests, all passing. Coverage by area:
+
+| Area | Files |
+|------|-------|
+| Parsing & symbol mapping | `test_classifier.py`, `test_signal_parser.py`, `test_update_parser.py`, `test_symbol_mapper.py` |
+| Strategy & risk | `test_risk_controls.py` |
+| State & encryption | `test_user_db.py`, `test_crypto.py`, `test_invite_codes.py` |
+| Exchange & retries | `test_retry.py` |
+| Orchestrator & pipeline | `test_orchestrator.py`, `test_e2e_pipeline.py` (40 cases — full pipeline with mocked exchange) |
+| Telegram | `test_notifications.py`, `test_approval.py`, `test_admin_commands.py`, `test_pnl_monitor.py`, `test_trade_notes.py`, `test_expiry_enforcement.py` |
+| API & infra | `test_admin_api.py`, `test_health.py`, `test_logging.py`, `test_discord_adapter.py` |
+| Hardening | `test_step12_hardening.py` |
+
+---
+
+## Docker Deployment
+
+```bash
+docker compose up -d --build
+```
+
+- Built on `python:3.12-slim` with a stdlib-based `HEALTHCHECK`.
+- Mounts `config/`, `data/`, `logs/`, and `signals/incoming/` from the host.
+- Exposes the health endpoint (`HEALTH_PORT`, default 8080) and admin REST API (`ADMIN_API_PORT`, default 8081).
+- `restart: unless-stopped`, `stop_grace_period: 10s`.
+- Logs rotate at 10 MB × 5 backups (configured in `src/utils/logger.py`).
+
+The bot handles `SIGTERM` / `SIGINT` and shuts down components in order: PnL monitor → expiry checker → Telegram bot → admin API → health server → orchestrator (per-user cleanup) → user DB.
+
+---
+
+## Hyperliquid Integration Notes
+
+Lessons baked into the code:
+
+- **szDecimals**: Each asset has a fixed number of size decimal places (e.g. ETH=4, ADA=0, ZK=0). Sizes are **floored** (not rounded) to the per-asset precision from `get_asset_meta()`.
+- **Price precision**: 5 significant figures, enforced via `_round_price()`.
+- **Minimum notional**: $10 per order (size × mid price, not limit price).
+- **Trigger orders**: `triggerPx` must be a float. SL/TP use `{"trigger": {"triggerPx": float, "isMarket": True, "tpsl": "sl" | "tp"}}`.
+- **Portfolio margin**: USDC lives in the spot clearinghouse but is available for perps; `get_balance()` queries both.
+- **maxLeverage**: Per-asset cap from metadata. Effective leverage is `min(signal_leverage, config_max_leverage, exchange_max_leverage)`.
+- **Retries**: Transient errors and rate-limit responses (`429`, `"rate limit"`, `"too many requests"`) are retried with exponential backoff + jitter.
+
 ---
 
 ## Changelog
 
+**2026-02-26 — Phase 4 complete**
+- Full Telegram bot UI: menu, registration with invite codes, calls view with approve/reject, trading sub-views, statistics, dashboard, configuration, trade notes, user-initiated renewal.
+- Per-user trade notifications, PnL threshold alerts (+5% / -3%), access expiry warnings (3d / 1d).
+- Admin Telegram commands: invite codes, users, extend/revoke, kill switch, broadcast, dynamic admin management, test signal injection.
+- Discord adapter wired to live channel. Multi-user orchestrator dispatches each signal to every active pipeline.
+- Encrypted credential storage (Fernet) and admin REST API for user CRUD + kill switch.
+- Hardening: DM-only filter, per-user rate limit, global error handler, retry on transient errors, structured JSON logging, log rotation.
+- Mainnet registration intentionally blocked — testnet only for now.
+- ~370 tests passing.
+
 **2026-02-11 — Phase 2 complete, E2E verified**
-- End-to-end testnet run: signal → orders → lifecycle → cleanup all working
-- Fixed market close price rounding for low-price assets (5 sig figs)
-- Risk controls: daily loss circuit breaker, total exposure cap, consolidated risk gate
-- Position sync on startup: reconciles DB state with exchange after restart
-- Symbol mapper: 110+ pairs, rebrands (MATIC→POL, FTM→S), kilo-prefix, validation
-- Dynamic SL adjustment: parses "move SL to X" from manual updates
-- Pipeline orchestrator: full 10-type message handling with auto_execute support
-- Position manager: submit, cancel, close, move SL — all exchange operations
-- Strategy presets: 6 built-in + user-defined custom presets
-- 158 tests total
-
-**2026-02-10 — Phase 1 complete**
-- 68 unit tests covering classifier, signal parser, and all update parsers
-- Config system: YAML config + .env secrets → typed dataclasses with validation
-- SQLite state persistence: trades + orders, composite PK (user_id, trade_id)
-- Order builder using real exchange metadata (szDecimals, maxLeverage)
-- Full order flow validated on testnet: entry + SL + 3 TPs
-
-**2026-02-09 — Project scaffolded**
-- Input adapters (CLI + simulation), parser layer (10 types, 28 samples)
-- Hyperliquid testnet connection with portfolio margin support
+- Strategy presets (6 built-in + user-defined), position sizing with risk-level overrides.
+- Risk controls: daily loss circuit breaker, total exposure cap, consolidated risk gate.
+- Position sync on startup reconciles DB state with exchange after restart.
+- Symbol mapper: 110+ pairs, rebrands (MATIC→POL, FTM→S), kilo-prefix, validation.
+- Dynamic SL adjustment from manual update messages.
+- Full pipeline orchestrator with 10-type message handling and `auto_execute` support.
+- Market close price rounding fixed for low-price assets.
+- End-to-end testnet run verified: signal → orders → lifecycle → cleanup.
