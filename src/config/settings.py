@@ -47,6 +47,8 @@ class InputConfig:
     signals_dir: str = "signals/incoming/"
     simulation_dir: str = "signals/samples/"       # ⚠️ TESTING ONLY — used by simulation adapter
     simulation_delay_sec: float = 5.0               # ⚠️ TESTING ONLY — delay between replayed signals
+    shadow_mode: bool = False                       # capture-only — no trades, just archive messages
+    captures_dir: str = "signals/captures/"         # shadow-mode archive destination
 
 
 @dataclass

@@ -233,11 +233,82 @@ def _make_resume_callback(orchestrator: Orchestrator):
     return callback
 
 
+async def run_shadow(config: Config) -> None:
+    """Shadow-mode capture loop — listens to Discord, archives to disk.
+
+    No orchestrator, no pipelines, no Telegram bot, no admin API. Just
+    listen and record. Used to grow the sample corpus from CryptoPrinter's
+    channel without executing trades.
+
+    Until live Discord auth is wired up (Phase 4.1 of the rework), this
+    loop will run but capture nothing — samples are hand-fed during
+    parser development. The plumbing is in place so the eventual switch
+    is a config / token change, not new code.
+    """
+    logger = logging.getLogger(__name__)
+
+    shutdown_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, shutdown_event.set)
+
+    from src.input.discord_adapter import DiscordAdapter
+    from src.input.shadow_capture import ShadowCapture
+
+    if not config.discord.bot_token:
+        logger.warning(
+            "Shadow mode: DISCORD_BOT_TOKEN is empty — adapter will fail to "
+            "connect. This is expected until Phase 4.1 wires live Discord auth.",
+        )
+
+    adapter = DiscordAdapter(
+        bot_token=config.discord.bot_token,
+        channel_id=config.discord.channel_id,
+        source_bot_name=config.discord.source_bot_name,
+    )
+    capture = ShadowCapture(root=config.input.captures_dir)
+
+    logger.info(
+        "Shadow mode active: captures_dir=%s, filter='%s', channel=%s",
+        config.input.captures_dir,
+        config.discord.source_bot_name,
+        config.discord.channel_id or "<unset>",
+    )
+
+    adapter_task = asyncio.create_task(adapter.start())
+
+    try:
+        while not shutdown_event.is_set():
+            try:
+                raw = await asyncio.wait_for(adapter.queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            try:
+                capture.write(raw)
+            except Exception:
+                logger.exception("Shadow capture failed to write message")
+    finally:
+        logger.info("Shadow mode shutting down...")
+        adapter_task.cancel()
+        try:
+            await adapter_task
+        except asyncio.CancelledError:
+            pass
+        await adapter.stop()
+        logger.info(
+            "Shadow mode stopped. Captured %d messages this session.",
+            capture.captured,
+        )
+
+
 def main() -> None:
     """Parse args and run."""
     config = load_config()
     setup_logging(config.logging)
-    asyncio.run(run(config))
+    if config.input.shadow_mode:
+        asyncio.run(run_shadow(config))
+    else:
+        asyncio.run(run(config))
 
 
 if __name__ == "__main__":

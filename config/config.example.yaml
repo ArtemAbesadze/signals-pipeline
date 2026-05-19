@@ -7,6 +7,12 @@ input:
   signals_dir: signals/incoming/   # file adapter drop zone
   simulation_dir: signals/samples/ # replay directory for simulation adapter
   simulation_delay_sec: 5          # seconds between replayed signals
+  # Shadow mode: capture every Discord message verbatim to disk, NO trades.
+  # When true, only the Discord adapter + capture sink run; no orchestrator,
+  # no Telegram bot, no admin API. Used to grow a sample corpus from CP's
+  # channel during parser development.
+  shadow_mode: false
+  captures_dir: signals/captures/  # shadow-mode archive destination
 
 # --- Hyperliquid exchange ---
 # Credentials are in .env (HL_ACCOUNT_ADDRESS, HL_API_WALLET, HL_API_SECRET)

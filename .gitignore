@@ -186,6 +186,10 @@ data/.encryption_key
 # Logs
 logs/
 
+# Shadow-mode captures — ignore contents, keep dir
+signals/captures/*
+!signals/captures/.gitkeep
+
 # OS
 .DS_Store
 Thumbs.db
