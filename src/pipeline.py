@@ -54,6 +54,11 @@ _PORT_WARN_FRACTION = 0.95
 
 _TRADE_ID_RE = re.compile(r"#(\d{3,})")
 
+# Max length we'll store in trade_events.action_taken. Keeps the audit
+# table compact when an upstream error includes a long stack trace or
+# raw exchange-response blob (D6).
+_MAX_ACTION_TAKEN_LEN = 1000
+
 
 def _extract_trade_id_from_text(raw: str) -> int | None:
     """Best-effort extraction of a trade_id from any CP message.
@@ -62,8 +67,17 @@ def _extract_trade_id_from_text(raw: str) -> int | None:
     when the message contained ``#NNNN`` — even if the structured parser
     couldn't get further. Returns ``None`` if no match.
     """
+    if not isinstance(raw, str):
+        return None
     m = _TRADE_ID_RE.search(raw)
     return int(m.group(1)) if m else None
+
+
+def _truncate(s: str, limit: int = _MAX_ACTION_TAKEN_LEN) -> str:
+    """Trim *s* to *limit* chars, appending an ellipsis marker if cut."""
+    if len(s) <= limit:
+        return s
+    return s[: limit - len(" … (truncated)")] + " … (truncated)"
 
 logger = logging.getLogger(__name__)
 
@@ -359,6 +373,12 @@ class Pipeline:
             except OrderSubmissionError as e:
                 logger.error("Trade #%d submission failed: %s", signal.trade_id, e)
                 self._db.update_trade_status(signal.trade_id, TradeStatus.CANCELED, close_reason="submission_failed")
+                self._record_event(
+                    trade_id=signal.trade_id,
+                    event_type=EventType.ERROR,
+                    raw_text=raw,
+                    action_taken=f"submission failed: {e}",
+                )
                 if self._notifier:
                     self._notify(self._notifier.notify_trade_failed(
                         signal.trade_id, trade_set.coin, str(e),
@@ -769,13 +789,14 @@ class Pipeline:
         action_taken: str,
     ) -> None:
         """Persist a trade_events row. Failures are caught — audit
-        logging must never crash the pipeline."""
+        logging must never crash the pipeline. ``action_taken`` is
+        truncated to keep the audit table compact (D6)."""
         try:
             self._db.record_event(
                 trade_id=trade_id,
                 event_type=event_type,
                 raw_text=raw_text,
-                action_taken=action_taken,
+                action_taken=_truncate(action_taken) if action_taken else action_taken,
             )
         except Exception:
             logger.exception("Failed to record trade event")

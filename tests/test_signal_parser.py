@@ -199,6 +199,46 @@ class TestSignalParserEdgeCases:
         with pytest.raises(SignalParseError, match="TP"):
             parse_signal("PAIR: BTC/USDT #1234\n(LOW RISK)\nTYPE: SWING\nSIZE: 1-4%\nSIDE: LONG\nENTRY: 100\nSL: 90\nTP1: 110 (10%)\nLEVERAGE: 10x")
 
+    def test_malformed_entry_raises_signal_parse_error(self):
+        """D6: malformed numeric (multiple dots) must raise SignalParseError, not ValueError."""
+        msg = (
+            "TRADING SIGNAL ALERT\n\n"
+            "PAIR: BTC/USDT #9999\n(LOW RISK)\n\n"
+            "TYPE: SWING\nSIZE: 1-4%\nSIDE: LONG\n\n"
+            "ENTRY: 1.2.3.4\n"
+            "SL: 49000          (-2%)\n\n"
+            "TP1: 51000      (2%)\nTP2: 52000      (4%)\nTP3: 55000      (10%)\n\n"
+            "LEVERAGE: 10x"
+        )
+        with pytest.raises(SignalParseError, match="entry"):
+            parse_signal(msg)
+
+    def test_malformed_sl_raises_signal_parse_error(self):
+        msg = (
+            "TRADING SIGNAL ALERT\n\n"
+            "PAIR: BTC/USDT #9999\n(LOW RISK)\n\n"
+            "TYPE: SWING\nSIZE: 1-4%\nSIDE: LONG\n\n"
+            "ENTRY: 50000\n"
+            "SL: 1.2.3          (-2%)\n\n"
+            "TP1: 51000      (2%)\nTP2: 52000      (4%)\nTP3: 55000      (10%)\n\n"
+            "LEVERAGE: 10x"
+        )
+        with pytest.raises(SignalParseError, match="stop_loss"):
+            parse_signal(msg)
+
+    def test_malformed_tp_raises_signal_parse_error(self):
+        msg = (
+            "TRADING SIGNAL ALERT\n\n"
+            "PAIR: BTC/USDT #9999\n(LOW RISK)\n\n"
+            "TYPE: SWING\nSIZE: 1-4%\nSIDE: LONG\n\n"
+            "ENTRY: 50000\nSL: 49000          (-2%)\n\n"
+            "TP1: 5.1.0.0      (2%)\n"
+            "TP2: 52000      (4%)\nTP3: 55000      (10%)\n\n"
+            "LEVERAGE: 10x"
+        )
+        with pytest.raises(SignalParseError, match="TP1"):
+            parse_signal(msg)
+
     def test_discord_bold_markdown_stripped(self):
         """Bold markers (**) should be stripped without affecting field extraction."""
         msg = (

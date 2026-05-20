@@ -260,6 +260,33 @@ class TestClassifierEdgeCases:
         )
         assert classify(msg) == MessageType.STOP_HIT
 
+    def test_none_input_returns_noise(self):
+        """D6: classifier must never crash on None."""
+        assert classify(None) == MessageType.NOISE
+
+    def test_non_string_input_returns_noise(self):
+        """D6: classifier must never crash on bytes / int / list."""
+        assert classify(b"some bytes") == MessageType.NOISE
+        assert classify(12345) == MessageType.NOISE
+        assert classify(["a", "list"]) == MessageType.NOISE
+        assert classify({"a": "dict"}) == MessageType.NOISE
+
+    def test_whitespace_only_returns_noise(self):
+        assert classify("   ") == MessageType.NOISE
+        assert classify("\n\n\n") == MessageType.NOISE
+        assert classify("\t\t") == MessageType.NOISE
+
+    def test_huge_garbage_input_classifies_without_hanging(self):
+        """D6: 50K-char garbage shouldn't trigger catastrophic backtracking."""
+        garbage = "a" * 50_000
+        assert classify(garbage) == MessageType.NOISE
+
+    def test_emoji_only_input_returns_noise(self):
+        assert classify("🔥💎🚀" * 100) == MessageType.NOISE
+
+    def test_control_chars_dont_crash(self):
+        assert classify("\x00\x01\x02 something \x7f") == MessageType.NOISE
+
     def test_bare_url_in_prev_ref_stripped(self):
         """`(prev: https://...)` without angle brackets is stripped too."""
         msg = (

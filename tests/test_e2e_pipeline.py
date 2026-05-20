@@ -1216,3 +1216,98 @@ class TestAuditTrailEvents:
         assert err.trade_id == 99999  # extracted from #99999
         assert err.raw_text == bad
         assert "parse error" in err.action_taken
+
+
+# ====================================================================
+# D6 — Pipeline never crashes; keeps running after errors
+# ====================================================================
+
+
+class TestPipelineKeepsRunning:
+    """The pipeline must never crash on malformed input. Every bad message
+    writes an error event; subsequent good messages still process."""
+
+    def test_good_garbage_good_sequence(self, pipeline, db):
+        from src.state.models import EventType
+        # Good signal #1
+        pipeline.process_message(_load("signal_alert_06.txt"))  # ADA #1259
+        assert db.get_trade(1259) is not None
+
+        # Garbage — must not crash
+        pipeline.process_message("\x00 corrupt \x7f bytes nothing useful")
+        pipeline.process_message("PAIR: ??? entry: not-a-number")
+        pipeline.process_message("")
+
+        # Good signal #2 still processes normally
+        pipeline.process_message(_load("signal_alert_01.txt"))  # ZK #1286
+        assert db.get_trade(1286) is not None
+
+        # Trade #1 was not corrupted by the garbage
+        ada = db.get_trade(1259)
+        assert ada.pair == "ADA/USDT"
+
+    def test_ten_garbage_messages_dont_crash(self, pipeline, db):
+        from src.state.models import EventType
+        garbage_inputs = [
+            None,
+            "",
+            "   ",
+            "\x00\x01\x02",
+            "completely unrelated text",
+            "PAIR: BTC/USDT #5001 ENTRY: 1.2.3.4 SL: 5 TP1: 6 TP2: 7 TP3: 8 LEVERAGE: 5x TYPE: SWING SIZE: 1-4% SIDE: LONG (LOW RISK)",
+            "TP TARGET 1 HIT PAIR: BTC/USDT #5002 PROFIT: 1.2.3.4%",
+            "**STOP TARGET HIT** PAIR: BTC/USDT #5003 LOSS: 1.2.3%",
+            "🔥ALL TAKE-PROFIT TARGETS HIT PAIR: X/Y #5004 PROFIT: not.a.number%",
+            "Move SL to abc on trade #5005",
+        ]
+        for msg in garbage_inputs:
+            pipeline.process_message(msg)  # must not raise
+
+        # After all that garbage, a real signal still works
+        pipeline.process_message(_load("signal_alert_06.txt"))
+        assert db.get_trade(1259) is not None
+
+    def test_submission_failure_writes_error_event(self, client, tmpdir):
+        from src.state.models import EventType, TradeStatus
+        from src.exchange.position_manager import OrderSubmissionError
+
+        # Patch the exchange to raise on update_leverage (first step of submit_trade)
+        client.exchange.update_leverage.side_effect = OrderSubmissionError(
+            "exchange rejected: insufficient margin"
+        )
+
+        config = _make_config(tmpdir)
+        db = TradeDatabase(user_id="test_user", db_path=tmpdir / "test.db")
+        pipeline = Pipeline(config=config, client=client, db=db)
+
+        pipeline.process_message(_load("signal_alert_06.txt"))
+
+        # Trade was recorded then marked CANCELED
+        trade = db.get_trade(1259)
+        assert trade is not None
+        assert trade.status == TradeStatus.CANCELED
+        assert trade.close_reason == "submission_failed"
+
+        # Error event written with the reason
+        errors = db.get_events_for_user(event_type=EventType.ERROR)
+        assert len(errors) >= 1
+        err = errors[0]
+        assert "submission failed" in err.action_taken
+        assert "insufficient margin" in err.action_taken
+
+    def test_action_taken_truncated(self, pipeline, db):
+        from src.state.models import EventType
+        # Trigger a parse error with a huge raw message — action_taken is
+        # the short error string, but the truncation helper still applies.
+        # We use the truncation helper directly to verify behavior since
+        # the live error strings are already short.
+        from src.pipeline import _truncate
+        huge = "X" * 5000
+        out = _truncate(huge)
+        assert len(out) <= 1000
+        assert out.endswith(" … (truncated)")
+
+    def test_truncate_under_limit_unchanged(self):
+        from src.pipeline import _truncate
+        s = "short reason"
+        assert _truncate(s) == s

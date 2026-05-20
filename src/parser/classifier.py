@@ -71,12 +71,18 @@ def classify(raw_message: str) -> MessageType:
     Rules are ordered from most specific to least specific so that
     unambiguous patterns match first.
 
+    Defensive (D6): non-string or empty input returns NOISE rather than
+    raising. The pipeline must never crash on malformed input.
+
     Args:
         raw_message: The raw message text, potentially with Discord formatting.
 
     Returns:
         The identified MessageType.
     """
+    if not isinstance(raw_message, str) or not raw_message.strip():
+        return MessageType.NOISE
+
     text = _strip_markdown(raw_message).upper()
 
     # --- Noise (check first — fast reject) ---

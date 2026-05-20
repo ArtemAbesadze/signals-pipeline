@@ -66,6 +66,20 @@ class SignalParseError(Exception):
     """Raised when a required field cannot be extracted."""
 
 
+def _safe_float(value: str, field: str, error_cls=SignalParseError) -> float:
+    """Convert *value* to float, raising a typed parse error on failure.
+
+    The numeric regexes capture ``[\\d.]+`` / ``[+-]?[\\d.]+`` which can
+    match malformed numbers like ``1.2.3.4``. ``float()`` on those raises
+    ``ValueError`` — we want a parser-specific error class so the pipeline's
+    audit hook routes it correctly.
+    """
+    try:
+        return float(value)
+    except (ValueError, TypeError) as e:
+        raise error_cls(f"Could not parse {field} as a number: '{value}'") from e
+
+
 def parse_signal(raw_message: str) -> ParsedSignal:
     """Extract all fields from a TRADING SIGNAL ALERT message.
 
@@ -116,13 +130,13 @@ def parse_signal(raw_message: str) -> ParsedSignal:
     m = re.search(r"ENTRY[:\s]+([\d.]+)", text, re.IGNORECASE)
     if not m:
         raise SignalParseError("Could not extract entry price")
-    entry = float(m.group(1))
+    entry = _safe_float(m.group(1), "entry")
 
     # --- Stop Loss ---
     m = re.search(r"SL[:\s]+([\d.]+)", text, re.IGNORECASE)
     if not m:
         raise SignalParseError("Could not extract stop loss")
-    stop_loss = float(m.group(1))
+    stop_loss = _safe_float(m.group(1), "stop_loss")
 
     # --- Take Profit targets (in the TAKE PROFIT TARGETS section) ---
     # Match TP lines that have percentages (to distinguish from R:R lines)
@@ -131,7 +145,7 @@ def parse_signal(raw_message: str) -> ParsedSignal:
     )
     tp_map: dict[int, float] = {}
     for tp_num, tp_val in tp_matches:
-        tp_map[int(tp_num)] = float(tp_val)
+        tp_map[int(tp_num)] = _safe_float(tp_val, f"TP{tp_num}")
 
     if not all(k in tp_map for k in (1, 2, 3)):
         raise SignalParseError(

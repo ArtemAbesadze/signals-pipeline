@@ -3,7 +3,7 @@
 import re
 from dataclasses import dataclass
 
-from .signal_parser import _clean
+from .signal_parser import _clean, _safe_float
 
 
 class UpdateParseError(Exception):
@@ -151,7 +151,7 @@ def parse_tp_hit(raw: str) -> TpHit:
     m = re.search(r"PROFIT[:\s]+([+-]?[\d.]+)%", text, re.IGNORECASE)
     if not m:
         raise UpdateParseError("TP_HIT: could not extract profit %")
-    profit_pct = float(m.group(1))
+    profit_pct = _safe_float(m.group(1), "TP_HIT profit_pct", UpdateParseError)
 
     m = re.search(r"PERIOD[:\s]+(.+)", text, re.IGNORECASE)
     period = m.group(1).strip() if m else ""
@@ -171,7 +171,7 @@ def parse_all_tp_hit(raw: str) -> AllTpHit:
     m = re.search(r"PROFIT[:\s]+([+-]?[\d.]+)%", text, re.IGNORECASE)
     if not m:
         raise UpdateParseError("ALL_TP_HIT: could not extract profit %")
-    profit_pct = float(m.group(1))
+    profit_pct = _safe_float(m.group(1), "ALL_TP_HIT profit_pct", UpdateParseError)
 
     m = re.search(r"PERIOD[:\s]+(.+)", text, re.IGNORECASE)
     period = m.group(1).strip() if m else ""
@@ -205,7 +205,7 @@ def parse_stop_hit(raw: str) -> StopHit:
     m = re.search(r"LOSS[:\s]+([-\d.]+)%", text, re.IGNORECASE)
     if not m:
         raise UpdateParseError("STOP_HIT: could not extract loss %")
-    loss_pct = float(m.group(1))
+    loss_pct = _safe_float(m.group(1), "STOP_HIT loss_pct", UpdateParseError)
 
     return StopHit(pair=pair, trade_id=trade_id, loss_pct=loss_pct)
 
@@ -333,7 +333,8 @@ def parse_sl_update(raw: str) -> SlUpdate | None:
     for pat in patterns:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
-            return SlUpdate(trade_id=trade_id, new_price=float(m.group(1)))
+            new_price = _safe_float(m.group(1), "SL new_price", UpdateParseError)
+            return SlUpdate(trade_id=trade_id, new_price=new_price)
 
     return None
 

@@ -416,3 +416,45 @@ class TestSlUpdate:
 
     def test_unrelated_message_returns_none(self):
         assert parse_sl_update("Great job everyone, TP1 hit!") is None
+
+
+# ====================================================================
+# D6 — Defensive numeric parsing
+# ====================================================================
+
+
+class TestDefensiveNumericParsing:
+    """Malformed numeric values raise UpdateParseError, not ValueError."""
+
+    def test_tp_hit_with_malformed_profit(self):
+        msg = (
+            "✅ **TP TARGET 1 HIT**\n\n"
+            "PAIR: BTC/USDT #1234\n\n"
+            "💰PROFIT: 1.2.3.4%\n"
+            "⏳PERIOD: 1 minute"
+        )
+        with pytest.raises(UpdateParseError, match="profit_pct"):
+            parse_tp_hit(msg)
+
+    def test_all_tp_hit_with_malformed_profit(self):
+        msg = (
+            "🔥ALL TAKE-PROFIT TARGETS HIT\n\n"
+            "PAIR: BTC/USDT #1234\n\n"
+            "💰PROFIT: 1.2.3%\n"
+            "⏳PERIOD: 1h"
+        )
+        with pytest.raises(UpdateParseError, match="profit_pct"):
+            parse_all_tp_hit(msg)
+
+    def test_stop_hit_with_malformed_loss(self):
+        msg = (
+            "**STOP TARGET HIT**\n\n"
+            "PAIR: BTC/USDT #1234\n\n"
+            "LOSS: 1.2.3.4%"
+        )
+        with pytest.raises(UpdateParseError, match="loss_pct"):
+            parse_stop_hit(msg)
+
+    def test_sl_update_with_malformed_price(self):
+        with pytest.raises(UpdateParseError, match="new_price"):
+            parse_sl_update("Move SL to 1.2.3.4 on trade #1234")
