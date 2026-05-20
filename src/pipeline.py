@@ -36,8 +36,10 @@ from src.parser.update_parser import (
     parse_trade_closed,
     parse_trade_live,
 )
+import re
+
 from src.state.database import TradeDatabase
-from src.state.models import TradeRecord, TradeStatus
+from src.state.models import EventType, TradeRecord, TradeStatus
 from src.state.user_db import UserDatabase
 from src.strategy.position_sizer import (
     PositionSizeError,
@@ -49,6 +51,19 @@ from src.strategy.position_sizer import (
 # Port-vs-wallet warning threshold (D1): warn but continue if port is more
 # than this fraction of wallet, halt entirely if port > wallet outright.
 _PORT_WARN_FRACTION = 0.95
+
+_TRADE_ID_RE = re.compile(r"#(\d{3,})")
+
+
+def _extract_trade_id_from_text(raw: str) -> int | None:
+    """Best-effort extraction of a trade_id from any CP message.
+
+    Used by the error-event path so a parse failure still ties to a trade
+    when the message contained ``#NNNN`` — even if the structured parser
+    couldn't get further. Returns ``None`` if no match.
+    """
+    m = _TRADE_ID_RE.search(raw)
+    return int(m.group(1)) if m else None
 
 logger = logging.getLogger(__name__)
 
@@ -106,8 +121,20 @@ class Pipeline:
             handler(raw_message)
         except (SignalParseError, UpdateParseError) as e:
             logger.error("Parse error for %s: %s", msg_type.value, e)
+            self._record_event(
+                trade_id=_extract_trade_id_from_text(raw_message),
+                event_type=EventType.ERROR,
+                raw_text=raw_message,
+                action_taken=f"parse error ({msg_type.value}): {e}",
+            )
         except Exception as e:
             logger.error("Unexpected error handling %s: %s", msg_type.value, e, exc_info=True)
+            self._record_event(
+                trade_id=_extract_trade_id_from_text(raw_message),
+                event_type=EventType.ERROR,
+                raw_text=raw_message,
+                action_taken=f"unexpected error ({msg_type.value}): {e}",
+            )
 
     # ------------------------------------------------------------------
     # Signal handling — new trade
@@ -123,6 +150,12 @@ class Pipeline:
         existing = self._db.get_trade(signal.trade_id)
         if existing:
             logger.warning("Trade #%d already exists (status=%s), skipping", signal.trade_id, existing.status.value)
+            self._record_event(
+                trade_id=signal.trade_id,
+                event_type=EventType.SIGNAL_ALERT,
+                raw_text=raw,
+                action_taken=f"skipped: trade #{signal.trade_id} already exists (status={existing.status.value})",
+            )
             return
 
         # --- Port / wallet guardrails (D1) ---
@@ -133,6 +166,12 @@ class Pipeline:
             logger.warning(
                 "Trade #%d skipped: port not configured for user %s",
                 signal.trade_id, self._db.user_id,
+            )
+            self._record_event(
+                trade_id=signal.trade_id,
+                event_type=EventType.SIGNAL_ALERT,
+                raw_text=raw,
+                action_taken="skipped: port not configured",
             )
             if self._notifier:
                 self._notify(self._notifier.notify_port_not_configured(
@@ -145,6 +184,12 @@ class Pipeline:
             logger.warning(
                 "Trade #%d halted: port $%.2f exceeds wallet $%.2f",
                 signal.trade_id, port_usd, wallet_usd,
+            )
+            self._record_event(
+                trade_id=signal.trade_id,
+                event_type=EventType.SIGNAL_ALERT,
+                raw_text=raw,
+                action_taken=f"skipped: port ${port_usd:.2f} exceeds wallet ${wallet_usd:.2f}",
             )
             if self._notifier:
                 self._notify(self._notifier.notify_port_exceeds_wallet(
@@ -172,6 +217,12 @@ class Pipeline:
         except PositionSizeError as e:
             if auto_execute:
                 logger.warning("Skipping trade #%d: %s", signal.trade_id, e)
+                self._record_event(
+                    trade_id=signal.trade_id,
+                    event_type=EventType.SIGNAL_ALERT,
+                    raw_text=raw,
+                    action_taken=f"skipped: {e}",
+                )
                 if self._notifier:
                     self._notify(self._notifier.notify_signal_skipped(
                         signal.trade_id, signal.pair, str(e),
@@ -194,6 +245,12 @@ class Pipeline:
         except RiskLimitBreached as e:
             if auto_execute:
                 logger.warning("Skipping trade #%d — risk limit: %s", signal.trade_id, e)
+                self._record_event(
+                    trade_id=signal.trade_id,
+                    event_type=EventType.SIGNAL_ALERT,
+                    raw_text=raw,
+                    action_taken=f"skipped: risk limit breached — {e}",
+                )
                 if self._notifier:
                     self._notify(self._notifier.notify_signal_skipped(
                         signal.trade_id, signal.pair, str(e),
@@ -212,6 +269,12 @@ class Pipeline:
         except (ValueError, KeyError) as e:
             if auto_execute:
                 logger.error("Trade #%d order build failed: %s", signal.trade_id, e)
+                self._record_event(
+                    trade_id=signal.trade_id,
+                    event_type=EventType.ERROR,
+                    raw_text=raw,
+                    action_taken=f"order build failed: {e}",
+                )
                 if self._notifier:
                     self._notify(self._notifier.notify_signal_skipped(
                         signal.trade_id, signal.pair, str(e),
@@ -224,7 +287,18 @@ class Pipeline:
         leverage = trade_set.leverage if trade_set else min(signal.leverage, self._config.strategy.max_leverage)
         position_size_coin = trade_set.entry.sz if trade_set else 0.0
 
-        # Record trade in DB
+        # Build the decision snapshot (D3 — captures the inputs that
+        # produced this trade for post-mortem auditing)
+        decision_snapshot = self._build_decision_snapshot(
+            signal=signal,
+            preset=preset,
+            port_state=port_state,
+            wallet_usd=wallet_usd,
+            position_size_usd=position_size_usd,
+            leverage_applied=leverage,
+        )
+
+        # Record trade in DB (verbatim signal text + decision snapshot)
         trade_record = TradeRecord(
             trade_id=signal.trade_id,
             user_id=self._db.user_id,
@@ -243,8 +317,22 @@ class Pipeline:
             signal_leverage=signal.leverage,
             position_size_usd=position_size_usd,
             position_size_coin=position_size_coin,
+            raw_signal_text=raw,
+            decision_snapshot=decision_snapshot,
         )
         self._db.create_trade(trade_record)
+
+        # Audit log: trade opened (D3)
+        self._record_event(
+            trade_id=signal.trade_id,
+            event_type=EventType.SIGNAL_ALERT,
+            raw_text=raw,
+            action_taken=(
+                f"opened #{signal.trade_id} {signal.pair} {signal.side.value} "
+                f"size=${position_size_usd:.2f} lev={leverage}x"
+                + (f" auto_execute=off" if not auto_execute else "")
+            ),
+        )
 
         # Notify new signal
         if self._notifier:
@@ -292,6 +380,12 @@ class Pipeline:
         trade = self._db.get_trade(tp.trade_id)
         if not trade:
             logger.warning("TP hit for unknown trade #%d", tp.trade_id)
+            self._record_event(
+                trade_id=tp.trade_id,
+                event_type=EventType.TP_HIT,
+                raw_text=raw,
+                action_taken=f"TP{tp.tp_number} hit but trade is unknown locally",
+            )
             return
 
         logger.info("TP%d hit for trade #%d %s (+%.2f%%)", tp.tp_number, tp.trade_id, tp.pair, tp.profit_pct)
@@ -303,8 +397,19 @@ class Pipeline:
             (be_after == "tp1" and tp.tp_number == 1) or
             (be_after == "tp2" and tp.tp_number == 2)
         )
+        be_moved = False
         if should_move and trade.status == TradeStatus.OPEN:
-            self._pm.move_sl_to_breakeven(tp.trade_id, trade.coin, trade.entry_price)
+            be_moved = bool(self._pm.move_sl_to_breakeven(tp.trade_id, trade.coin, trade.entry_price))
+
+        action = f"TP{tp.tp_number} hit at {tp.profit_pct:+.2f}%"
+        if be_moved:
+            action += f"; SL moved to entry ${trade.entry_price}"
+        self._record_event(
+            trade_id=tp.trade_id,
+            event_type=EventType.TP_HIT,
+            raw_text=raw,
+            action_taken=action,
+        )
 
         if self._notifier:
             self._notify(self._notifier.notify_tp_hit(
@@ -317,6 +422,12 @@ class Pipeline:
         trade = self._db.get_trade(atp.trade_id)
         if not trade:
             logger.warning("All TP hit for unknown trade #%d", atp.trade_id)
+            self._record_event(
+                trade_id=atp.trade_id,
+                event_type=EventType.TRADE_CLOSED,
+                raw_text=raw,
+                action_taken=f"all TPs hit at {atp.profit_pct:+.2f}% but trade is unknown locally",
+            )
             return
 
         logger.info("All TPs hit for trade #%d %s (+%.2f%%)", atp.trade_id, atp.pair, atp.profit_pct)
@@ -327,6 +438,13 @@ class Pipeline:
 
         # Apply realized P&L to the user's port (D1 — withdraw/compound/watermark)
         self._apply_pnl_to_port(trade.position_size_usd, atp.profit_pct)
+
+        self._record_event(
+            trade_id=atp.trade_id,
+            event_type=EventType.TRADE_CLOSED,
+            raw_text=raw,
+            action_taken=f"all TPs hit at {atp.profit_pct:+.2f}%, trade closed",
+        )
 
         if self._notifier:
             self._notify(self._notifier.notify_all_tp_hit(
@@ -339,12 +457,19 @@ class Pipeline:
         trade = self._db.get_trade(be.trade_id)
         if not trade:
             logger.warning("Breakeven for unknown trade #%d", be.trade_id)
+            self._record_event(
+                trade_id=be.trade_id,
+                event_type=EventType.BREAKEVEN,
+                raw_text=raw,
+                action_taken=f"BE after TP{be.tp_secured} for unknown trade",
+            )
             return
 
         logger.info("Breakeven for trade #%d %s (TP%d secured)", be.trade_id, be.pair, be.tp_secured)
 
+        moved = False
         if trade.status == TradeStatus.OPEN and self._config.strategy.auto_execute:
-            moved = self._pm.move_sl_to_breakeven(be.trade_id, trade.coin, trade.entry_price)
+            moved = bool(self._pm.move_sl_to_breakeven(be.trade_id, trade.coin, trade.entry_price))
             if moved:
                 logger.info("SL moved to breakeven for trade #%d via provider message", be.trade_id)
                 if self._notifier:
@@ -354,12 +479,30 @@ class Pipeline:
             # If move_sl_to_breakeven returns False it means no active SL was found
             # (likely already moved by the TP-hit auto-move) — that's fine.
 
+        action = f"BE after TP{be.tp_secured}"
+        if moved:
+            action += f"; SL moved to entry ${trade.entry_price}"
+        else:
+            action += "; no SL move (already at BE or trade not open)"
+        self._record_event(
+            trade_id=be.trade_id,
+            event_type=EventType.BREAKEVEN,
+            raw_text=raw,
+            action_taken=action,
+        )
+
     def _handle_stop_hit(self, raw: str) -> None:
         """Stop hit — trade is closed at a loss."""
         sh = parse_stop_hit(raw)
         trade = self._db.get_trade(sh.trade_id)
         if not trade:
             logger.warning("Stop hit for unknown trade #%d", sh.trade_id)
+            self._record_event(
+                trade_id=sh.trade_id,
+                event_type=EventType.STOP_HIT,
+                raw_text=raw,
+                action_taken=f"stop hit at {sh.loss_pct:+.2f}% but trade is unknown locally",
+            )
             return
 
         logger.info("Stop hit for trade #%d %s (%.2f%%)", sh.trade_id, sh.pair, sh.loss_pct)
@@ -370,6 +513,13 @@ class Pipeline:
 
         # Apply realized P&L to the user's port (D1 — withdraw/compound/watermark)
         self._apply_pnl_to_port(trade.position_size_usd, sh.loss_pct)
+
+        self._record_event(
+            trade_id=sh.trade_id,
+            event_type=EventType.STOP_HIT,
+            raw_text=raw,
+            action_taken=f"stop hit at {sh.loss_pct:+.2f}%, trade closed",
+        )
 
         if self._notifier:
             self._notify(self._notifier.notify_stop_hit(
@@ -382,13 +532,28 @@ class Pipeline:
         trade = self._db.get_trade(cancel.trade_id)
         if not trade:
             logger.warning("Cancel for unknown trade #%d", cancel.trade_id)
+            self._record_event(
+                trade_id=cancel.trade_id,
+                event_type=EventType.CANCEL,
+                raw_text=raw,
+                action_taken=f"cancel for unknown trade — reason: {cancel.reason or 'n/a'}",
+            )
             return
 
         logger.info("Trade #%d canceled: %s", cancel.trade_id, cancel.reason)
         if trade.status == TradeStatus.OPEN:
             self._pm.close_position(cancel.trade_id, trade.coin, reason="canceled")
+            action = f"position closed; reason: {cancel.reason or 'n/a'}"
         else:
             self._pm.cancel_trade(cancel.trade_id)
+            action = f"orders canceled; reason: {cancel.reason or 'n/a'}"
+
+        self._record_event(
+            trade_id=cancel.trade_id,
+            event_type=EventType.CANCEL,
+            raw_text=raw,
+            action_taken=action,
+        )
 
         if self._notifier:
             self._notify(self._notifier.notify_trade_canceled(
@@ -401,6 +566,12 @@ class Pipeline:
         trade = self._db.get_trade(tc.trade_id)
         if not trade:
             logger.warning("Trade closed for unknown trade #%d", tc.trade_id)
+            self._record_event(
+                trade_id=tc.trade_id,
+                event_type=EventType.TRADE_CLOSED,
+                raw_text=raw,
+                action_taken=f"trade closed for unknown trade — detail: {tc.detail}",
+            )
             return
 
         logger.info("Trade #%d closed: %s", tc.trade_id, tc.detail)
@@ -408,6 +579,13 @@ class Pipeline:
             self._pm.close_position(tc.trade_id, trade.coin, reason="manual_close")
         else:
             self._db.update_trade_status(tc.trade_id, TradeStatus.CLOSED, close_reason="manual_close")
+
+        self._record_event(
+            trade_id=tc.trade_id,
+            event_type=EventType.TRADE_CLOSED,
+            raw_text=raw,
+            action_taken=f"closed: {tc.detail}",
+        )
 
         if self._notifier:
             self._notify(self._notifier.notify_trade_closed(
@@ -424,11 +602,24 @@ class Pipeline:
         trade = self._db.get_trade(op.trade_id)
         if not trade:
             logger.warning("ORDER_PENDING for unknown trade #%d", op.trade_id)
+            self._record_event(
+                trade_id=op.trade_id,
+                event_type=EventType.ORDER_PENDING,
+                raw_text=raw,
+                action_taken="order pending for unknown trade",
+            )
             return
 
         logger.info(
             "ORDER_PENDING: trade #%d %s — CP says price moved, waiting for pullback",
             op.trade_id, op.pair,
+        )
+
+        self._record_event(
+            trade_id=op.trade_id,
+            event_type=EventType.ORDER_PENDING,
+            raw_text=raw,
+            action_taken="CP says price moved, waiting for pullback (no exchange action)",
         )
 
         if self._notifier:
@@ -446,11 +637,24 @@ class Pipeline:
         trade = self._db.get_trade(tl.trade_id)
         if not trade:
             logger.warning("TRADE_LIVE for unknown trade #%d", tl.trade_id)
+            self._record_event(
+                trade_id=tl.trade_id,
+                event_type=EventType.TRADE_LIVE,
+                raw_text=raw,
+                action_taken="trade-live confirmation for unknown trade",
+            )
             return
 
         logger.info(
             "TRADE_LIVE: trade #%d %s — CP confirms entry filled",
             tl.trade_id, tl.pair,
+        )
+
+        self._record_event(
+            trade_id=tl.trade_id,
+            event_type=EventType.TRADE_LIVE,
+            raw_text=raw,
+            action_taken="CP confirms entry filled (exchange is authoritative)",
         )
 
         if self._notifier:
@@ -474,20 +678,40 @@ class Pipeline:
             trade = self._db.get_trade(sl.trade_id)
             if not trade:
                 logger.warning("SL update for unknown trade #%d", sl.trade_id)
+                self._record_event(
+                    trade_id=sl.trade_id,
+                    event_type=EventType.SL_MOVE,
+                    raw_text=raw,
+                    action_taken=f"SL move to {sl.new_price} for unknown trade",
+                )
                 return
             if trade.status != TradeStatus.OPEN:
                 logger.warning("SL update for non-open trade #%d (status=%s)", sl.trade_id, trade.status.value)
+                self._record_event(
+                    trade_id=sl.trade_id,
+                    event_type=EventType.SL_MOVE,
+                    raw_text=raw,
+                    action_taken=f"SL move skipped — trade not open (status={trade.status.value})",
+                )
                 return
 
             logger.info("SL update detected: trade #%d → new SL %.6f", sl.trade_id, sl.new_price)
             if self._config.strategy.auto_execute:
                 self._pm.move_stop_loss(sl.trade_id, trade.coin, sl.new_price)
+                action = f"SL moved to {sl.new_price}"
                 if self._notifier:
                     self._notify(self._notifier.notify_sl_moved(
                         sl.trade_id, trade.coin, sl.new_price,
                     ))
             else:
                 logger.info("SL update ready (auto_execute=false) for trade #%d", sl.trade_id)
+                action = f"SL move to {sl.new_price} ready (auto_execute=off)"
+            self._record_event(
+                trade_id=sl.trade_id,
+                event_type=EventType.SL_MOVE,
+                raw_text=raw,
+                action_taken=action,
+            )
             return
 
         # Not an SL instruction — log for human review
@@ -535,6 +759,68 @@ class Pipeline:
             "port_usd": self._config.port.port_usd,
             "port_mode": self._config.port.port_mode,
             "port_watermark": self._config.port.port_watermark,
+        }
+
+    def _record_event(
+        self,
+        trade_id: int | None,
+        event_type: EventType,
+        raw_text: str,
+        action_taken: str,
+    ) -> None:
+        """Persist a trade_events row. Failures are caught — audit
+        logging must never crash the pipeline."""
+        try:
+            self._db.record_event(
+                trade_id=trade_id,
+                event_type=event_type,
+                raw_text=raw_text,
+                action_taken=action_taken,
+            )
+        except Exception:
+            logger.exception("Failed to record trade event")
+
+    def _build_decision_snapshot(
+        self,
+        signal: ParsedSignal,
+        preset: StrategyPreset,
+        port_state: dict,
+        wallet_usd: float,
+        position_size_usd: float,
+        leverage_applied: int,
+    ) -> dict:
+        """Capture the inputs that produced this trade — preset, sizing,
+        port state, leverage caps — for audit + post-mortem (D3)."""
+        risk = signal.risk_level.value
+        size_pct = self._config.strategy.size_by_risk.get(risk, preset.size_pct)
+        port_usd = port_state["port_usd"] or 0.0
+        target_usd = port_usd * size_pct / 100.0
+
+        why_parts = [
+            f"size_by_risk[{risk}]={size_pct}% of port ${port_usd:.2f} = ${target_usd:.2f}"
+        ]
+        if target_usd > position_size_usd:
+            why_parts.append(
+                f"clamped to max_position_size=${self._config.risk.max_position_size_usd:.2f}"
+            )
+        if leverage_applied < signal.leverage:
+            why_parts.append(
+                f"leverage capped from {signal.leverage}x to {leverage_applied}x"
+            )
+
+        exposure = (position_size_usd / port_usd * 100.0) if port_usd > 0 else 0.0
+        return {
+            "preset": self._config.strategy.active_preset,
+            "size_pct_applied": size_pct,
+            "port_usd_at_open": port_usd,
+            "port_mode": port_state["port_mode"],
+            "risk_level": risk,
+            "leverage_applied": leverage_applied,
+            "leverage_signal": signal.leverage,
+            "position_size_usd": position_size_usd,
+            "exposure_used_pct": exposure,
+            "wallet_usd_at_open": wallet_usd,
+            "why": "; ".join(why_parts),
         }
 
     def _apply_pnl_to_port(self, position_size_usd: float, pnl_pct: float) -> None:

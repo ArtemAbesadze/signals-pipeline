@@ -1081,3 +1081,138 @@ class TestPortUpdatesOnClose:
         assert state["port_usd"] == 1000.0  # clamped at watermark
         assert state["port_watermark"] == 1000.0
         user_db.close()
+
+
+# ====================================================================
+# D3 — Audit-log plumbing
+# ====================================================================
+
+
+class TestAuditTrailOnOpen:
+    """Every opened trade carries raw_signal_text + decision_snapshot."""
+
+    def test_raw_signal_text_stored_verbatim(self, pipeline, db):
+        msg = _load("signal_alert_06.txt")
+        pipeline.process_message(msg)
+        trade = db.get_trade(1259)
+        assert trade.raw_signal_text == msg
+
+    def test_decision_snapshot_shape(self, pipeline, db):
+        pipeline.process_message(_load("signal_alert_06.txt"))  # ADA LOW risk
+        trade = db.get_trade(1259)
+        snap = trade.decision_snapshot
+        assert snap is not None
+        # All 11 fields specified in the plan are present
+        for key in (
+            "preset", "size_pct_applied", "port_usd_at_open", "port_mode",
+            "risk_level", "leverage_applied", "leverage_signal",
+            "position_size_usd", "exposure_used_pct",
+            "wallet_usd_at_open", "why",
+        ):
+            assert key in snap, f"missing key {key}"
+
+    def test_decision_snapshot_values(self, pipeline, db):
+        pipeline.process_message(_load("signal_alert_06.txt"))
+        snap = db.get_trade(1259).decision_snapshot
+        assert snap["preset"] == "even_split"
+        assert snap["risk_level"] == "LOW"
+        assert snap["size_pct_applied"] == 4.0  # size_by_risk[LOW]
+        assert snap["port_usd_at_open"] == 10000.0
+        assert snap["wallet_usd_at_open"] == 10000.0
+        assert snap["leverage_signal"] == 14
+        assert snap["leverage_applied"] <= snap["leverage_signal"]
+        # exposure_used_pct = position_size_usd / port_usd * 100 (Q1 = A)
+        expected_exposure = (
+            snap["position_size_usd"] / snap["port_usd_at_open"] * 100
+        )
+        assert snap["exposure_used_pct"] == pytest.approx(expected_exposure)
+        assert "size_by_risk[LOW]=4.0%" in snap["why"]
+
+
+class TestAuditTrailEvents:
+    """Every CP message we process writes a trade_events row."""
+
+    def test_signal_alert_event_type_and_action(self, pipeline, db):
+        from src.state.models import EventType
+        msg = _load("signal_alert_06.txt")
+        pipeline.process_message(msg)
+        events = db.get_events_for_trade(1259)
+        assert len(events) == 1
+        assert events[0].event_type == EventType.SIGNAL_ALERT
+        assert events[0].raw_text == msg
+        assert "opened" in events[0].action_taken
+
+    def test_full_ada_lifecycle_reconstructible(self, pipeline, db):
+        from src.state.models import EventType
+        # Signal → TP1 → BE → ALL_TP → reconstruct chronological event log
+        pipeline.process_message(_load("signal_alert_06.txt"))  # ADA #1259
+
+        tp1_msg = (
+            "✅ **TP TARGET 1 HIT**\n\n"
+            "📝**PAIR:** ADA/USDT #1259\n\n"
+            "💰**PROFIT:** +25% 📈\n"
+            "⏳**PERIOD:** 10 MINUTES"
+        )
+        pipeline.process_message(tp1_msg)
+
+        be_msg = (
+            "**BREAK EVEN HIT AFTER TP1**\n\n"
+            "📝**PAIR:** ADA/USDT #1259\n\n"
+            "Capital protected."
+        )
+        pipeline.process_message(be_msg)
+
+        all_tp_msg = (
+            "🔥ALL TAKE-PROFIT TARGETS HIT\n\n"
+            "📝PAIR: ADA/USDT #1259\n\n"
+            "💰PROFIT: +50% 📈\n"
+            "⏳PERIOD: 1 HOURS"
+        )
+        pipeline.process_message(all_tp_msg)
+
+        events = db.get_events_for_trade(1259)
+        types = [e.event_type for e in events]
+        assert EventType.SIGNAL_ALERT in types
+        assert EventType.TP_HIT in types
+        assert EventType.BREAKEVEN in types
+        assert EventType.TRADE_CLOSED in types
+        # Chronological order
+        assert types == sorted(types, key=lambda _: events[types.index(_)].occurred_at)
+
+    def test_skipped_signal_writes_event_no_trade(self, client, tmpdir):
+        from src.state.models import EventType
+        # port_usd=None → signal skipped, but event is recorded
+        config = _make_config(tmpdir, port_usd=None)
+        db = TradeDatabase(user_id="test_user", db_path=tmpdir / "test.db")
+        pipeline = Pipeline(config=config, client=client, db=db)
+
+        pipeline.process_message(_load("signal_alert_06.txt"))
+
+        assert db.get_trade(1259) is None  # no trade
+        events = db.get_events_for_trade(1259)
+        assert len(events) == 1
+        assert events[0].event_type == EventType.SIGNAL_ALERT
+        assert "skipped" in events[0].action_taken
+        assert "port not configured" in events[0].action_taken
+
+    def test_parse_error_writes_error_event(self, pipeline, db):
+        from src.state.models import EventType
+        # A malformed signal that's classified as SIGNAL_ALERT but fails parsing
+        bad = (
+            "TRADING SIGNAL ALERT\n\n"
+            "PAIR: BTC/USDT #99999\n"
+            "(LOW RISK)\n\n"
+            # Missing TYPE/SIZE/SIDE/etc → parse_signal raises
+            "ENTRY: 50000\n"
+            "SL: 49000\n"
+            "TP1: 51000\n"
+        )
+        pipeline.process_message(bad)
+
+        # Look up errors specifically
+        errors = db.get_events_for_user(event_type=EventType.ERROR)
+        assert len(errors) >= 1
+        err = errors[0]
+        assert err.trade_id == 99999  # extracted from #99999
+        assert err.raw_text == bad
+        assert "parse error" in err.action_taken

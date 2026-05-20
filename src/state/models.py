@@ -35,6 +35,22 @@ class OrderStatus(Enum):
     REJECTED = "rejected"    # Exchange rejected the order
 
 
+class EventType(Enum):
+    """Audit-log event types (D3). Every signal and lifecycle event is
+    persisted to trade_events with one of these values."""
+
+    SIGNAL_ALERT = "signal_alert"       # New signal received (opened or skipped)
+    ORDER_PENDING = "order_pending"     # CP says entry not yet filled
+    TRADE_LIVE = "trade_live"           # CP confirms entry filled
+    TP_HIT = "tp_hit"                   # Single TP hit (TP1/TP2/TP3)
+    BREAKEVEN = "breakeven"             # SL moved to entry
+    STOP_HIT = "stop_hit"               # Stop hit, trade closed
+    SL_MOVE = "sl_move"                 # SL moved by manual update
+    TRADE_CLOSED = "trade_closed"       # ALL_TP_HIT or explicit TRADE_CLOSED
+    CANCEL = "cancel"                   # Trade canceled
+    ERROR = "error"                     # Parse failure, exchange rejection, etc.
+
+
 @dataclass
 class TradeRecord:
     """One row per signal — tracks the full lifecycle of a trade."""
@@ -45,7 +61,7 @@ class TradeRecord:
     coin: str                # Hyperliquid coin name (e.g. "ZK")
     side: str                # "LONG" or "SHORT"
     risk_level: str          # "LOW", "MEDIUM", "HIGH"
-    trade_type: str          # "SWING" or "SCALP"
+    trade_type: str          # "SWING", "SCALP", or "POSITION"
     size_hint: str           # e.g. "1-4%"
     entry_price: float
     stop_loss: float
@@ -63,6 +79,23 @@ class TradeRecord:
     close_reason: str | None = None  # "all_tp_hit", "stop_hit", "manual", "canceled"
     pnl_pct: float | None = None     # Final P&L % (from signal provider or calculated)
     notes: str | None = None          # User-provided trade journal notes
+    # D3 audit fields — verbatim signal text + decision snapshot captured at open
+    raw_signal_text: str | None = None
+    decision_snapshot: dict | None = None
+
+
+@dataclass
+class TradeEvent:
+    """One row in the audit log (trade_events). Every signal and lifecycle
+    event we observe is persisted here for post-mortem debugging + reporting."""
+
+    id: int | None           # auto-increment
+    trade_id: int | None     # nullable — parse errors may have no trade
+    user_id: str
+    occurred_at: datetime
+    event_type: EventType
+    raw_text: str | None     # verbatim message that triggered this event
+    action_taken: str | None # human-readable description of what we did
 
 
 @dataclass
