@@ -90,6 +90,34 @@ class TestSignalParser:
         assert s.tp3 == 0.00663
         assert s.leverage == 16
 
+    def test_signal_alert_08_position_type(self):
+        """BCH — TYPE: POSITION (new type) + emoji-color risk indicator."""
+        s = parse_signal(_load("signal_alert_08.txt"))
+        assert s.pair == "BCH/USDT"
+        assert s.trade_id == 2094
+        assert s.risk_level == RiskLevel.HIGH
+        assert s.trade_type == "POSITION"
+        assert s.side == Side.SHORT
+        assert s.entry == 371.8
+        assert s.stop_loss == 395.83
+        assert s.tp1 == 357.77
+        assert s.tp2 == 359.52
+        assert s.tp3 == 336.55
+        assert s.leverage == 32
+
+    def test_signal_alert_09_minimal_header_with_trade_on_link(self):
+        """TRX — minimalist 'Trading Signal Alert' header + 🔗 Trade on link;
+        URL must be stripped before parsing."""
+        s = parse_signal(_load("signal_alert_09.txt"))
+        assert s.pair == "TRX/USDT"
+        assert s.trade_id == 2092
+        assert s.risk_level == RiskLevel.LOW
+        assert s.trade_type == "SWING"
+        assert s.side == Side.SHORT
+        assert s.entry == 0.3542
+        assert s.stop_loss == 0.35758
+        assert s.leverage == 27
+
 
 class TestSignalParserRiskLevelFormat:
     """Both old (parenthesized) and new (bare) risk-level formats parse."""
@@ -125,6 +153,36 @@ class TestSignalParserRiskLevelFormat:
     def test_bare_high_risk_works(self):
         s = parse_signal(self._build_signal("HIGH RISK"))
         assert s.risk_level == RiskLevel.HIGH
+
+
+class TestSignalParserTradeType:
+    """All three TYPE values — SWING, SCALP, POSITION — must parse."""
+
+    def _build(self, type_value: str) -> str:
+        return (
+            "TRADING SIGNAL ALERT\n\n"
+            "PAIR: BTC/USDT #9999\n"
+            "LOW RISK\n\n"
+            f"TYPE: {type_value}\n"
+            "SIZE: 1-4%\n"
+            "SIDE: LONG\n\n"
+            "ENTRY: 100\n"
+            "SL: 90          (-10%)\n\n"
+            "TP1: 110      (10%)\n"
+            "TP2: 120      (20%)\n"
+            "TP3: 130      (30%)\n\n"
+            "LEVERAGE: 10x"
+        )
+
+    def test_swing(self):
+        assert parse_signal(self._build("SWING")).trade_type == "SWING"
+
+    def test_scalp(self):
+        assert parse_signal(self._build("SCALP")).trade_type == "SCALP"
+
+    def test_position(self):
+        """POSITION — new TYPE value used by CP for longer-term trades."""
+        assert parse_signal(self._build("POSITION")).trade_type == "POSITION"
 
 
 class TestSignalParserEdgeCases:

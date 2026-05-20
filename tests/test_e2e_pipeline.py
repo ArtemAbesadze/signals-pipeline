@@ -72,6 +72,7 @@ ASSET_META = {
     "DOGE": {"szDecimals": 0, "maxLeverage": 50, "name": "DOGE"},
     "ETH": {"szDecimals": 4, "maxLeverage": 100, "name": "ETH"},
     "BTC": {"szDecimals": 5, "maxLeverage": 100, "name": "BTC"},
+    "TRX": {"szDecimals": 0, "maxLeverage": 50, "name": "TRX"},
 }
 
 
@@ -800,11 +801,12 @@ class TestEdgeCases:
         for f in sorted(SAMPLES_DIR.glob("*.txt")):
             pipeline.process_message(f.read_text().strip())
 
-        # We should have one trade per signal_alert sample — other messages
-        # are lifecycle events for trades that may not exist locally.
+        # We should have one DB record per signal_alert_* sample. Some may
+        # have been closed by lifecycle events in the same run (e.g.
+        # stop_hit_02 closes the trade signal_alert_09 just opened).
         expected_trades = len(list(SAMPLES_DIR.glob("signal_alert_*.txt")))
-        trades = db.get_open_trades()
-        assert len(trades) == expected_trades
+        all_trades = db.get_open_trades() + db.get_completed_trades()
+        assert len(all_trades) == expected_trades
 
     def test_rapid_fire_same_signal(self, pipeline, db, client):
         """Processing the same signal 10 times should only create 1 trade."""

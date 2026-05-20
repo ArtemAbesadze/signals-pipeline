@@ -33,6 +33,21 @@ _EMOJI = re.compile(
     r"\U0001fa00-\U0001fa6f\U0001fa70-\U0001faff\U0000200d]+",
 )
 
+# Phrases that mark CP commentary / recaps / market analysis. None of these
+# trigger an action; all classify as NOISE. Match is case-insensitive because
+# classify() upper-cases the cleaned text before comparison.
+_NOISE_MARKERS = (
+    "WEEKLY CRYPTO RESULTS",
+    "WEEKLY STATS",
+    "DAILY PERFORMANCE",
+    "YESTERDAY'S RESULTS",
+    "YESTERDAY COLLECTED",
+    "NET RESULT:",
+    "TOTAL COLLECTED:",
+    "MARKET STRUCTURE UPDATE",
+    "DATA RECAP",
+)
+
 
 def _strip_markdown(text: str) -> str:
     """Remove Discord markdown, mentions, URLs, and the Called-by footer."""
@@ -68,6 +83,14 @@ def classify(raw_message: str) -> MessageType:
     if "@PERP ALERT" in text:
         return MessageType.NOISE
 
+    # CP commentary: weekly reports, daily recaps, market analysis, brief
+    # comments. These are informational and must not trigger any action.
+    # Checked BEFORE lifecycle keywords because CP sometimes wraps these
+    # messages with ticker headers like "TRADE CANCELED <@&NNN>" that would
+    # otherwise win the classification.
+    if any(marker in text for marker in _NOISE_MARKERS):
+        return MessageType.NOISE
+
     # --- Lifecycle events (specific keywords) ---
     # ORDER_PENDING and TRADE_LIVE must be checked BEFORE SIGNAL_ALERT —
     # their messages can include a "Trading Signal Alert" header preamble
@@ -100,16 +123,20 @@ def classify(raw_message: str) -> MessageType:
     if "INCOMING" in text and "PREPARE" in text:
         return MessageType.PREPARATION
 
-    # --- Signal alert (explicit header or has entry/SL/TP fields) ---
-    if "TRADING SIGNAL ALERT" in text:
-        return MessageType.SIGNAL_ALERT
-
-    # Fallback: some signals arrive without the header but contain key fields
+    # --- Signal alert: must have structured fields, regardless of header ---
+    # CP uses "Trading Signal Alert" as a generic header preamble for prose
+    # too, so header presence alone is not enough. A real signal carries
+    # ENTRY + SL + TP, full stop.
     has_entry = bool(re.search(r"\bENTRY[:\s]", text))
     has_sl = bool(re.search(r"\bSL[:\s]", text))
     has_tp = bool(re.search(r"\bTP\d", text))
     if has_entry and has_sl and has_tp:
         return MessageType.SIGNAL_ALERT
+
+    # "Trading Signal Alert" header without structured fields is CP prose
+    # (commentary, brief comment, market context) — treat as NOISE.
+    if "TRADING SIGNAL ALERT" in text:
+        return MessageType.NOISE
 
     # --- Manual update (has a pair/trade # but didn't match above) ---
     if re.search(r"PAIR[:\s]", text) or re.search(r"#\d{3,}", text):

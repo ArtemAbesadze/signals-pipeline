@@ -94,8 +94,8 @@ def parse_signal(raw_message: str) -> ParsedSignal:
         raise SignalParseError("Could not extract risk level")
     risk_level = RiskLevel(m.group(1).upper())
 
-    # --- Type (SWING / SCALP) ---
-    m = re.search(r"TYPE[:\s]+(SWING|SCALP)", text, re.IGNORECASE)
+    # --- Type (SWING / SCALP / POSITION) ---
+    m = re.search(r"TYPE[:\s]+(SWING|SCALP|POSITION)", text, re.IGNORECASE)
     if not m:
         raise SignalParseError("Could not extract trade type")
     trade_type = m.group(1).upper()

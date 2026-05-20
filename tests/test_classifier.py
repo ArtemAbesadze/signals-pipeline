@@ -39,6 +39,14 @@ class TestClassifier:
         """1000BONK — new CP format with bare `LOW RISK` (no parens) + ticker header."""
         assert classify(_load("signal_alert_07.txt")) == MessageType.SIGNAL_ALERT
 
+    def test_signal_alert_08_position_type(self):
+        """BCH — TYPE: POSITION (new value alongside SWING/SCALP)."""
+        assert classify(_load("signal_alert_08.txt")) == MessageType.SIGNAL_ALERT
+
+    def test_signal_alert_09_minimal_header_with_trade_on_link(self):
+        """TRX — minimalist 'Trading Signal Alert' header + 🔗 Trade on referral line."""
+        assert classify(_load("signal_alert_09.txt")) == MessageType.SIGNAL_ALERT
+
     # --- ORDER_PENDING ---
 
     def test_order_pending_01(self):
@@ -175,6 +183,23 @@ class TestClassifier:
     def test_noise_01(self):
         assert classify(_load("noise_01.txt")) == MessageType.NOISE
 
+    def test_noise_02_weekly_report(self):
+        """Regression: weekly report wrapped in TRADE CANCELED header used to
+        misclassify as CANCELED."""
+        assert classify(_load("noise_02.txt")) == MessageType.NOISE
+
+    def test_noise_03_daily_recap(self):
+        """Daily recap with 'Yesterday Collected' / 'Total Collected:' markers."""
+        assert classify(_load("noise_03.txt")) == MessageType.NOISE
+
+    def test_noise_04_market_analysis(self):
+        """'BTC Market Structure Update' prose."""
+        assert classify(_load("noise_04.txt")) == MessageType.NOISE
+
+    def test_noise_05_brief_prose(self):
+        """Brief CP comment with 'Trading Signal Alert' header but no fields."""
+        assert classify(_load("noise_05.txt")) == MessageType.NOISE
+
 
 # ------------------------------------------------------------------
 # Edge cases
@@ -244,3 +269,54 @@ class TestClassifierEdgeCases:
             "LOSS: -10.5%"
         )
         assert classify(msg) == MessageType.STOP_HIT
+
+    def test_weekly_report_with_cancel_header_is_noise(self):
+        """Regression: CP wraps weekly reports with a 'TRADE CANCELED' ticker
+        header. The body keyword (WEEKLY CRYPTO RESULTS) must win — otherwise
+        the CANCEL keyword would misclassify the report."""
+        msg = (
+            "TRADE CANCELED <@&123>\n"
+            "💎 WEEKLY CRYPTO RESULTS 11 – 17 MAY\n\n"
+            "📊 TP2 Only: +351.66%\n"
+            "📊 TP3 Only: +967.71%"
+        )
+        assert classify(msg) == MessageType.NOISE
+
+    def test_daily_recap_with_net_result_is_noise(self):
+        msg = (
+            "Good morning team\n\n"
+            "Yesterday's Results\n\n"
+            "✅ BTC/USDT TP2 +50% #1234\n\n"
+            "Net Result: +50% ✅"
+        )
+        assert classify(msg) == MessageType.NOISE
+
+    def test_market_analysis_is_noise(self):
+        msg = (
+            "Trading Signal Alert <@&123>\n"
+            "BTC Market Structure Update\n\n"
+            "The chart is painting a clear picture..."
+        )
+        assert classify(msg) == MessageType.NOISE
+
+    def test_trading_signal_alert_header_without_fields_is_noise(self):
+        """Prose with the 'Trading Signal Alert' header but no ENTRY/SL/TP
+        fields used to misclassify as SIGNAL_ALERT and silently fail parsing."""
+        msg = (
+            "Trading Signal Alert <@&123>\n"
+            "NEAR super near the TP3"
+        )
+        assert classify(msg) == MessageType.NOISE
+
+    def test_signal_alert_requires_all_three_fields(self):
+        """SIGNAL_ALERT needs ENTRY + SL + TP, not just one or two."""
+        # ENTRY only
+        assert classify("Trading Signal Alert\nENTRY: 100") == MessageType.NOISE
+        # ENTRY + SL only
+        assert classify("Trading Signal Alert\nENTRY: 100\nSL: 90") == MessageType.NOISE
+        # ENTRY + TP only
+        assert classify("Trading Signal Alert\nENTRY: 100\nTP1: 110") == MessageType.NOISE
+        # All three → SIGNAL_ALERT
+        assert classify(
+            "Trading Signal Alert\nENTRY: 100\nSL: 90\nTP1: 110"
+        ) == MessageType.SIGNAL_ALERT

@@ -1,0 +1,30 @@
+Trading Signal Alert <@&1488219081063665784>
+**TRADING SIGNAL ALERT**
+
+📝**PAIR:** BCH/USDT #2094
+🟠 HIGH RISK
+
+**TYPE:** POSITION
+**SIZE:** 1-4%
+**SIDE:** SHORT
+
+📍**ENTRY:** 371.8
+✖️**SL:** 395.83          (-210.23%)
+
+💰**TAKE PROFIT TARGETS:**
+
+**TP1:** 357.77      (120.75%)
+**TP2:** 359.52      (105.69%)
+**TP3:** 336.55      (306.32%)
+
+⚖️**LEVERAGE:** 32x
+
+**TP1:** 0.57 R:R
+**TP2:** 0.5 R:R
+**TP3:** 1.46 R:R
+
+⚠️**PROTECT YOUR CAPITAL, MANAGE RISK, LETS PRINT!**
+
+🔗 **Trade on:** https://partner.blofin.com/d/potion
+
+Called by <@1436550935743565884>

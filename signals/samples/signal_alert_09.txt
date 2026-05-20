@@ -1,0 +1,30 @@
+Trading Signal Alert <@&1488219081063665784>
+**TRADING SIGNAL ALERT**
+
+📝**PAIR:** TRX/USDT #2092
+🟢 LOW RISK
+
+**TYPE:** SWING
+**SIZE:** 1-4%
+**SIDE:** SHORT
+
+📍**ENTRY:** 0.3542
+✖️**SL:** 0.35758          (-29.04%)
+
+💰**TAKE PROFIT TARGETS:**
+
+**TP1:** 0.35149      (20.66%)
+**TP2:** 0.34817      (45.97%)
+**TP3:** 0.34538      (70.36%)
+
+⚖️**LEVERAGE:** 27x
+
+**TP1:** 0.71 R:R
+**TP2:** 1.58 R:R
+**TP3:** 2.42 R:R
+
+⚠️**PROTECT YOUR CAPITAL, MANAGE RISK, LETS PRINT!**
+
+🔗 **Trade on:** https://partner.blofin.com/d/potion
+
+Called by <@1436550935743565884>

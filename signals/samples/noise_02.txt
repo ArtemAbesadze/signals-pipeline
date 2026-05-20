@@ -1,0 +1,37 @@
+TRADE CANCELED <@&1488219081063665784>
+💎 WEEKLY CRYPTO RESULTS 11 – 17 MAY
+
+📅 Daily Performance:
+
+⚪ 11 MAY – No trades
+❌ 12 MAY – 2W / 3L (−73.15%)
+✅ 13 MAY – 14W / 1L (+1,485.79%)
+⚪ 14 MAY – No trades
+✅ 15 MAY – 4W / 2L (+382.19%)
+⚪ 16 MAY – No trades
+⚪ 17 MAY – No trades
+
+📊 WEEKLY STATS:
+
+💎 Total Trades: 28
+✅ Wins: 20
+❌ Losses: 6
+🤝 Canceled / BE: 2
+🔥 Win Rate: 85.00%
+
+📈 Total NET Setups Performance: +1,794.83%
+
+🛡 Safe TP1 Strategy Profit: +188.52%
+📊 TP2 Only: +351.66%
+📊 TP3 Only: +967.71%
+📊 TP2 + BE: +278.05%
+📊 TP3 + BE: +207.17%
+📊 Hybrid: +254.93%
+
+📌 Open Trades Carrying Forward: 0
+
+Every strategy. Green. That is the summary of last week.
+
+New week. New money. Let's keep adding green. 💎
+
+Called by <@952155394766151690>
