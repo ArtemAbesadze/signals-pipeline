@@ -168,54 +168,62 @@ Lightweight daily SQLite backup (`sqlite3 .backup`, dump to a local `backups/` d
 
 ## Phase plan
 
+Status legend: ✅ shipped on `rework/scope-v1` · ⏳ next · ◻ pending
+
 ### Phase 1 — Development & validation (no live trades; sample-driven)
 
-| # | Task |
-|---|------|
-| 1.1 | **Shadow mode for sample collection** — capture-only Discord adapter mode that connects to a channel and logs every message verbatim to a file, without executing. Used to build a sample corpus from CP's channel while we keep developing. Artem will run this manually and provide samples via screenshot/copy until the final Discord wiring step. |
-| 1.2 | **Sample corpus expansion** — collect 30+ more CP messages of varying lifecycle events; integrate into `signals/samples/`; add classifier/parser test coverage. |
-| 1.3 | **Port/wallet architecture (D1)** — schema, sizing, three modes, guardrail logic. |
-| 1.4 | **Strategy preset overhaul (D2)** — rebuild the 7-preset list, set `even_split` as default, update `size_by_risk` handling, migrate any existing `user_config` rows. |
-| 1.5 | **Audit-log plumbing (D3)** — `trades` columns + `trade_events` table + pipeline + lifecycle handlers all writing events. |
-| 1.6 | **Defensive parsing (D6)** — never crash on bad input; route errors to `trade_events`. |
+| # | Status | Commit | Task |
+|---|---|---|---|
+| 1.1 | ✅ | `df5fb90` | **Shadow mode** — capture-only Discord adapter mode that listens to a channel and logs every message verbatim, without executing. The form factor; live wiring is Phase 4.1. |
+| 1.2 | ✅ | `8717f8b` + `e96219d` | **Sample corpus expansion** — adopted new CP format (mentions, prev URLs, footer, signed profits, POSITION type), added ORDER_PENDING + TRADE_LIVE message types, +50 signal samples, classifier + parser hardened. |
+| 1.3 | ✅ | `b210903` | **Port/wallet architecture (D1)** — schema, sizing, three modes (withdraw/compound/watermark), guardrails. |
+| 1.4 | ✅ | `055029c` | **Strategy preset overhaul (D2)** — 7 new presets matching CP's report rows, `even_split` default, idempotent migration from old names. |
+| 1.5 | ✅ | `1158a4c` | **Audit-log plumbing (D3)** — `trades.raw_signal_text` + `trades.decision_snapshot` + new `trade_events` table; every handler writes events. |
+| 1.6 | ✅ | `7bbc3a4` | **Defensive parsing (D6)** — typed parser errors, classifier never crashes, action_taken truncation, submission-failure event. |
 
 ### Phase 2 — Telegram rework (interactive design)
 
-| # | Task |
-|---|------|
-| 2.1 | Rip SaaS layer (D4) — invite/expiry/broadcast/admin sprawl removed. |
-| 2.2 | Redesign menu structure interactively (don't predesign). |
-| 2.3 | Add port-management UI. |
-| 2.4 | Add audit/explain views. |
-| 2.5 | Update notifications to surface port-vs-wallet status and mode-relevant info. |
+| # | Status | Commit | Task |
+|---|---|---|---|
+| 2.1 | ✅ | `c366c55` | Rip SaaS layer (D4) — invite codes / expiry / broadcast / users / extend / revoke / renew flow removed. −1737 LOC. |
+| 2.2 | ✅ | `80320b3` + `d772548` | Interactive menu redesign — condensed main dashboard, 4 drill-downs (Calls / Trading / Port / Config), Pause toggle on main. Port screen (state + history). Per-trade Audit Trail. |
+| 2.3 | (folded into 2.2) | | Port management UI. |
+| 2.4 | (folded into 2.2) | | Audit/explain views. |
+| 2.5 | ◻ | | Update notifications to surface port-vs-wallet status and mode-relevant info. (Deferred — may roll into Phase 4 polish.) |
 
 ### Phase 3 — Pre-launch
 
-| # | Task |
-|---|------|
-| 3.1 | Backups (D9). |
-| 3.2 | Local deployment setup — systemd / launchd / tmux per Artem's OS preference. |
-| 3.3 | Log rotation — the structured JSON logs need to not grow infinite. |
-| 3.4 | **README rewrite.** |
-| 3.5 | Mainnet promotion gate — conservative defaults, big-trade confirmation dialog in Telegram, etc. |
+| # | Status | Task |
+|---|---|---|
+| 3.1 | ⏳ | **Backups (D9)** — daily SQLite backup via `sqlite3 .backup` to a `backups/` directory, date-stamped, prune >30 days. Schedule via asyncio background task in `main.py`. |
+| 3.2 | ◻ | **Local deployment setup** — `launchd` plist for macOS so the bot runs 24/7. SIGTERM/SIGINT already wired. |
+| 3.3 | ◻ | **Log rotation polish** — confirm the existing rotating-file handler (10 MB × 5) caps correctly under sustained load. Tune if needed. |
+| 3.4 | ◻ | **README rewrite** — the README is frozen during the rework. This is the slot for the full rewrite. |
+| 3.5 | ◻ | **Mainnet promotion gate** — conservative defaults, big-trade confirmation dialog in Telegram, etc. |
 
 ### Phase 4 — GO LIVE
 
-| # | Task |
-|---|------|
-| 4.1 | Wire the real Discord adapter to CP's channel (channel ID + bot or selfbot auth). |
-| 4.2 | Artem onboards as the first user on testnet, runs ~5 live signals end-to-end, validates audit log + Telegram UI. |
-| 4.3 | Add the 2 friends as users. |
-| 4.4 | Move to mainnet (per-user choice). |
+| # | Status | Task |
+|---|---|---|
+| 4.1 | ◻ | Wire the real Discord adapter to CP's channel (channel ID + bot or selfbot auth). |
+| 4.2 | ◻ | Artem onboards as the first user on testnet, runs ~5 live signals end-to-end, validates audit log + Telegram UI. |
+| 4.3 | ◻ | Add the 2 friends as users. |
+| 4.4 | ◻ | Move to mainnet (per-user choice). |
 
 ### Phase 5 — Post-launch (parking lot)
 
 | # | Task |
 |---|------|
-| 5.1 | Weekly performance report (Sheets or PDF). |
+| 5.1 | Weekly performance report (Sheets or PDF). Row labels already match CP's report (per D2). |
 | 5.2 | VPS migration if needed. |
 | 5.3 | CI/CD (lint + tests on push). |
 | 5.4 | Backtest tooling for strategy A/B once enough live data exists. |
+
+---
+
+## Tests
+
+**541/541 passing** as of `d772548` (the baseline at `170abbd` was 414).
 
 ---
 

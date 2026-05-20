@@ -100,19 +100,38 @@ Key files when something breaks:
 
 ## Current phase
 
-**Phase 1 — Development & validation (no live trades).**
+**Phase 3 — Pre-launch.** Phases 1 (foundation) and 2 (Telegram redesign)
+are shipped. Branch `rework/scope-v1` is at `d772548` on GitHub.
 
-Order:
-1. **1.1 Shadow mode** — capture-only Discord adapter that archives CP messages without executing. (Active.)
-2. 1.2 Sample corpus expansion.
-3. 1.3 Port/wallet architecture (D1).
-4. 1.4 Strategy preset overhaul (D2).
-5. 1.5 Audit-log plumbing (D3).
-6. 1.6 Defensive parsing (D6).
+Done:
 
-Phase 2 = Telegram rework (interactive). Phase 3 = pre-launch (backups, deploy, log rotation, README, mainnet gate). Phase 4 = go live (wire real Discord, onboard Artem on testnet, then friends). Phase 5 (parking lot) = weekly reports, VPS, CI/CD, backtests.
+| # | Commit | What |
+|---|---|---|
+| 1.1 | `df5fb90` | Shadow-mode capture (no live trades) |
+| 1.2 | `8717f8b` + `e96219d` | Sample corpus expansion, CP format adoption, ORDER_PENDING / TRADE_LIVE |
+| 1.3 | `b210903` | Port/wallet architecture (D1) |
+| 1.4 | `055029c` | 7 new strategy presets (D2), even_split default |
+| 1.5 | `1158a4c` | Audit-log plumbing (D3) — raw_signal_text + decision_snapshot + trade_events |
+| 1.6 | `7bbc3a4` | Defensive parsing (D6) — typed errors, never crashes |
+| 2.1 | `c366c55` | SaaS layer ripped (D4) |
+| 2.2 | `80320b3` + `d772548` | Condensed dashboard, Port screen, Audit Trail |
+
+Up next (Phase 3 — pre-launch polish):
+
+1. **3.1 Backups (D9)** — daily SQLite backup to `backups/` with `sqlite3 .backup`, date-stamped, prune >30d. Schedule via asyncio background task in `main.py`.
+2. **3.2 Local deployment** — `launchd` plist for macOS so the bot runs 24/7 on Artem's laptop. SIGTERM is already wired.
+3. **3.3 Log rotation polish** — confirm rotating logs cap correctly under sustained load; tune if needed.
+4. **3.4 README rewrite** — the README is frozen during rework; this is where it gets the full rewrite for the new scope.
+5. **3.5 Mainnet promotion gate** — conservative defaults + big-trade confirmation dialog in Telegram before flipping to mainnet.
+
+Phase 4 = go live (wire CP's real Discord, Artem onboards on testnet, then friends, then mainnet per-user).
+Phase 5 = parking lot (weekly performance report, VPS, CI/CD, backtest tooling).
 
 Full phase breakdown: `docs/REWORK_BRIEF.md`.
+
+## Tests
+
+**541/541 passing** as of `d772548` (up from 414 at the start of the rework — +127 tests across 11 commits).
 
 ---
 
