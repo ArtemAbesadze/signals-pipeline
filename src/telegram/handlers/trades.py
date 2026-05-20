@@ -213,8 +213,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     open_trades = trade_db.get_open_trades()
     text = format_stats(closed, len(open_trades))
 
-    from src.telegram.keyboards import stats_keyboard
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=stats_keyboard())
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=trading_sub_keyboard())
 
 
 async def trade_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -368,6 +367,16 @@ async def trading_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         closed = closed[:HISTORY_MAX_TRADES]
         text, keyboard = _format_trade_list(closed, 0, "Trade History")
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    elif data == "trading:stats":
+        if not trade_db:
+            await query.edit_message_text("⚠️ Your trading pipeline is not active.")
+            return
+        from src.state.models import TradeStatus
+        closed = trade_db.get_trades_by_status(TradeStatus.CLOSED)
+        open_trades = trade_db.get_open_trades()
+        text = format_stats(closed, len(open_trades))
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=trading_sub_keyboard())
 
 
 async def trade_note_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

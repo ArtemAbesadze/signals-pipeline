@@ -2,32 +2,34 @@
 
 Every screen is one message with formatted text + inline keyboard buttons.
 Screens update in-place via edit_message_text (no new messages).
+
+Phase 2.2: the main menu is now a condensed dashboard (port/wallet,
+pipeline state, open trades, today, recent CP). Drill-downs collapse
+to Calls / Trading / Port / Config — Account, Stats, Dashboard
+are folded into other screens or removed.
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from src.orchestrator import Orchestrator
-from src.state.models import TradeStatus
+from src.state.models import EventType, TradeStatus
 from src.state.user_db import UserDatabase
 from src.telegram.formatters import (
-    format_account_info,
     format_calls_view,
-    format_dashboard,
+    format_main_menu,
     format_stats,
     format_trading_hub,
-    mask_address,
 )
 from src.telegram.keyboards import (
-    account_keyboard,
     calls_view_keyboard,
     config_menu_keyboard,
-    dashboard_keyboard,
     main_menu_keyboard,
-    stats_keyboard,
+    port_keyboard,
     trading_hub_keyboard,
 )
 from src.telegram.middleware import registered_only
@@ -38,6 +40,22 @@ logger = logging.getLogger(__name__)
 CALLS_LIMIT = 10
 # Maximum age for calls to appear in calls view
 CALLS_MAX_AGE = timedelta(days=3)
+
+# Local timezone for the dashboard timestamps + "today" boundary
+_LOCAL_TZ = ZoneInfo("America/New_York")
+
+# How many recent events to surface on the main dashboard
+_MAIN_RECENT_EVENT_LIMIT = 3
+# Event types that count as "actionable CP activity" on the main feed
+_ACTIONABLE_EVENT_TYPES = {
+    EventType.TP_HIT,
+    EventType.BREAKEVEN,
+    EventType.STOP_HIT,
+    EventType.TRADE_CLOSED,
+    EventType.CANCEL,
+    EventType.ORDER_PENDING,
+    EventType.TRADE_LIVE,
+}
 
 
 # ------------------------------------------------------------------
@@ -119,51 +137,101 @@ def is_in_calls_view(bot_data: dict, chat_id: int) -> bool:
 # Main menu text
 # ------------------------------------------------------------------
 
-def _build_main_menu_text(user_db: UserDatabase, user_id: str) -> str:
-    """Build the main menu text with user info."""
+def _build_main_menu_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> str:
+    """Build the condensed dashboard shown as the main menu.
+
+    Fetches all the data the dashboard needs (port state, wallet, open
+    trades + unrealized PnL, today's closed-trade summary, recent CP
+    events) and hands it to ``format_main_menu`` for rendering.
+    """
+    user_db = _get_user_db(context)
     user = user_db.get_user(user_id)
     display_name = user.display_name if user else "User"
 
-    # Get wallet address
-    try:
-        creds = user_db.get_user_credentials_decrypted(user_id)
-        if creds:
-            wallet = mask_address(creds.get("account_address", "N/A"))
-            network = creds.get("network", "testnet").capitalize()
-        else:
-            wallet = "N/A"
-            network = "Testnet"
-    except Exception:
-        wallet = "N/A"
-        network = "Testnet"
+    user_config = user_db.get_user_config(user_id) or {}
+    port_state = user_db.get_port_state(user_id) or {
+        "port_usd": None, "port_mode": "withdraw", "port_watermark": None,
+    }
 
-    return (
-        f"{'━' * 30}\n"
-        "🧪 *Welcome to Potion Perps!*\n"
-        f"{'━' * 30}\n\n"
-        f"Hey {display_name}! What would you like to do?\n\n"
-        f"💼 Wallet:    `{wallet}`\n"
-        f"🌐 Network:  {network}\n\n"
-        f"{'─' * 30}\n"
-        "📖 Guide  ·  💬 Support  ·  🌐 Socials"
+    client = _get_client(context, user_id)
+    trade_db = _get_trade_db(context, user_id)
+
+    wallet_usd: float | None = None
+    positions_by_coin: dict = {}
+    if client is not None:
+        try:
+            bal = client.get_balance()
+            wallet_usd = float(bal.get("usdc_balance", 0))
+        except Exception:
+            logger.exception("Failed to fetch wallet for user %s", user_id)
+        try:
+            positions_by_coin = {
+                p["coin"]: p for p in client.get_open_positions()
+            }
+        except Exception:
+            logger.exception("Failed to fetch positions for user %s", user_id)
+
+    open_pairs: list[tuple] = []
+    today_count = today_wins = today_losses = 0
+    today_total_pnl = 0.0
+    recent_events: list = []
+    if trade_db is not None:
+        try:
+            open_trades = trade_db.get_open_trades()
+            for t in open_trades:
+                open_pairs.append((t, positions_by_coin.get(t.coin)))
+        except Exception:
+            logger.exception("Failed to fetch open trades for user %s", user_id)
+
+        try:
+            # "Today" runs from local midnight in _LOCAL_TZ
+            now_local = datetime.now(timezone.utc).astimezone(_LOCAL_TZ)
+            local_midnight = now_local.replace(
+                hour=0, minute=0, second=0, microsecond=0,
+            )
+            midnight_utc = local_midnight.astimezone(timezone.utc).replace(tzinfo=None)
+            for t in trade_db.get_completed_trades():
+                closed = t.closed_at
+                if closed is not None and closed >= midnight_utc and t.pnl_pct is not None:
+                    today_count += 1
+                    today_total_pnl += t.pnl_pct
+                    if t.pnl_pct > 0:
+                        today_wins += 1
+                    elif t.pnl_pct < 0:
+                        today_losses += 1
+        except Exception:
+            logger.exception("Failed to compute today's stats for user %s", user_id)
+
+        try:
+            # Pull recent events filtered to actionable types
+            raw_events = trade_db.get_events_for_user(limit=20)
+            actionable = [e for e in raw_events if e.event_type in _ACTIONABLE_EVENT_TYPES]
+            recent_events = actionable[:_MAIN_RECENT_EVENT_LIMIT]
+        except Exception:
+            logger.exception("Failed to fetch recent events for user %s", user_id)
+
+    is_active = _is_pipeline_active(context, user_id)
+
+    return format_main_menu(
+        display_name=display_name,
+        port_state=port_state,
+        wallet_usd=wallet_usd,
+        pipeline_active=is_active,
+        auto_execute=bool(user_config.get("auto_execute")),
+        preset_name=user_config.get("active_preset", "even_split"),
+        open_trades=open_pairs,
+        today_count_closed=today_count,
+        today_total_pnl_pct=today_total_pnl,
+        today_wins=today_wins,
+        today_losses=today_losses,
+        recent_events=recent_events,
+        tz=_LOCAL_TZ,
     )
 
 
 # ------------------------------------------------------------------
 # Screen builders for each submenu
 # ------------------------------------------------------------------
-
-def _build_account_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> str:
-    user_db = _get_user_db(context)
-    user_config = user_db.get_user_config(user_id)
-    try:
-        creds = user_db.get_user_credentials_decrypted(user_id)
-        if not creds:
-            creds = {}
-    except Exception:
-        creds = {}
-    return format_account_info(user_config, creds)
-
 
 def _build_calls_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> tuple[str, InlineKeyboardMarkup]:
     """Build calls view text and keyboard with approve/reject for pending signals."""
@@ -231,6 +299,7 @@ def _build_trading_hub_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) ->
 
 
 def _build_stats_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> str:
+    """Stats screen — now reached via Trading > Stats."""
     trade_db = _get_trade_db(context, user_id)
     if not trade_db:
         return "📈 *Trading Statistics*\n\nPipeline not active."
@@ -240,11 +309,15 @@ def _build_stats_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> str:
     return format_stats(closed, len(open_trades))
 
 
-def _build_dashboard_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> str:
-    user_db = _get_user_db(context)
-    user_config = user_db.get_user_config(user_id)
-    is_active = _is_pipeline_active(context, user_id)
-    return format_dashboard(user_config, is_active)
+def _build_port_placeholder() -> str:
+    """Placeholder for the Port screen. Real implementation lands in Commit B."""
+    return (
+        "🛡 *Port*\n\n"
+        "_Port management UI is coming in the next commit (Phase 2.2 Commit B)._\n\n"
+        "Port amount and mode can be set via the admin REST API in the "
+        "meantime:\n"
+        "  PUT /api/users/{id} {\"config\": {\"port_usd\": 1000, \"port_mode\": \"compound\"}}"
+    )
 
 
 def _build_config_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> str:
@@ -285,10 +358,9 @@ def _build_config_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> str:
 _SCREEN_MAP = [
     ("📊 Trading\n", "trading"),       # Must be before stats (also 📊)
     ("📈 Trading Statistics", "stats"),
-    ("🧪 Welcome", "main"),
-    ("👤 Account", "account"),
+    ("🧪 Potion Perps", "main"),
     ("📡 Calls View", "calls"),
-    ("🛡 Risk Dashboard", "dashboard"),
+    ("🛡 Port", "port"),
     ("⚙️ Configuration", "config"),
     ("💰 Account Balance", "trading"),  # Sub-views → refresh as trading hub
     ("📂 Open Positions", "trading"),
@@ -315,12 +387,12 @@ def _detect_current_screen(message_text: str | None) -> str:
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /menu — send main menu as a new message."""
     user_id = context.user_data["user_id"]
-    user_db = _get_user_db(context)
-    text = _build_main_menu_text(user_db, user_id)
+    text = _build_main_menu_text(context, user_id)
+    is_active = _is_pipeline_active(context, user_id)
     await update.message.reply_text(
         text,
         parse_mode="Markdown",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(is_active),
     )
 
 
@@ -356,16 +428,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         if data == "menu:main":
             _leave_calls_view(context, chat_id)
-            text = _build_main_menu_text(user_db, user_id)
+            text = _build_main_menu_text(context, user_id)
+            is_active = _is_pipeline_active(context, user_id)
             await query.edit_message_text(
-                text, parse_mode="Markdown", reply_markup=main_menu_keyboard(),
-            )
-
-        elif data == "menu:account":
-            _leave_calls_view(context, chat_id)
-            text = _build_account_text(context, user_id)
-            await query.edit_message_text(
-                text, parse_mode="Markdown", reply_markup=account_keyboard(),
+                text, parse_mode="Markdown", reply_markup=main_menu_keyboard(is_active),
             )
 
         elif data == "menu:calls":
@@ -383,26 +449,32 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 text, parse_mode="Markdown", reply_markup=trading_hub_keyboard(),
             )
 
-        elif data == "menu:stats":
+        elif data == "menu:port":
             _leave_calls_view(context, chat_id)
-            text = _build_stats_text(context, user_id)
+            text = _build_port_placeholder()
             await query.edit_message_text(
-                text, parse_mode="Markdown", reply_markup=stats_keyboard(),
-            )
-
-        elif data == "menu:dashboard":
-            _leave_calls_view(context, chat_id)
-            text = _build_dashboard_text(context, user_id)
-            await query.edit_message_text(
-                text, parse_mode="Markdown", reply_markup=dashboard_keyboard(),
+                text, parse_mode="Markdown", reply_markup=port_keyboard(),
             )
 
         elif data == "menu:config":
             _leave_calls_view(context, chat_id)
             text = _build_config_text(context, user_id)
+            await query.edit_message_text(
+                text, parse_mode="Markdown", reply_markup=config_menu_keyboard(),
+            )
+
+        elif data in ("menu:pause", "menu:resume"):
+            orchestrator = _get_orchestrator(context)
+            if orchestrator is not None:
+                if data == "menu:pause":
+                    orchestrator.pause_user(user_id)
+                else:
+                    orchestrator.resume_user(user_id)
+            # Re-render the main menu reflecting the new state
+            text = _build_main_menu_text(context, user_id)
             is_active = _is_pipeline_active(context, user_id)
             await query.edit_message_text(
-                text, parse_mode="Markdown", reply_markup=config_menu_keyboard(is_active),
+                text, parse_mode="Markdown", reply_markup=main_menu_keyboard(is_active),
             )
 
         elif data == "menu:refresh":
@@ -426,13 +498,11 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def _refresh_screen(query, context, user_id, user_db, screen):
     """Re-render the detected screen."""
-    if screen == "main":
-        text = _build_main_menu_text(user_db, user_id)
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    is_active = _is_pipeline_active(context, user_id)
 
-    elif screen == "account":
-        text = _build_account_text(context, user_id)
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=account_keyboard())
+    if screen == "main":
+        text = _build_main_menu_text(context, user_id)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard(is_active))
 
     elif screen == "calls":
         text, keyboard = _build_calls_text(context, user_id)
@@ -442,19 +512,14 @@ async def _refresh_screen(query, context, user_id, user_db, screen):
         text = _build_trading_hub_text(context, user_id)
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=trading_hub_keyboard())
 
-    elif screen == "stats":
-        text = _build_stats_text(context, user_id)
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=stats_keyboard())
-
-    elif screen == "dashboard":
-        text = _build_dashboard_text(context, user_id)
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=dashboard_keyboard())
+    elif screen == "port":
+        text = _build_port_placeholder()
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=port_keyboard())
 
     elif screen == "config":
         text = _build_config_text(context, user_id)
-        is_active = _is_pipeline_active(context, user_id)
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=config_menu_keyboard(is_active))
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=config_menu_keyboard())
 
     else:
-        text = _build_main_menu_text(user_db, user_id)
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        text = _build_main_menu_text(context, user_id)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard(is_active))

@@ -75,50 +75,165 @@ def format_positions(positions: list[dict[str, Any]]) -> str:
     return "\n\n".join(lines)
 
 
-def format_status(
-    user_config: dict,
-    balance: dict[str, str],
-    positions: list,
-) -> str:
-    """Format risk dashboard / status view."""
-    open_count = len(positions)
-    max_pos = user_config.get("max_open_positions", 10)
-
-    total_exposure = sum(
-        abs(float(p.get("size", 0)) * float(p.get("entry_price", 0)))
-        for p in positions
-    )
-    max_exposure = user_config.get("max_total_exposure_usd", 2000)
-
-    return (
-        "🛡 *Risk Dashboard*\n\n"
-        f"🎯 Preset: {user_config.get('active_preset', 'even_split')}\n"
-        f"⚡ Auto-execute: {'ON' if user_config.get('auto_execute') else 'OFF'}\n"
-        f"📊 Max Leverage: {user_config.get('max_leverage', 20)}x\n\n"
-        f"🔒 *Risk Limits*\n"
-        f"📊 Positions: {open_count}/{max_pos}\n"
-        f"📈 Exposure: {format_usd(total_exposure)} / {format_usd(max_exposure)}\n"
-        f"💰 Max Position: {format_usd(user_config.get('max_position_size_usd', 500))}\n"
-        f"🛡 Daily Loss Limit: {user_config.get('max_daily_loss_pct', 10)}%\n\n"
-        f"💼 *Account*\n"
-        f"💵 Balance: {format_usd(balance.get('account_value', '0'))}"
-    )
-
-
-def format_account_info(
-    user_config: dict,
-    credentials: dict,
-) -> str:
-    """Format account info for the account submenu."""
+def format_account_block(credentials: dict) -> str:
+    """Inline account block used inside the Config screen (wallet + network)."""
     wallet = mask_address(credentials.get("account_address", "N/A"))
     api_wallet = mask_address(credentials.get("api_wallet", "N/A"))
     network = credentials.get("network", "testnet").capitalize()
+    return (
+        "🔐 *Account*\n"
+        f"Wallet: `{wallet}`\n"
+        f"API: `{api_wallet}` ({network})"
+    )
+
+
+# ------------------------------------------------------------------
+# Main menu dashboard helpers
+# ------------------------------------------------------------------
+
+def _format_port_status_line(
+    port_usd: float | None,
+    port_mode: str,
+    wallet_usd: float | None,
+) -> str:
+    """One-line port + wallet status with bounds indicator.
+
+    ✅ within bounds | ⚠️ near wallet (>95%) | 🛑 exceeds wallet | ⚙️ not set
+    """
+    if port_usd is None:
+        return "💰 Port: _not set_  |  💼 Wallet: " + (format_usd(wallet_usd) if wallet_usd is not None else "—")
+
+    port_str = format_usd(port_usd)
+    wallet_str = format_usd(wallet_usd) if wallet_usd is not None else "—"
+    if wallet_usd is None:
+        marker = "—"
+    elif port_usd > wallet_usd:
+        marker = "🛑"
+    elif port_usd > wallet_usd * 0.95:
+        marker = "⚠️"
+    else:
+        marker = "✅"
+    return f"💰 Port: {port_str} ({port_mode})  |  💼 Wallet: {wallet_str}  {marker}"
+
+
+def _format_open_trade_line(trade: Any, position: dict | None) -> str:
+    """One row in the dashboard's open-trades section."""
+    side_emoji = "📈" if trade.side.upper() == "LONG" else "📉"
+    if position is None:
+        # Trade exists in DB but no exchange position — typically PENDING entry
+        return f"  ⏳ {trade.coin} {trade.side} #{trade.trade_id}  pending entry"
+    try:
+        entry = float(position.get("entry_price", trade.entry_price))
+        size = abs(float(position.get("size", 0)))
+        unrealized = float(position.get("unrealized_pnl", 0))
+        pnl_pct = (unrealized / (entry * size)) * 100 if entry > 0 and size > 0 else 0.0
+    except (TypeError, ValueError):
+        pnl_pct = 0.0
+    return f"  🟢 {side_emoji} {trade.coin} {trade.side} #{trade.trade_id}  {pnl_pct:+.2f}%"
+
+
+def _format_recent_event_line(event: Any, now_local: datetime, tz: ZoneInfo) -> str:
+    """One row in the dashboard's 'Recent CP' section."""
+    icon = {
+        "tp_hit": "🎯",
+        "breakeven": "⚖️",
+        "stop_hit": "🛑",
+        "trade_closed": "🏁",
+        "cancel": "🚫",
+        "order_pending": "⌛",
+        "trade_live": "✅",
+    }.get(event.event_type.value, "•")
+
+    occurred = event.occurred_at
+    if occurred is not None:
+        occurred_local = occurred.replace(tzinfo=timezone.utc).astimezone(tz)
+        if occurred_local.date() == now_local.date():
+            time_str = occurred_local.strftime("%-I:%M %p")
+        else:
+            time_str = occurred_local.strftime("%b %-d, %-I:%M %p")
+    else:
+        time_str = "—"
+
+    action = event.action_taken or event.event_type.value
+    # Truncate long actions to keep the dashboard tight
+    if len(action) > 70:
+        action = action[:67] + "..."
+    return f"  {icon} {time_str}  {action}"
+
+
+def format_main_menu(
+    display_name: str,
+    port_state: dict,
+    wallet_usd: float | None,
+    pipeline_active: bool,
+    auto_execute: bool,
+    preset_name: str,
+    open_trades: list[tuple[Any, dict | None]],
+    today_count_closed: int,
+    today_total_pnl_pct: float,
+    today_wins: int,
+    today_losses: int,
+    recent_events: list[Any],
+    tz: ZoneInfo = _NY,
+) -> str:
+    """Build the condensed dashboard shown as the main menu.
+
+    Args:
+        display_name: User's display name for the greeting line.
+        port_state: ``{"port_usd", "port_mode", "port_watermark"}``.
+        wallet_usd: Current wallet USDC balance, or None if unavailable.
+        pipeline_active: True if the user's pipeline is not paused.
+        auto_execute: True if auto-execute is on.
+        preset_name: Active strategy preset name.
+        open_trades: List of ``(TradeRecord, position dict | None)`` pairs
+            for trades currently open or pending. Positions are matched by
+            coin from ``client.get_open_positions()``.
+        today_count_closed: Number of trades closed since local midnight.
+        today_total_pnl_pct: Sum of pnl_pct for those trades.
+        today_wins / today_losses: Splits within today_count_closed.
+        recent_events: TradeEvent rows (most recent first) filtered to
+            actionable types.
+        tz: Local timezone for timestamps.
+    """
+    port_line = _format_port_status_line(
+        port_state.get("port_usd"),
+        port_state.get("port_mode", "withdraw"),
+        wallet_usd,
+    )
+    pipeline_text = "▶️ Active" if pipeline_active else "⏸ Paused"
+    auto_text = "ON" if auto_execute else "OFF"
+
+    # Open trades section
+    if open_trades:
+        lines = [_format_open_trade_line(t, pos) for t, pos in open_trades]
+        open_section = f"📂 *Open trades ({len(open_trades)}):*\n" + "\n".join(lines)
+    else:
+        open_section = "📂 *Open trades:* none"
+
+    # Today section
+    if today_count_closed > 0:
+        today_section = (
+            f"📈 *Today:* {format_pct(today_total_pnl_pct)} "
+            f"({today_count_closed} closed: {today_wins}W / {today_losses}L)"
+        )
+    else:
+        today_section = "📈 *Today:* no closed trades"
+
+    # Recent CP section
+    if recent_events:
+        now_local = datetime.now(timezone.utc).astimezone(tz)
+        event_lines = [_format_recent_event_line(e, now_local, tz) for e in recent_events]
+        cp_section = "📡 *Recent CP:*\n" + "\n".join(event_lines)
+    else:
+        cp_section = "📡 *Recent CP:* nothing yet"
 
     return (
-        "👤 *Account*\n\n"
-        f"💼 Wallet: `{wallet}`\n"
-        f"🔑 API Wallet: `{api_wallet}`\n"
-        f"🌐 Network: {network}"
+        f"🧪 *Potion Perps* — Hey {display_name}!\n\n"
+        f"{port_line}\n"
+        f"{pipeline_text}  |  ⚡ Auto: {auto_text}  |  🎯 {preset_name}\n\n"
+        f"{open_section}\n\n"
+        f"{today_section}\n\n"
+        f"{cp_section}"
     )
 
 
@@ -242,32 +357,3 @@ def format_stats(closed_trades: list, open_count: int) -> str:
     )
 
 
-def format_dashboard(
-    user_config: dict,
-    is_active: bool,
-) -> str:
-    """Format the risk dashboard for the menu view."""
-    from src.config.settings import BUILTIN_PRESETS
-
-    preset_name = user_config.get("active_preset", "even_split")
-    p = BUILTIN_PRESETS.get(preset_name)
-    tp_desc = ""
-    if p:
-        tp_pcts = [int(x * 100) for x in p.tp_split]
-        tp_desc = f" ({tp_pcts[0]}/{tp_pcts[1]}/{tp_pcts[2]})"
-
-    auto = "✅ Auto" if user_config.get("auto_execute") else "👋 Manual Approve"
-    pipeline = "▶️ Active" if is_active else "⏸ Paused"
-
-    return (
-        "🛡 *Risk Dashboard*\n\n"
-        f"▶️ Pipeline: {pipeline}\n"
-        f"🤖 Calls Mode: {auto}\n"
-        f"🎯 Strategy: {preset_name}{tp_desc}\n"
-        f"📊 Leverage: {user_config.get('max_leverage', 20)}x\n\n"
-        "🔒 *Risk Limits*\n"
-        f"Max Positions: {user_config.get('max_open_positions', 10)}\n"
-        f"Max Position: {format_usd(user_config.get('max_position_size_usd', 500))}\n"
-        f"Max Exposure: {format_usd(user_config.get('max_total_exposure_usd', 2000))}\n"
-        f"Daily Loss Limit: {user_config.get('max_daily_loss_pct', 10)}%"
-    )

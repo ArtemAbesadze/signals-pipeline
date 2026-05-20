@@ -1,4 +1,10 @@
-"""Account monitoring handlers — /balance, /positions, /status, /activate, /deactivate."""
+"""Account-related slash commands — /balance, /positions, /activate, /deactivate.
+
+The /status command was removed in Phase 2.2 (its info is now on the
+main dashboard). The account_nav_callback (legacy inline-button
+navigation between balance/positions/status views) is also gone — the
+Trading hub is the central nav for account data.
+"""
 
 import logging
 
@@ -6,9 +12,8 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from src.orchestrator import Orchestrator
-from src.state.user_db import UserDatabase
-from src.telegram.formatters import format_balance, format_positions, format_status
-from src.telegram.keyboards import account_nav_keyboard, trading_sub_keyboard
+from src.telegram.formatters import format_balance, format_positions
+from src.telegram.keyboards import trading_sub_keyboard
 from src.telegram.middleware import registered_only
 
 logger = logging.getLogger(__name__)
@@ -76,84 +81,6 @@ async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         text,
         parse_mode="Markdown",
         reply_markup=trading_sub_keyboard(),
-    )
-
-
-@registered_only
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /status — show risk dashboard and access info."""
-    user_id = context.user_data["user_id"]
-    user_db: UserDatabase = context.bot_data["user_db"]
-    client = _get_client(context, user_id)
-
-    if not client:
-        await update.message.reply_text(
-            "⚠️ Your trading pipeline is not active. Use /activate or contact admin."
-        )
-        return
-
-    user_config = user_db.get_user_config(user_id)
-
-    try:
-        balance = client.get_balance()
-        positions = client.get_open_positions()
-    except Exception as e:
-        logger.error("Failed to fetch account data for user %s: %s", user_id, e)
-        await update.message.reply_text("⚠️ Failed to fetch account data. Try again later.")
-        return
-
-    text = format_status(user_config, balance, positions)
-    from src.telegram.keyboards import dashboard_keyboard
-    await update.message.reply_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=dashboard_keyboard(),
-    )
-
-
-async def account_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle inline keyboard navigation between account views."""
-    query = update.callback_query
-    await query.answer()
-
-    # Check registration (can't use decorator on callback queries easily)
-    user_db: UserDatabase = context.bot_data["user_db"]
-    chat_id = update.effective_chat.id
-    user_id = user_db.get_user_by_telegram_chat_id(chat_id)
-    if not user_id:
-        await query.edit_message_text("❌ You're not registered. Use /register to get started.")
-        return
-
-    client = _get_client(context, user_id)
-    if not client:
-        await query.edit_message_text("⚠️ Your trading pipeline is not active.")
-        return
-
-    view = query.data.replace("nav:", "")
-
-    try:
-        if view == "balance":
-            balance = client.get_balance()
-            text = format_balance(balance)
-        elif view == "positions":
-            positions = client.get_open_positions()
-            text = format_positions(positions)
-        elif view == "status":
-            user_config = user_db.get_user_config(user_id)
-            balance = client.get_balance()
-            positions = client.get_open_positions()
-            text = format_status(user_config, balance, positions)
-        else:
-            return
-    except Exception as e:
-        logger.error("Failed to fetch data for nav:%s user %s: %s", view, user_id, e)
-        await query.edit_message_text("⚠️ Failed to fetch data. Try again later.")
-        return
-
-    await query.edit_message_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=account_nav_keyboard(view),
     )
 
 

@@ -1,4 +1,14 @@
-"""Inline keyboard builders for Telegram bot."""
+"""Inline keyboard builders for Telegram bot.
+
+Menu graph (Phase 2.2 redesign):
+
+    Main (dashboard)
+    ├── Calls
+    ├── Trading (hub) → Balance / Positions / Trades / History / Stats
+    ├── Port → state + history (Phase 2.2 Commit B)
+    ├── Config (absorbs Account + Dashboard)
+    └── Pause (toggle)
+"""
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -19,23 +29,31 @@ def _back_refresh_close(back_target: str, back_label: str = "⬅️ Menu") -> li
 
 
 # ------------------------------------------------------------------
-# Main menu
+# Main menu — condensed dashboard with 4 drill-downs + pause/refresh
 # ------------------------------------------------------------------
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Main menu — 3 rows of 2 buttons + Close."""
+def main_menu_keyboard(is_active: bool = True) -> InlineKeyboardMarkup:
+    """Main menu — 4 drill-downs + Pause toggle + Refresh + Close.
+
+    ``is_active`` controls the Pause/Resume button label.
+    """
+    pause_btn = (
+        InlineKeyboardButton("⏸ Pause", callback_data="menu:pause")
+        if is_active
+        else InlineKeyboardButton("▶️ Resume", callback_data="menu:resume")
+    )
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("👤 Account", callback_data="menu:account"),
-            InlineKeyboardButton("📡 Calls View", callback_data="menu:calls"),
-        ],
-        [
+            InlineKeyboardButton("📡 Calls", callback_data="menu:calls"),
             InlineKeyboardButton("📊 Trading", callback_data="menu:trading"),
-            InlineKeyboardButton("📈 Statistics", callback_data="menu:stats"),
         ],
         [
-            InlineKeyboardButton("🛡 Dashboard", callback_data="menu:dashboard"),
-            InlineKeyboardButton("⚙️ Configuration", callback_data="menu:config"),
+            InlineKeyboardButton("🛡 Port", callback_data="menu:port"),
+            InlineKeyboardButton("⚙️ Config", callback_data="menu:config"),
+        ],
+        [
+            pause_btn,
+            InlineKeyboardButton("🔄 Refresh", callback_data="menu:refresh"),
         ],
         [InlineKeyboardButton("✖ Close", callback_data="menu:close")],
     ])
@@ -45,18 +63,13 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 # Submenu keyboards
 # ------------------------------------------------------------------
 
-def account_keyboard() -> InlineKeyboardMarkup:
-    """Account submenu — back/refresh/close nav only."""
-    return InlineKeyboardMarkup(_back_refresh_close("menu:main"))
-
-
 def calls_view_keyboard() -> InlineKeyboardMarkup:
     """Calls view — Back + Refresh + Close."""
     return InlineKeyboardMarkup(_back_refresh_close("menu:main"))
 
 
 def trading_hub_keyboard() -> InlineKeyboardMarkup:
-    """Trading hub — 4 sub-buttons + nav."""
+    """Trading hub — 5 sub-buttons (incl. Stats) + nav."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("💰 Balance", callback_data="trading:balance"),
@@ -66,6 +79,7 @@ def trading_hub_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📋 Trades", callback_data="trading:trades"),
             InlineKeyboardButton("📜 History", callback_data="trading:history"),
         ],
+        [InlineKeyboardButton("📈 Stats", callback_data="trading:stats")],
         *_back_refresh_close("menu:main"),
     ])
 
@@ -75,23 +89,23 @@ def trading_sub_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(_back_refresh_close("menu:trading", "⬅️ Trading"))
 
 
-def stats_keyboard() -> InlineKeyboardMarkup:
-    """Statistics view — Back + Refresh + Close."""
-    return InlineKeyboardMarkup(_back_refresh_close("menu:main"))
+def port_keyboard() -> InlineKeyboardMarkup:
+    """Port management — state + history view (Phase 2.2 Commit B)."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Set Amount", callback_data="port:set_amount"),
+            InlineKeyboardButton("🔄 Change Mode", callback_data="port:change_mode"),
+        ],
+        [InlineKeyboardButton("📜 Full History", callback_data="port:full_history")],
+        *_back_refresh_close("menu:main"),
+    ])
 
 
-def dashboard_keyboard() -> InlineKeyboardMarkup:
-    """Risk Dashboard — Back + Refresh + Close."""
-    return InlineKeyboardMarkup(_back_refresh_close("menu:main"))
+def config_menu_keyboard() -> InlineKeyboardMarkup:
+    """Configuration submenu — preset / auto / leverage / risk + nav.
 
-
-def config_menu_keyboard(is_active: bool = True) -> InlineKeyboardMarkup:
-    """Configuration submenu — settings buttons + activate/deactivate + nav."""
-    toggle_btn = (
-        InlineKeyboardButton("⏸ Deactivate", callback_data="cfg:deactivate")
-        if is_active
-        else InlineKeyboardButton("▶️ Activate", callback_data="cfg:activate")
-    )
+    Pipeline pause/resume now lives on the main menu, not here.
+    """
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🎯 Preset", callback_data="cfg:strategy"),
@@ -101,7 +115,6 @@ def config_menu_keyboard(is_active: bool = True) -> InlineKeyboardMarkup:
             InlineKeyboardButton("📊 Leverage", callback_data="cfg:leverage"),
             InlineKeyboardButton("🛡 Risk Limits", callback_data="cfg:risk"),
         ],
-        [toggle_btn],
         *_back_refresh_close("menu:main"),
     ])
 
@@ -140,19 +153,3 @@ def risk_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🛡 Daily Loss Limit", callback_data="cfg:risk:max_daily_loss_pct")],
         [InlineKeyboardButton("⬅️ Back", callback_data="cfg:back")],
     ])
-
-
-# ------------------------------------------------------------------
-# Legacy (kept for backward compatibility in account nav callbacks)
-# ------------------------------------------------------------------
-
-def account_nav_keyboard(current: str = "balance") -> InlineKeyboardMarkup:
-    """Navigation keyboard for account views (balance, positions, status)."""
-    buttons = []
-    if current != "balance":
-        buttons.append(InlineKeyboardButton("💰 Balance", callback_data="nav:balance"))
-    if current != "positions":
-        buttons.append(InlineKeyboardButton("📂 Positions", callback_data="nav:positions"))
-    if current != "status":
-        buttons.append(InlineKeyboardButton("🛡 Status", callback_data="nav:status"))
-    return InlineKeyboardMarkup([buttons])

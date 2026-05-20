@@ -6,8 +6,8 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from src.config.settings import BUILTIN_PRESETS
-from src.orchestrator import Orchestrator
 from src.state.user_db import UserDatabase
+from src.telegram.formatters import format_account_block
 from src.telegram.keyboards import config_menu_keyboard, preset_keyboard, risk_keyboard
 from src.telegram.middleware import registered_only
 
@@ -18,18 +18,8 @@ def _get_user_db(context: ContextTypes.DEFAULT_TYPE) -> UserDatabase:
     return context.bot_data["user_db"]
 
 
-def _is_pipeline_active(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> bool:
-    orchestrator: Orchestrator | None = context.bot_data.get("orchestrator")
-    if not orchestrator:
-        return False
-    paused = orchestrator.is_user_paused(user_id)
-    if paused is None:
-        return False
-    return not paused
-
-
-def _format_config(cfg: dict) -> str:
-    """Format current config for display."""
+def _format_config(cfg: dict, account_block: str | None = None) -> str:
+    """Format current config for display, with optional inline Account block."""
     preset = cfg.get("active_preset", "even_split")
     auto = "✅ ON" if cfg.get("auto_execute") else "❌ OFF"
     lev = cfg.get("max_leverage", 20)
@@ -41,7 +31,7 @@ def _format_config(cfg: dict) -> str:
         tp_pcts = [int(x * 100) for x in p.tp_split]
         tp_desc = f" ({tp_pcts[0]}/{tp_pcts[1]}/{tp_pcts[2]})"
 
-    return (
+    text = (
         "⚙️ *Configuration*\n\n"
         f"🎯 Strategy: {preset}{tp_desc}\n"
         f"⚡ Auto-execute: {auto}\n"
@@ -52,6 +42,18 @@ def _format_config(cfg: dict) -> str:
         f"Max Exposure: ${cfg.get('max_total_exposure_usd', 2000):,.0f}\n"
         f"Daily Loss Limit: {cfg.get('max_daily_loss_pct', 10)}%"
     )
+    if account_block:
+        text += f"\n\n{account_block}"
+    return text
+
+
+def _build_account_block(user_db: UserDatabase, user_id: str) -> str:
+    """Fetch decrypted credentials and render the inline Account block."""
+    try:
+        creds = user_db.get_user_credentials_decrypted(user_id)
+    except Exception:
+        creds = None
+    return format_account_block(creds or {})
 
 
 @registered_only
@@ -60,13 +62,13 @@ async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = context.user_data["user_id"]
     user_db = _get_user_db(context)
     cfg = user_db.get_user_config(user_id)
-    is_active = _is_pipeline_active(context, user_id)
+    account_block = _build_account_block(user_db, user_id)
 
-    text = _format_config(cfg)
+    text = _format_config(cfg, account_block)
     await update.message.reply_text(
         text,
         parse_mode="Markdown",
-        reply_markup=config_menu_keyboard(is_active),
+        reply_markup=config_menu_keyboard(),
     )
 
 
@@ -143,11 +145,11 @@ async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         tp_pcts = [int(x * 100) for x in p.tp_split]
 
         cfg = user_db.get_user_config(user_id)
-        text = _format_config(cfg)
+        account_block = _build_account_block(user_db, user_id)
+        text = _format_config(cfg, account_block)
         text += f"\n\n_🎯 Changed to {name} ({tp_pcts[0]}/{tp_pcts[1]}/{tp_pcts[2]})_"
-        is_active = _is_pipeline_active(context, user_id)
         await query.edit_message_text(
-            text, parse_mode="Markdown", reply_markup=config_menu_keyboard(is_active),
+            text, parse_mode="Markdown", reply_markup=config_menu_keyboard(),
         )
 
     elif data == "cfg:auto":
@@ -156,12 +158,12 @@ async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         user_db.update_user_config(user_id, auto_execute=new_value)
 
         cfg = user_db.get_user_config(user_id)
-        text = _format_config(cfg)
+        account_block = _build_account_block(user_db, user_id)
+        text = _format_config(cfg, account_block)
         state = "✅ ON" if new_value else "❌ OFF"
         text += f"\n\n_⚡ Auto-execute toggled {state}_"
-        is_active = _is_pipeline_active(context, user_id)
         await query.edit_message_text(
-            text, parse_mode="Markdown", reply_markup=config_menu_keyboard(is_active),
+            text, parse_mode="Markdown", reply_markup=config_menu_keyboard(),
         )
 
     elif data == "cfg:risk":
@@ -203,67 +205,10 @@ async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     elif data == "cfg:back":
         cfg = user_db.get_user_config(user_id)
-        text = _format_config(cfg)
-        is_active = _is_pipeline_active(context, user_id)
+        account_block = _build_account_block(user_db, user_id)
+        text = _format_config(cfg, account_block)
         await query.edit_message_text(
-            text, parse_mode="Markdown", reply_markup=config_menu_keyboard(is_active),
-        )
-
-    elif data == "cfg:activate":
-        orchestrator: Orchestrator | None = context.bot_data.get("orchestrator")
-        if not orchestrator:
-            await query.edit_message_text("⚠️ Trading system is not available.")
-            return
-
-        paused = orchestrator.is_user_paused(user_id)
-        if paused is None:
-            await query.edit_message_text("⚠️ Your trading pipeline is not active. Contact admin.")
-            return
-
-        if not paused:
-            # Already active, just refresh
-            cfg = user_db.get_user_config(user_id)
-            text = _format_config(cfg)
-            text += "\n\n_▶️ Trading is already active._"
-            await query.edit_message_text(
-                text, parse_mode="Markdown", reply_markup=config_menu_keyboard(True),
-            )
-            return
-
-        orchestrator.resume_user(user_id)
-        cfg = user_db.get_user_config(user_id)
-        text = _format_config(cfg)
-        text += "\n\n_▶️ Trading activated! You will receive trade signals._"
-        await query.edit_message_text(
-            text, parse_mode="Markdown", reply_markup=config_menu_keyboard(True),
-        )
-
-    elif data == "cfg:deactivate":
-        orchestrator: Orchestrator | None = context.bot_data.get("orchestrator")
-        if not orchestrator:
-            await query.edit_message_text("⚠️ Trading system is not available.")
-            return
-
-        paused = orchestrator.is_user_paused(user_id)
-        if paused is None:
-            await query.edit_message_text("⚠️ Your trading pipeline is not active. Contact admin.")
-            return
-
-        if paused:
-            cfg = user_db.get_user_config(user_id)
-            text = _format_config(cfg)
-            text += "\n\n_⏸ Trading is already paused._"
-            await query.edit_message_text(
-                text, parse_mode="Markdown", reply_markup=config_menu_keyboard(False),
-            )
-            return
-
-        orchestrator.pause_user(user_id)
-        cfg = user_db.get_user_config(user_id)
-        text = _format_config(cfg)
-        text += "\n\n_⏸ Trading deactivated. No new signals will be sent._"
-        await query.edit_message_text(
-            text, parse_mode="Markdown", reply_markup=config_menu_keyboard(False),
+            text, parse_mode="Markdown", reply_markup=config_menu_keyboard(),
         )
 
 
@@ -332,10 +277,10 @@ async def config_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Success — clear state and show updated config with menu
     context.user_data.pop("awaiting_config", None)
     cfg = user_db.get_user_config(user_id)
-    config_text = _format_config(cfg)
-    is_active = _is_pipeline_active(context, user_id)
+    account_block = _build_account_block(user_db, user_id)
+    config_text = _format_config(cfg, account_block)
     await update.message.reply_text(
         config_text + "\n\n_✅ Setting updated._",
         parse_mode="Markdown",
-        reply_markup=config_menu_keyboard(is_active),
+        reply_markup=config_menu_keyboard(),
     )
