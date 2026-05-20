@@ -3,7 +3,6 @@
 import logging
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
 from functools import wraps
 from typing import Callable
 
@@ -58,16 +57,6 @@ def registered_only(func: Callable) -> Callable:
                 "You're not registered. Use /register to get started."
             )
             return
-
-        # Check access expiry
-        expiry = user_db.get_access_expiry(user_id)
-        if expiry is not None:
-            expiry_dt = datetime.fromisoformat(expiry)
-            if expiry_dt <= datetime.now(timezone.utc):
-                await update.message.reply_text(
-                    "Your access has expired. Contact admin to renew."
-                )
-                return
 
         context.user_data["user_id"] = user_id
         return await func(update, context)

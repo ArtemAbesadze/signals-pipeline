@@ -10,10 +10,10 @@ from src.state.user_db import UserDatabase
 logger = logging.getLogger(__name__)
 
 WELCOME_MESSAGE = (
-    "🧪 *Welcome to Potion Perps Bot!*\n\n"
-    "Automated Hyperliquid perpetual futures trading, "
-    "powered by Potion Perps signals.\n\n"
-    "To get started, you'll need an invite code from an admin."
+    "🧪 *Welcome*\n\n"
+    "Automated Hyperliquid perpetual futures trading,\n"
+    "powered by CryptoPrinter signals.\n\n"
+    "Use /register to get started."
 )
 
 HELP_MESSAGE = (
@@ -23,7 +23,7 @@ HELP_MESSAGE = (
     "/start — Welcome / main menu\n"
     "/help — Show this help message\n\n"
     "🔐 *Getting Started*\n"
-    "/register — Register with an invite code\n\n"
+    "/register — Register your Hyperliquid credentials\n\n"
     "📊 *Trading Shortcuts*\n"
     "/balance — Account balance\n"
     "/positions — Open positions\n"
@@ -75,8 +75,7 @@ async def start_register_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     await query.edit_message_text(
         "🔑 *Getting Started*\n\n"
-        "Use /register to begin setup.\n"
-        "You'll need an invite code from an admin.",
+        "Use /register to set up your Hyperliquid credentials.",
         parse_mode="Markdown",
     )
 

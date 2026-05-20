@@ -1,13 +1,19 @@
-"""Admin command handlers — invite code & user management."""
+"""Admin command handlers — kill switch, admin-role management, and the
+testing-only signal-injection helper.
+
+The SaaS-era surface (invite codes, expiry, broadcast, user listing,
+extend/revoke access) was removed in Phase 2.1 / D4. This file is now
+focused on operational controls for the 3-user private deployment.
+"""
 
 import logging
+import random
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from src.orchestrator import Orchestrator
 from src.state.user_db import UserDatabase
-from src.telegram.invite_codes import generate_invite_code
 from src.telegram.middleware import admin_only
 
 logger = logging.getLogger(__name__)
@@ -23,22 +29,11 @@ def _get_orchestrator(context: ContextTypes.DEFAULT_TYPE) -> Orchestrator:
 
 ADMIN_HELP_MESSAGE = (
     "*Admin Commands*\n\n"
-    "*Invite Codes*\n"
-    "/generate\\_code \\[days\\] — Generate invite code\n"
-    "/generate\\_codes <count> \\[days\\] — Batch generate codes\n"
-    "/list\\_codes — List all invite codes\n"
-    "/revoke\\_code <code> — Revoke an invite code\n\n"
-    "*User Management*\n"
-    "/users — List all registered users\n"
-    "/extend <user\\_id> <days> — Extend user access\n"
-    "/revoke <user\\_id> — Revoke user access\n\n"
     "*Emergency*\n"
-    "/kill — Kill switch (close all positions)\n"
-    "/resume — Resume after kill switch\n\n"
-    "*Communication*\n"
-    "/broadcast <message> — Message all active users\n\n"
+    "/kill — Kill switch (close all positions for all users)\n"
+    "/resume — Resume signal processing after kill\n\n"
     "*Testing*\n"
-    "/inject — ⚠️ TESTING ONLY — Inject fake signal\n\n"
+    "/inject — ⚠️ TESTING ONLY — Inject a synthetic signal\n\n"
     "*Admin Access*\n"
     "/add\\_admin <telegram\\_id> — Grant admin access\n"
     "/remove\\_admin <telegram\\_id> — Revoke admin access\n"
@@ -52,237 +47,9 @@ async def admin_help_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(ADMIN_HELP_MESSAGE, parse_mode="Markdown")
 
 
-@admin_only
-async def generate_code_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /generate_code [days] — generate a single invite code."""
-    user_db = _get_user_db(context)
-    admin_name = str(update.effective_user.id)
-
-    # Parse optional duration
-    duration_days = None
-    if context.args:
-        try:
-            duration_days = int(context.args[0])
-            if duration_days < 1:
-                await update.message.reply_text("Duration must be at least 1 day.")
-                return
-        except ValueError:
-            await update.message.reply_text("Usage: /generate\\_code \\[days\\]\nExample: `/generate_code 30`", parse_mode="Markdown")
-            return
-
-    code = generate_invite_code()
-    user_db.create_invite_code(code, created_by=admin_name, duration_days=duration_days)
-
-    duration_text = f"{duration_days} days" if duration_days else "unlimited"
-    await update.message.reply_text(
-        f"*Invite Code Generated*\n\n"
-        f"`{code}`\n\n"
-        f"Duration: {duration_text}",
-        parse_mode="Markdown",
-    )
-
-
-@admin_only
-async def generate_codes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /generate_codes <count> [days] — batch generate invite codes."""
-    user_db = _get_user_db(context)
-    admin_name = str(update.effective_user.id)
-
-    if not context.args or len(context.args) < 1:
-        await update.message.reply_text(
-            "Usage: /generate\\_codes \\<count\\> \\[days\\]\n"
-            "Example: `/generate_codes 5 30`",
-            parse_mode="Markdown",
-        )
-        return
-
-    try:
-        count = int(context.args[0])
-        if count < 1 or count > 50:
-            await update.message.reply_text("Count must be between 1 and 50.")
-            return
-    except ValueError:
-        await update.message.reply_text("Count must be a number.")
-        return
-
-    duration_days = None
-    if len(context.args) >= 2:
-        try:
-            duration_days = int(context.args[1])
-            if duration_days < 1:
-                await update.message.reply_text("Duration must be at least 1 day.")
-                return
-        except ValueError:
-            await update.message.reply_text("Duration must be a number.")
-            return
-
-    codes = []
-    for _ in range(count):
-        code = generate_invite_code()
-        user_db.create_invite_code(code, created_by=admin_name, duration_days=duration_days)
-        codes.append(code)
-
-    duration_text = f"{duration_days} days" if duration_days else "unlimited"
-    code_list = "\n".join(f"`{c}`" for c in codes)
-    await update.message.reply_text(
-        f"*{count} Invite Codes Generated*\n"
-        f"Duration: {duration_text}\n\n{code_list}",
-        parse_mode="Markdown",
-    )
-
-
-@admin_only
-async def list_codes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /list_codes — show all invite codes with status."""
-    user_db = _get_user_db(context)
-    codes = user_db.list_invite_codes()
-
-    if not codes:
-        await update.message.reply_text("No invite codes found.")
-        return
-
-    lines = ["*Invite Codes*\n"]
-    for c in codes:
-        status_icon = {
-            "active": "🟢",
-            "redeemed": "🔵",
-            "revoked": "🔴",
-            "expired": "⚪",
-        }.get(c["status"], "❓")
-
-        duration = f"{c['duration_days']}d" if c["duration_days"] else "∞"
-        line = f"{status_icon} `{c['code']}` — {c['status']} ({duration})"
-
-        if c["redeemed_by"]:
-            line += f" → {c['redeemed_by']}"
-
-        lines.append(line)
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-@admin_only
-async def revoke_code_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /revoke_code <code> — revoke an unused invite code."""
-    user_db = _get_user_db(context)
-
-    if not context.args:
-        await update.message.reply_text(
-            "Usage: /revoke\\_code \\<code\\>\nExample: `/revoke_code PPB-A3F8-K9X2`",
-            parse_mode="Markdown",
-        )
-        return
-
-    code = context.args[0].upper()
-    if user_db.revoke_invite_code(code):
-        await update.message.reply_text(f"Code `{code}` has been revoked.", parse_mode="Markdown")
-    else:
-        await update.message.reply_text(
-            f"Could not revoke `{code}`. It may not exist or is already redeemed/revoked.",
-            parse_mode="Markdown",
-        )
-
-
 # ------------------------------------------------------------------
-# User management commands
+# Kill switch
 # ------------------------------------------------------------------
-
-
-@admin_only
-async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /users — list all registered users with status."""
-    user_db = _get_user_db(context)
-    users = user_db.list_users()
-
-    if not users:
-        await update.message.reply_text("No users registered.")
-        return
-
-    lines = ["*Registered Users*\n"]
-    for u in users:
-        icon = "\U0001f7e2" if u.status == "active" else "\U0001f534"
-        config = user_db.get_user_config(u.user_id)
-        preset = config.get("active_preset", "—") if config else "—"
-        expiry = user_db.get_access_expiry(u.user_id)
-        expiry_text = expiry[:10] if expiry else "unlimited"
-        name = u.display_name[:20] if u.display_name else u.user_id
-        lines.append(f"{icon} `{u.user_id}` — {name} | {preset} | exp: {expiry_text}")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-@admin_only
-async def extend_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /extend <user_id> <days> — extend user access."""
-    user_db = _get_user_db(context)
-
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text(
-            "Usage: /extend <user\\_id> <days>\nExample: `/extend 7441245554 30`",
-            parse_mode="Markdown",
-        )
-        return
-
-    target_user_id = context.args[0]
-    try:
-        days = int(context.args[1])
-        if days < 1:
-            await update.message.reply_text("Days must be at least 1.")
-            return
-    except ValueError:
-        await update.message.reply_text("Days must be a number.")
-        return
-
-    user = user_db.get_user(target_user_id)
-    if not user:
-        await update.message.reply_text(f"User `{target_user_id}` not found.", parse_mode="Markdown")
-        return
-
-    new_expiry = user_db.extend_user_access(target_user_id, days)
-
-    # Re-activate if user was inactive (expired)
-    reactivated = ""
-    if user.status == "inactive":
-        user_db.set_user_status(target_user_id, "active")
-        orchestrator = _get_orchestrator(context)
-        try:
-            orchestrator.activate_user(target_user_id)
-            reactivated = "\nUser re-activated and pipeline started."
-        except Exception as e:
-            reactivated = f"\nUser status set to active. Pipeline activation failed: {e}"
-
-    await update.message.reply_text(
-        f"Access extended for `{target_user_id}` by {days} days.\n"
-        f"New expiry: `{new_expiry[:19]}`{reactivated}",
-        parse_mode="Markdown",
-    )
-
-
-@admin_only
-async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /revoke <user_id> — revoke user access and deactivate pipeline."""
-    user_db = _get_user_db(context)
-    orchestrator = _get_orchestrator(context)
-
-    if not context.args:
-        await update.message.reply_text(
-            "Usage: /revoke <user\\_id>\nExample: `/revoke 7441245554`",
-            parse_mode="Markdown",
-        )
-        return
-
-    target_user_id = context.args[0]
-    user = user_db.get_user(target_user_id)
-    if not user:
-        await update.message.reply_text(f"User `{target_user_id}` not found.", parse_mode="Markdown")
-        return
-
-    user_db.revoke_user_access(target_user_id)
-    orchestrator.deactivate_user(target_user_id)
-    await update.message.reply_text(
-        f"Access revoked and pipeline deactivated for `{target_user_id}`.",
-        parse_mode="Markdown",
-    )
 
 
 @admin_only
@@ -309,50 +76,11 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text("Kill switch deactivated. Signal processing resumed.")
 
 
-@admin_only
-async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /broadcast <message> — send message to all active users."""
-    user_db = _get_user_db(context)
-
-    if not context.args:
-        await update.message.reply_text(
-            "Usage: /broadcast <message>\nExample: `/broadcast Maintenance in 1 hour`",
-            parse_mode="Markdown",
-        )
-        return
-
-    message = " ".join(context.args)
-    chat_ids = user_db.get_all_telegram_chat_ids()
-
-    if not chat_ids:
-        await update.message.reply_text("No active users to broadcast to.")
-        return
-
-    success = 0
-    failed = 0
-    for chat_id in chat_ids:
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"*Admin Broadcast*\n\n{message}",
-                parse_mode="Markdown",
-            )
-            success += 1
-        except Exception:
-            logger.exception("Failed to send broadcast to chat %s", chat_id)
-            failed += 1
-
-    await update.message.reply_text(
-        f"Broadcast sent. Delivered: {success}, Failed: {failed}"
-    )
-
-
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle admin inline button callbacks (kill confirm/cancel)."""
     query = update.callback_query
     await query.answer()
 
-    # Check admin
     admin_ids: list[int] = context.bot_data.get("admin_ids", [])
     if update.effective_user.id not in admin_ids:
         await query.edit_message_text("This action is only available to administrators.")
@@ -380,7 +108,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ------------------------------------------------------------------
-# Admin access management
+# Admin role management
 # ------------------------------------------------------------------
 
 
@@ -437,13 +165,11 @@ async def remove_admin_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Telegram ID must be a number.")
         return
 
-    # Prevent removing yourself
     if target_id == update.effective_user.id:
         await update.message.reply_text("You cannot remove yourself as admin.")
         return
 
     if user_db.remove_telegram_admin(target_id):
-        # Remove from runtime list
         admin_ids: list[int] = context.bot_data.get("admin_ids", [])
         if target_id in admin_ids:
             admin_ids.remove(target_id)
@@ -481,6 +207,12 @@ async def list_admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # Track the last injected trade ID so TP/close signals target the right trade
 _last_inject_trade_id: int | None = None
+_last_inject_coin: str | None = None
+
+_INJECT_COINS = ["ETH", "BTC", "SOL", "XRP"]
+_INJECT_SIDES = ["LONG", "SHORT"]
+_INJECT_RISKS = ["LOW", "MEDIUM", "HIGH"]
+_INJECT_TYPES = ["SWING", "SCALP"]
 
 
 def _get_any_client(context: ContextTypes.DEFAULT_TYPE):
@@ -489,15 +221,6 @@ def _get_any_client(context: ContextTypes.DEFAULT_TYPE):
     for ctx in orchestrator.pipelines.values():
         return ctx.client
     return None
-
-
-_INJECT_COINS = ["ETH", "BTC", "SOL", "XRP"]
-_INJECT_SIDES = ["LONG", "SHORT"]
-_INJECT_RISKS = ["LOW", "MEDIUM", "HIGH"]
-_INJECT_TYPES = ["SWING", "SCALP"]
-
-# Track last injected coin so TP signals reference the correct pair
-_last_inject_coin: str | None = None
 
 
 def _build_signal(price: float, trade_id: int, coin: str, side: str, leverage: int, risk: str, trade_type: str) -> str:
@@ -542,7 +265,7 @@ def _build_tp_signal(tp_num: str, profit: str, trade_id: int, coin: str) -> str:
             f"**\U0001f4b0PROFIT:** {profit} \U0001f4c8"
         )
     return (
-        f"**\u2705 TP TARGET {tp_num} HIT**\n\n"
+        f"**✅ TP TARGET {tp_num} HIT**\n\n"
         f"**\U0001f4ddPAIR:** {coin}/USDT #{trade_id}\n\n"
         f"**\U0001f4b0PROFIT:** {profit} \U0001f4c8"
     )
@@ -551,9 +274,6 @@ def _build_tp_signal(tp_num: str, profit: str, trade_id: int, coin: str) -> str:
 @admin_only
 async def inject_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /inject — show test signal buttons for quick injection."""
-    global _last_inject_trade_id
-
-    # Show current prices for context
     client = _get_any_client(context)
     price_lines = []
     if client:
@@ -591,12 +311,11 @@ async def inject_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def inject_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle inject:{signal_type} callbacks — dispatch test signal to all users."""
-    global _last_inject_trade_id
+    global _last_inject_trade_id, _last_inject_coin
 
     query = update.callback_query
     await query.answer()
 
-    # Admin check
     admin_ids: list[int] = context.bot_data.get("admin_ids", [])
     if update.effective_user.id not in admin_ids:
         await query.edit_message_text("This action is only available to administrators.")
@@ -606,14 +325,11 @@ async def inject_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     orchestrator = _get_orchestrator(context)
 
     if signal_type == "signal":
-        global _last_inject_coin
-
         client = _get_any_client(context)
         if not client:
             await query.edit_message_text("No active pipelines — cannot fetch price.")
             return
 
-        import random
         coin = random.choice(_INJECT_COINS)
         side = random.choice(_INJECT_SIDES)
         leverage = random.randint(3, 15)

@@ -1,8 +1,10 @@
 """Unit tests for admin Telegram command handlers.
 
-Tests /users, /extend, /revoke, /kill, /resume, /broadcast, and
-the kill confirmation callback. Mocks user_db, orchestrator, and
-Telegram Update/Context objects.
+Tests /kill, /resume, and the kill confirmation callback. Mocks user_db,
+orchestrator, and Telegram Update/Context objects.
+
+The SaaS-era admin commands (/users, /extend, /revoke, /broadcast,
+/generate_code, /list_codes, etc.) were removed in Phase 2.1.
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12,12 +14,8 @@ import pytest
 from src.state.user_db import UserRecord
 from src.telegram.handlers.admin import (
     admin_callback,
-    broadcast_command,
-    extend_command,
     kill_command,
     resume_command,
-    revoke_command,
-    users_command,
 )
 
 
@@ -75,126 +73,6 @@ def _make_callback_update(callback_data, user_id=ADMIN_ID):
     update.callback_query = query
     update.effective_user.id = user_id
     return update
-
-
-# ------------------------------------------------------------------
-# /users
-# ------------------------------------------------------------------
-
-class TestUsersCommand:
-    @pytest.mark.asyncio
-    async def test_no_users(self):
-        user_db = MagicMock()
-        user_db.list_users.return_value = []
-        context = _make_context(user_db=user_db)
-        update = _make_update()
-
-        await users_command(update, context)
-
-        update.message.reply_text.assert_called_once_with("No users registered.")
-
-    @pytest.mark.asyncio
-    async def test_two_users_listed(self):
-        u1 = _make_user("user-1", "Alice", "active")
-        u2 = _make_user("user-2", "Bob", "inactive")
-        user_db = MagicMock()
-        user_db.list_users.return_value = [u1, u2]
-        user_db.get_user_config.side_effect = [
-            {"active_preset": "even_split"},
-            {"active_preset": "scalper"},
-        ]
-        user_db.get_access_expiry.side_effect = [
-            "2025-06-01T00:00:00+00:00",
-            None,
-        ]
-        context = _make_context(user_db=user_db)
-        update = _make_update()
-
-        await users_command(update, context)
-
-        text = update.message.reply_text.call_args[0][0]
-        assert "user-1" in text
-        assert "user-2" in text
-        assert "Alice" in text
-        assert "Bob" in text
-        assert "even_split" in text
-        assert "scalper" in text
-        assert "2025-06-01" in text
-        assert "unlimited" in text
-
-
-# ------------------------------------------------------------------
-# /extend
-# ------------------------------------------------------------------
-
-class TestExtendCommand:
-    @pytest.mark.asyncio
-    async def test_success(self):
-        user_db = MagicMock()
-        user_db.get_user.return_value = _make_user("user-1")
-        user_db.extend_user_access.return_value = "2025-07-01T00:00:00+00:00"
-        context = _make_context(args=["user-1", "30"], user_db=user_db)
-        update = _make_update()
-
-        await extend_command(update, context)
-
-        user_db.extend_user_access.assert_called_once_with("user-1", 30)
-        text = update.message.reply_text.call_args[0][0]
-        assert "user-1" in text
-        assert "30" in text
-
-    @pytest.mark.asyncio
-    async def test_missing_args(self):
-        context = _make_context(args=[])
-        update = _make_update()
-
-        await extend_command(update, context)
-
-        text = update.message.reply_text.call_args[0][0]
-        assert "Usage" in text
-
-    @pytest.mark.asyncio
-    async def test_unknown_user(self):
-        user_db = MagicMock()
-        user_db.get_user.return_value = None
-        context = _make_context(args=["unknown-user", "30"], user_db=user_db)
-        update = _make_update()
-
-        await extend_command(update, context)
-
-        text = update.message.reply_text.call_args[0][0]
-        assert "not found" in text
-
-
-# ------------------------------------------------------------------
-# /revoke
-# ------------------------------------------------------------------
-
-class TestRevokeCommand:
-    @pytest.mark.asyncio
-    async def test_success(self):
-        user_db = MagicMock()
-        user_db.get_user.return_value = _make_user("user-1")
-        orchestrator = MagicMock()
-        context = _make_context(args=["user-1"], user_db=user_db, orchestrator=orchestrator)
-        update = _make_update()
-
-        await revoke_command(update, context)
-
-        user_db.revoke_user_access.assert_called_once_with("user-1")
-        orchestrator.deactivate_user.assert_called_once_with("user-1")
-        text = update.message.reply_text.call_args[0][0]
-        assert "revoked" in text.lower()
-
-    @pytest.mark.asyncio
-    async def test_missing_args(self):
-        context = _make_context(args=[])
-        update = _make_update()
-
-        await revoke_command(update, context)
-
-        text = update.message.reply_text.call_args[0][0]
-        assert "Usage" in text
 
 
 # ------------------------------------------------------------------
@@ -269,66 +147,16 @@ class TestResumeCommand:
 
 
 # ------------------------------------------------------------------
-# /broadcast
-# ------------------------------------------------------------------
-
-class TestBroadcastCommand:
-    @pytest.mark.asyncio
-    async def test_success(self):
-        user_db = MagicMock()
-        user_db.get_all_telegram_chat_ids.return_value = [111, 222]
-        context = _make_context(args=["Hello", "everyone!"], user_db=user_db)
-        update = _make_update()
-
-        await broadcast_command(update, context)
-
-        assert context.bot.send_message.call_count == 2
-        # Check the broadcast message content
-        sent_text = context.bot.send_message.call_args_list[0][1]["text"]
-        assert "Hello everyone!" in sent_text
-        assert "Admin Broadcast" in sent_text
-        # Check delivery summary
-        reply_text = update.message.reply_text.call_args[0][0]
-        assert "Delivered: 2" in reply_text
-        assert "Failed: 0" in reply_text
-
-    @pytest.mark.asyncio
-    async def test_no_message(self):
-        context = _make_context(args=[])
-        update = _make_update()
-
-        await broadcast_command(update, context)
-
-        text = update.message.reply_text.call_args[0][0]
-        assert "Usage" in text
-
-    @pytest.mark.asyncio
-    async def test_partial_failure(self):
-        user_db = MagicMock()
-        user_db.get_all_telegram_chat_ids.return_value = [111, 222]
-        context = _make_context(args=["Test"], user_db=user_db)
-        # First send succeeds, second fails
-        context.bot.send_message = AsyncMock(side_effect=[None, Exception("blocked")])
-        update = _make_update()
-
-        await broadcast_command(update, context)
-
-        reply_text = update.message.reply_text.call_args[0][0]
-        assert "Delivered: 1" in reply_text
-        assert "Failed: 1" in reply_text
-
-
-# ------------------------------------------------------------------
 # Non-admin rejection
 # ------------------------------------------------------------------
 
 class TestNonAdminRejected:
     @pytest.mark.asyncio
-    async def test_non_admin_users_command(self):
+    async def test_non_admin_kill_command_rejected(self):
         context = _make_context(admin=False)
         update = _make_update(user_id=12345)  # Not in admin_ids
 
-        await users_command(update, context)
+        await kill_command(update, context)
 
         text = update.message.reply_text.call_args[0][0]
         assert "administrator" in text.lower()

@@ -93,7 +93,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     user_config = user_db.get_user_config(user_id)
-    expires_at = user_db.get_access_expiry(user_id)
 
     try:
         balance = client.get_balance()
@@ -103,7 +102,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("⚠️ Failed to fetch account data. Try again later.")
         return
 
-    text = format_status(user_config, balance, positions, expires_at)
+    text = format_status(user_config, balance, positions)
     from src.telegram.keyboards import dashboard_keyboard
     await update.message.reply_text(
         text,
@@ -141,10 +140,9 @@ async def account_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             text = format_positions(positions)
         elif view == "status":
             user_config = user_db.get_user_config(user_id)
-            expires_at = user_db.get_access_expiry(user_id)
             balance = client.get_balance()
             positions = client.get_open_positions()
-            text = format_status(user_config, balance, positions, expires_at)
+            text = format_status(user_config, balance, positions)
         else:
             return
     except Exception as e:

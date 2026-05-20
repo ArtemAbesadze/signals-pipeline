@@ -1,9 +1,12 @@
 """Registration flow — multi-step ConversationHandler.
 
-States: INVITE_CODE → ACCOUNT_ADDRESS → API_WALLET → API_SECRET → NETWORK
+States: ACCOUNT_ADDRESS → API_WALLET → API_SECRET → NETWORK
 
 Each credential message is deleted immediately after reading.
 DM-only check rejects registration in group chats.
+
+Phase 2.1 / D4: the SaaS-era invite-code step was removed. This is a
+private 3-user tool, no codes required.
 """
 
 import logging
@@ -21,12 +24,12 @@ from telegram.ext import (
 
 from src.exchange.hyperliquid import HyperliquidClient
 from src.state.user_db import UserDatabase
-from src.telegram.formatters import format_expiry, mask_address
+from src.telegram.formatters import mask_address
 
 logger = logging.getLogger(__name__)
 
 # Conversation states
-INVITE_CODE, ACCOUNT_ADDRESS, API_WALLET, API_SECRET, NETWORK = range(5)
+ACCOUNT_ADDRESS, API_WALLET, API_SECRET, NETWORK = range(4)
 
 # Regex for 0x-prefixed hex addresses/keys
 _HEX_PATTERN = re.compile(r"^0x[0-9a-fA-F]+$")
@@ -60,39 +63,7 @@ async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     await update.message.reply_text(
         "🔑 *Registration*\n\n"
-        "Let's get you set up! Enter your invite code:",
-        parse_mode="Markdown",
-    )
-    return INVITE_CODE
-
-
-async def receive_invite_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Validate the invite code and proceed to credential collection."""
-    user_db = _get_user_db(context)
-    code = update.message.text.strip().upper()
-
-    result = user_db.validate_invite_code(code)
-    if not result["valid"]:
-        reason = result["reason"]
-        if "redeemed" in reason.lower():
-            await update.message.reply_text(
-                "❌ This code has already been used. Contact admin for a new code."
-            )
-        else:
-            await update.message.reply_text(
-                "❌ Invalid or expired invite code. Contact admin for access."
-            )
-        return ConversationHandler.END
-
-    # Store validated code in user_data for later
-    duration = result.get("duration_days")
-    duration_text = f"{duration} days" if duration else "unlimited"
-    context.user_data["invite_code"] = code
-    context.user_data["duration_days"] = duration
-
-    await update.message.reply_text(
-        f"✅ *Code accepted!* Access: {duration_text}\n\n"
-        "🔐 Now I'll need your Hyperliquid API credentials.\n"
+        "Let's get you set up — I'll need your Hyperliquid API credentials.\n"
         "Make sure you're in a private chat.\n\n"
         "📋 Send your *Account Address* (0x...):",
         parse_mode="Markdown",
@@ -257,10 +228,6 @@ async def receive_network(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Store telegram chat ID
     user_db.set_telegram_chat_id(user_id, chat_id)
 
-    # Redeem invite code
-    invite_code = context.user_data["invite_code"]
-    expires_at = user_db.redeem_invite_code(invite_code, user_id)
-
     # Activate pipeline via orchestrator
     orchestrator = _get_orchestrator(context)
     if orchestrator:
@@ -270,14 +237,12 @@ async def receive_network(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             logger.error("Failed to activate pipeline for user %s: %s", user_id, e)
 
     # Build congratulations message with Continue button
-    expiry_text = format_expiry(expires_at)
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🚀 Continue", callback_data="menu:main")],
     ])
     await query.edit_message_text(
         "🎉 *Registration Complete!*\n\n"
-        "Welcome to Potion Perps! Your account is set up and ready to go.\n\n"
-        f"⏰ Access expires: {expiry_text}\n"
+        "Welcome — your account is set up and ready to go.\n\n"
         f"🎯 Strategy: even_split (33/33/34)\n"
         f"⚡ Auto-execute: OFF\n"
         f"📊 Max leverage: 20x\n\n"
@@ -300,7 +265,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 def _clear_user_data(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Remove sensitive data from user_data."""
-    for key in ("invite_code", "duration_days", "account_address", "api_wallet", "api_secret", "network"):
+    for key in ("account_address", "api_wallet", "api_secret", "network"):
         context.user_data.pop(key, None)
 
 
@@ -309,7 +274,6 @@ def build_registration_handler() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[CommandHandler("register", register_command)],
         states={
-            INVITE_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_invite_code)],
             ACCOUNT_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_account_address)],
             API_WALLET: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_wallet)],
             API_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_secret)],

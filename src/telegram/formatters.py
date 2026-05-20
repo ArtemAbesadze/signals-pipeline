@@ -23,13 +23,6 @@ def mask_address(address: str) -> str:
     return f"{address[:6]}...{address[-4:]}"
 
 
-def format_expiry(expires_at: str | None) -> str:
-    """Format access expiry for display."""
-    if expires_at is None:
-        return "Unlimited"
-    return expires_at[:10]
-
-
 def format_usd(value: str | float) -> str:
     """Format a USD value: $1,234.56."""
     v = float(value)
@@ -86,7 +79,6 @@ def format_status(
     user_config: dict,
     balance: dict[str, str],
     positions: list,
-    expires_at: str | None,
 ) -> str:
     """Format risk dashboard / status view."""
     open_count = len(positions)
@@ -109,39 +101,24 @@ def format_status(
         f"💰 Max Position: {format_usd(user_config.get('max_position_size_usd', 500))}\n"
         f"🛡 Daily Loss Limit: {user_config.get('max_daily_loss_pct', 10)}%\n\n"
         f"💼 *Account*\n"
-        f"💵 Balance: {format_usd(balance.get('account_value', '0'))}\n"
-        f"⏰ Access Expires: {format_expiry(expires_at)}"
+        f"💵 Balance: {format_usd(balance.get('account_value', '0'))}"
     )
 
 
 def format_account_info(
     user_config: dict,
     credentials: dict,
-    expires_at: str | None,
 ) -> str:
-    """Format account & membership info for the account submenu."""
+    """Format account info for the account submenu."""
     wallet = mask_address(credentials.get("account_address", "N/A"))
     api_wallet = mask_address(credentials.get("api_wallet", "N/A"))
     network = credentials.get("network", "testnet").capitalize()
-    invite_code = user_config.get("invite_code", "N/A")
-
-    # Determine subscription status from expiry
-    if expires_at is None:
-        sub_line = "📋 Subscription: ♾ Unlimited"
-    else:
-        now = datetime.now(timezone.utc).isoformat()
-        if expires_at > now:
-            sub_line = f"📋 Subscription: ✅ Active\n⏰ Expires: {expires_at[:10]}"
-        else:
-            sub_line = f"📋 Subscription: ❌ Expired\n⏰ Expired: {expires_at[:10]}"
 
     return (
-        "👤 *Account & Membership*\n\n"
+        "👤 *Account*\n\n"
         f"💼 Wallet: `{wallet}`\n"
         f"🔑 API Wallet: `{api_wallet}`\n"
-        f"🌐 Network: {network}\n\n"
-        f"{sub_line}\n"
-        f"🎟 Code Used: {invite_code}"
+        f"🌐 Network: {network}"
     )
 
 
@@ -268,7 +245,6 @@ def format_stats(closed_trades: list, open_count: int) -> str:
 def format_dashboard(
     user_config: dict,
     is_active: bool,
-    expires_at: str | None,
 ) -> str:
     """Format the risk dashboard for the menu view."""
     from src.config.settings import BUILTIN_PRESETS
@@ -293,6 +269,5 @@ def format_dashboard(
         f"Max Positions: {user_config.get('max_open_positions', 10)}\n"
         f"Max Position: {format_usd(user_config.get('max_position_size_usd', 500))}\n"
         f"Max Exposure: {format_usd(user_config.get('max_total_exposure_usd', 2000))}\n"
-        f"Daily Loss Limit: {user_config.get('max_daily_loss_pct', 10)}%\n\n"
-        f"⏰ Access Expires: {format_expiry(expires_at)}"
+        f"Daily Loss Limit: {user_config.get('max_daily_loss_pct', 10)}%"
     )

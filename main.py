@@ -122,15 +122,6 @@ async def run(config: Config) -> None:
         for uid, ctx in orchestrator.pipelines.items():
             ctx.pipeline._notifier = _notifier_factory(uid)
 
-        # Start expiry checker background task
-        from src.telegram.expiry_checker import ExpiryChecker
-        expiry_checker = ExpiryChecker(
-            bot=telegram_bot.bot,
-            user_db=user_db,
-            orchestrator=orchestrator,
-        )
-        await expiry_checker.start()
-
         # Start PnL monitor background task
         from src.telegram.pnl_monitor import PnLMonitor
         pnl_monitor = PnLMonitor(
@@ -141,7 +132,6 @@ async def run(config: Config) -> None:
 
         logger.info("Telegram bot started with trade notifications")
     else:
-        expiry_checker = None
         pnl_monitor = None
         logger.info("Telegram bot disabled (no TELEGRAM_BOT_TOKEN in .env)")
 
@@ -194,8 +184,6 @@ async def run(config: Config) -> None:
             pass
         if pnl_monitor:
             await pnl_monitor.stop()
-        if expiry_checker:
-            await expiry_checker.stop()
         if telegram_bot:
             await telegram_bot.stop()
         await admin_api.stop()
