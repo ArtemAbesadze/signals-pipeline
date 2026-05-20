@@ -30,7 +30,7 @@ def _is_pipeline_active(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> boo
 
 def _format_config(cfg: dict) -> str:
     """Format current config for display."""
-    preset = cfg.get("active_preset", "runner")
+    preset = cfg.get("active_preset", "even_split")
     auto = "✅ ON" if cfg.get("auto_execute") else "❌ OFF"
     lev = cfg.get("max_leverage", 20)
 

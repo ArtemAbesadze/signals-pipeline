@@ -255,7 +255,7 @@ def _build_config_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> str:
     user_db = _get_user_db(context)
     cfg = user_db.get_user_config(user_id)
 
-    preset = cfg.get("active_preset", "runner")
+    preset = cfg.get("active_preset", "even_split")
     auto = "✅ ON" if cfg.get("auto_execute") else "❌ OFF"
     lev = cfg.get("max_leverage", 20)
 

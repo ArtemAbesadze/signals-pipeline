@@ -20,28 +20,28 @@ exchange:
   network: testnet                 # testnet | mainnet
 
 # --- Strategy presets ---
-# A "strategy" is just 3 settings: TP management, SL management, position sizing.
-# Define your own presets here, or use built-ins: runner, conservative, tp2_exit,
-# tp3_hold, breakeven_filter, small_runner.
-#
-# User-defined presets override built-ins with the same name.
+# A "strategy" is just 3 settings: TP management, SL management, position
+# sizing. Names mirror CryptoPrinter's weekly report rows so a per-user
+# report lines up directly with CP's. Define your own presets here to
+# override built-ins with the same name.
 strategy_presets:
   my_strategy:                     # your custom preset
     tp_split: [0.5, 0.3, 0.2]     # % of position to close at TP1, TP2, TP3
     move_sl_to_breakeven_after: tp1  # tp1 | tp2 | never
-    size_pct: 1.5                  # % of account balance per trade
+    size_pct: 1.5                  # fallback size %, used only if size_by_risk lacks the level
 
 # Built-in presets (no need to redefine unless you want to override):
-#   runner:           tp_split [0.33, 0.33, 0.34], BE after TP1, 2% size
-#   conservative:     tp_split [1.0, 0, 0],        no BE move,   2% size
-#   tp2_exit:         tp_split [0.5, 0.5, 0],      BE after TP1, 2% size
-#   tp3_hold:         tp_split [0, 0, 1.0],         BE after TP1, 2% size
-#   breakeven_filter: tp_split [0.33, 0.33, 0.34], BE after TP1, 1.5% size
-#   small_runner:     tp_split [0.33, 0.33, 0.34], BE after TP1, 0.5% size
+#   tp1_only:    tp_split [1.0, 0, 0],         no BE,        2% size
+#   tp2_only:    tp_split [0, 1.0, 0],         no BE,        2% size
+#   tp3_only:    tp_split [0, 0, 1.0],         no BE,        2% size
+#   tp2_be:      tp_split [0, 1.0, 0],         BE after TP1, 2% size
+#   tp3_be:      tp_split [0, 0, 1.0],         BE after TP1, 2% size
+#   hybrid:      tp_split [0.1, 0.7, 0.2],     BE after TP1, 2% size
+#   even_split:  tp_split [0.33, 0.33, 0.34],  BE after TP1, 2% size  (default)
 
 # --- Strategy selection ---
 strategy:
-  active_preset: runner            # which preset to use (built-in or custom)
+  active_preset: even_split        # which preset to use (built-in or custom)
   auto_execute: false              # true = execute immediately, false = wait for confirmation
   max_leverage: 20                 # cap leverage regardless of signal
   size_by_risk:                    # override preset size_pct per risk level

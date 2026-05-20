@@ -65,46 +65,55 @@ class StrategyPreset:
     size_pct: float = 2.0                     # % of account balance per trade
 
 
-# Built-in presets matching the 7 backtested approaches
+# Built-in presets — names mirror CryptoPrinter's weekly performance
+# report rows so per-user reports line up directly with CP's (D2).
+# `even_split` is our addition and the default for new users.
 BUILTIN_PRESETS: dict[str, StrategyPreset] = {
-    "runner": StrategyPreset(
-        tp_split=[0.33, 0.33, 0.34],
-        move_sl_to_breakeven_after="tp1",
-        size_pct=2.0,
-    ),
-    "conservative": StrategyPreset(
+    "tp1_only": StrategyPreset(
         tp_split=[1.0, 0.0, 0.0],
         move_sl_to_breakeven_after="never",
         size_pct=2.0,
     ),
-    "tp2_exit": StrategyPreset(
-        tp_split=[0.5, 0.5, 0.0],
+    "tp2_only": StrategyPreset(
+        tp_split=[0.0, 1.0, 0.0],
+        move_sl_to_breakeven_after="never",
+        size_pct=2.0,
+    ),
+    "tp3_only": StrategyPreset(
+        tp_split=[0.0, 0.0, 1.0],
+        move_sl_to_breakeven_after="never",
+        size_pct=2.0,
+    ),
+    "tp2_be": StrategyPreset(
+        tp_split=[0.0, 1.0, 0.0],
         move_sl_to_breakeven_after="tp1",
         size_pct=2.0,
     ),
-    "tp3_hold": StrategyPreset(
+    "tp3_be": StrategyPreset(
         tp_split=[0.0, 0.0, 1.0],
         move_sl_to_breakeven_after="tp1",
         size_pct=2.0,
     ),
-    "breakeven_filter": StrategyPreset(
-        tp_split=[0.33, 0.33, 0.34],
+    "hybrid": StrategyPreset(
+        tp_split=[0.1, 0.7, 0.2],
         move_sl_to_breakeven_after="tp1",
-        size_pct=1.5,
+        size_pct=2.0,
     ),
-    "small_runner": StrategyPreset(
+    "even_split": StrategyPreset(
         tp_split=[0.33, 0.33, 0.34],
         move_sl_to_breakeven_after="tp1",
-        size_pct=0.5,
+        size_pct=2.0,
     ),
 }
+
+DEFAULT_PRESET = "even_split"
 
 
 @dataclass
 class StrategyConfig:
     """Strategy selection and overrides."""
 
-    active_preset: str = "runner"
+    active_preset: str = "even_split"
     auto_execute: bool = False
     max_leverage: int = 20
     size_by_risk: dict[str, float] = field(
@@ -292,7 +301,7 @@ def load_config(
     # --- Build strategy config ---
     strategy_yaml = yaml_data.get("strategy", {})
     strategy_config = StrategyConfig(
-        active_preset=strategy_yaml.get("active_preset", "runner"),
+        active_preset=strategy_yaml.get("active_preset", DEFAULT_PRESET),
         auto_execute=strategy_yaml.get("auto_execute", False),
         max_leverage=strategy_yaml.get("max_leverage", 20),
         size_by_risk=strategy_yaml.get("size_by_risk", {"LOW": 4.0, "MEDIUM": 2.0, "HIGH": 1.0}),

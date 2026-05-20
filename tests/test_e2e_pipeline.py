@@ -127,7 +127,7 @@ def _make_config(
         ),
         input=InputConfig(adapter="simulation"),
         strategy=StrategyConfig(
-            active_preset="runner",
+            active_preset="even_split",
             auto_execute=auto_execute,
             max_leverage=20,
             size_by_risk={"LOW": 4.0, "MEDIUM": 2.0, "HIGH": 1.0},
@@ -288,7 +288,7 @@ class TestTpHitFlow:
     """TP hit → DB update, optional SL move to breakeven."""
 
     def test_tp1_hit_moves_sl_to_breakeven(self, pipeline, db, client):
-        """With runner preset (BE after TP1), hitting TP1 should move SL."""
+        """With even_split preset (BE after TP1), hitting TP1 should move SL."""
         # First create the trade
         pipeline.process_message(_load("signal_alert_01.txt"))  # ZK #1286
         trade = db.get_trade(1286)
@@ -591,7 +591,7 @@ class TestOrderRecording:
         assert OrderType.STOP_LOSS in order_types
         # At least some TPs should exist (depends on tp_split having non-zero values)
         tp_count = sum(1 for o in orders if o.order_type in (OrderType.TP1, OrderType.TP2, OrderType.TP3))
-        assert tp_count >= 2  # runner preset has [0.33, 0.33, 0.34]
+        assert tp_count >= 2  # even_split preset has [0.33, 0.33, 0.34]
 
     def test_entry_oid_recorded(self, pipeline, db, client):
         """Entry order should have an oid set after submission."""

@@ -100,7 +100,7 @@ def format_status(
 
     return (
         "🛡 *Risk Dashboard*\n\n"
-        f"🎯 Preset: {user_config.get('active_preset', 'runner')}\n"
+        f"🎯 Preset: {user_config.get('active_preset', 'even_split')}\n"
         f"⚡ Auto-execute: {'ON' if user_config.get('auto_execute') else 'OFF'}\n"
         f"📊 Max Leverage: {user_config.get('max_leverage', 20)}x\n\n"
         f"🔒 *Risk Limits*\n"
@@ -273,7 +273,7 @@ def format_dashboard(
     """Format the risk dashboard for the menu view."""
     from src.config.settings import BUILTIN_PRESETS
 
-    preset_name = user_config.get("active_preset", "runner")
+    preset_name = user_config.get("active_preset", "even_split")
     p = BUILTIN_PRESETS.get(preset_name)
     tp_desc = ""
     if p:

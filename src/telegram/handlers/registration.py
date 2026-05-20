@@ -278,7 +278,7 @@ async def receive_network(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "🎉 *Registration Complete!*\n\n"
         "Welcome to Potion Perps! Your account is set up and ready to go.\n\n"
         f"⏰ Access expires: {expiry_text}\n"
-        f"🎯 Strategy: runner (33/33/34)\n"
+        f"🎯 Strategy: even_split (33/33/34)\n"
         f"⚡ Auto-execute: OFF\n"
         f"📊 Max leverage: 20x\n\n"
         "Press Continue to open the main menu!",

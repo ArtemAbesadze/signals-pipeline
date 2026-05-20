@@ -110,19 +110,25 @@ def config_menu_keyboard(is_active: bool = True) -> InlineKeyboardMarkup:
 
 
 def preset_keyboard() -> InlineKeyboardMarkup:
-    """Strategy preset selection keyboard."""
+    """Strategy preset selection keyboard.
+
+    Names mirror CryptoPrinter's weekly performance report rows so a
+    user's report rows line up directly with CP's (D2). ``even_split``
+    is the default.
+    """
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🎯 runner", callback_data="cfg:preset:runner"),
-            InlineKeyboardButton("🛡 conservative", callback_data="cfg:preset:conservative"),
+            InlineKeyboardButton("🛡 tp1_only", callback_data="cfg:preset:tp1_only"),
+            InlineKeyboardButton("🎯 tp2_only", callback_data="cfg:preset:tp2_only"),
+            InlineKeyboardButton("📈 tp3_only", callback_data="cfg:preset:tp3_only"),
         ],
         [
-            InlineKeyboardButton("📊 tp2_exit", callback_data="cfg:preset:tp2_exit"),
-            InlineKeyboardButton("📈 tp3_hold", callback_data="cfg:preset:tp3_hold"),
+            InlineKeyboardButton("🎯 tp2_be", callback_data="cfg:preset:tp2_be"),
+            InlineKeyboardButton("📈 tp3_be", callback_data="cfg:preset:tp3_be"),
         ],
         [
-            InlineKeyboardButton("⚖️ breakeven_filter", callback_data="cfg:preset:breakeven_filter"),
-            InlineKeyboardButton("🏃 small_runner", callback_data="cfg:preset:small_runner"),
+            InlineKeyboardButton("⚖️ hybrid", callback_data="cfg:preset:hybrid"),
+            InlineKeyboardButton("🟰 even_split", callback_data="cfg:preset:even_split"),
         ],
         [InlineKeyboardButton("⬅️ Back", callback_data="cfg:back")],
     ])

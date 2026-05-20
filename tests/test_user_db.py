@@ -41,7 +41,7 @@ SAMPLE_CREDS = {
 }
 
 SAMPLE_CONFIG = {
-    "active_preset": "conservative",
+    "active_preset": "tp1_only",
     "auto_execute": True,
     "max_leverage": 10,
     "max_open_positions": 5,
@@ -62,7 +62,7 @@ class TestCreateUser:
     def test_create_user_with_config(self, db):
         db.create_user("bob", "Bob", SAMPLE_CREDS, config=SAMPLE_CONFIG)
         cfg = db.get_user_config("bob")
-        assert cfg["active_preset"] == "conservative"
+        assert cfg["active_preset"] == "tp1_only"
         assert cfg["auto_execute"] is True
         assert cfg["max_leverage"] == 10
 
@@ -155,7 +155,7 @@ class TestUserConfig:
     def test_default_config(self, db):
         db.create_user("alice", "Alice", SAMPLE_CREDS)
         cfg = db.get_user_config("alice")
-        assert cfg["active_preset"] == "runner"
+        assert cfg["active_preset"] == "even_split"
         assert cfg["auto_execute"] is False
         assert cfg["max_leverage"] == 20
         assert cfg["max_open_positions"] == 10
@@ -163,16 +163,16 @@ class TestUserConfig:
     def test_custom_config(self, db):
         db.create_user("alice", "Alice", SAMPLE_CREDS, config=SAMPLE_CONFIG)
         cfg = db.get_user_config("alice")
-        assert cfg["active_preset"] == "conservative"
+        assert cfg["active_preset"] == "tp1_only"
         assert cfg["auto_execute"] is True
         assert cfg["max_leverage"] == 10
         assert cfg["max_position_size_usd"] == 200.0
 
     def test_update_config(self, db):
         db.create_user("alice", "Alice", SAMPLE_CREDS)
-        db.update_user_config("alice", active_preset="tp2_exit", max_leverage=15)
+        db.update_user_config("alice", active_preset="tp2_be", max_leverage=15)
         cfg = db.get_user_config("alice")
-        assert cfg["active_preset"] == "tp2_exit"
+        assert cfg["active_preset"] == "tp2_be"
         assert cfg["max_leverage"] == 15
 
     def test_update_json_config(self, db):
@@ -198,7 +198,7 @@ class TestGetUserConfigAsConfig:
         assert cfg.exchange.network == "testnet"
 
         # Strategy from user config
-        assert cfg.strategy.active_preset == "conservative"
+        assert cfg.strategy.active_preset == "tp1_only"
         assert cfg.strategy.auto_execute is True
         assert cfg.strategy.max_leverage == 10
 
@@ -429,3 +429,137 @@ class TestMigration:
         assert "port_mode" in cols
         assert "port_watermark" in cols
         db.close()
+
+
+# ====================================================================
+# D2 — Preset rename migration
+# ====================================================================
+
+
+class TestActivePresetMigration:
+    """Old built-in preset names get rewritten to D2 equivalents on open."""
+
+    def _seed_user_with_preset(self, db_path: Path, user_id: str, preset: str) -> None:
+        """Insert a user_config row with the given active_preset bypassing the
+        new validation — simulates a row written by a pre-D2 version."""
+        import sqlite3
+        now = "2026-01-01T00:00:00+00:00"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "INSERT INTO users (user_id, display_name, status, created_at, updated_at) "
+            "VALUES (?, ?, 'active', ?, ?)",
+            (user_id, user_id, now, now),
+        )
+        conn.execute(
+            "INSERT INTO user_config (user_id, active_preset, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, preset, now, now),
+        )
+        conn.commit()
+        conn.close()
+
+    @pytest.mark.parametrize("old,new", [
+        ("runner", "even_split"),
+        ("conservative", "tp1_only"),
+        ("tp2_exit", "tp2_be"),
+        ("tp3_hold", "tp3_be"),
+        ("breakeven_filter", "even_split"),
+        ("small_runner", "even_split"),
+    ])
+    def test_old_name_migrates_to_new(self, tmp_path, old, new):
+        db_path = tmp_path / "legacy.db"
+        # Open once to create the schema
+        db = UserDatabase(db_path=db_path)
+        db.close()
+        # Seed a row with the old preset name
+        self._seed_user_with_preset(db_path, "alice", old)
+        # Re-open — _migrate_active_preset should rewrite alice's preset
+        db = UserDatabase(db_path=db_path)
+        cfg = db.get_user_config("alice")
+        assert cfg["active_preset"] == new
+        db.close()
+
+    def test_custom_preset_name_untouched(self, tmp_path):
+        """A user with a custom preset name (not in the rename map) is unaffected."""
+        db_path = tmp_path / "legacy.db"
+        db = UserDatabase(db_path=db_path)
+        db.close()
+        self._seed_user_with_preset(db_path, "alice", "my_custom_preset")
+        db = UserDatabase(db_path=db_path)
+        cfg = db.get_user_config("alice")
+        assert cfg["active_preset"] == "my_custom_preset"
+        db.close()
+
+    def test_migration_is_idempotent(self, tmp_path):
+        """Running the migration twice doesn't double-process."""
+        db_path = tmp_path / "legacy.db"
+        db = UserDatabase(db_path=db_path)
+        db.close()
+        self._seed_user_with_preset(db_path, "alice", "runner")
+        # First open migrates
+        db = UserDatabase(db_path=db_path)
+        assert db.get_user_config("alice")["active_preset"] == "even_split"
+        db.close()
+        # Second open is a no-op
+        db = UserDatabase(db_path=db_path)
+        assert db.get_user_config("alice")["active_preset"] == "even_split"
+        db.close()
+
+    def test_new_name_already_set_is_noop(self, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        db = UserDatabase(db_path=db_path)
+        db.close()
+        self._seed_user_with_preset(db_path, "alice", "hybrid")
+        db = UserDatabase(db_path=db_path)
+        assert db.get_user_config("alice")["active_preset"] == "hybrid"
+        db.close()
+
+
+# ====================================================================
+# D2 — BUILTIN_PRESETS contents
+# ====================================================================
+
+
+class TestBuiltinPresets:
+    """The 7 built-in presets match the D2 spec exactly."""
+
+    def test_exactly_seven_presets(self):
+        from src.config.settings import BUILTIN_PRESETS
+        expected = {
+            "tp1_only", "tp2_only", "tp3_only",
+            "tp2_be", "tp3_be", "hybrid", "even_split",
+        }
+        assert set(BUILTIN_PRESETS.keys()) == expected
+
+    def test_default_preset_is_even_split(self):
+        from src.config.settings import DEFAULT_PRESET, StrategyConfig
+        assert DEFAULT_PRESET == "even_split"
+        assert StrategyConfig().active_preset == "even_split"
+
+    @pytest.mark.parametrize("name,tp_split,be", [
+        ("tp1_only", [1.0, 0.0, 0.0], "never"),
+        ("tp2_only", [0.0, 1.0, 0.0], "never"),
+        ("tp3_only", [0.0, 0.0, 1.0], "never"),
+        ("tp2_be", [0.0, 1.0, 0.0], "tp1"),
+        ("tp3_be", [0.0, 0.0, 1.0], "tp1"),
+        ("hybrid", [0.1, 0.7, 0.2], "tp1"),
+        ("even_split", [0.33, 0.33, 0.34], "tp1"),
+    ])
+    def test_preset_shape(self, name, tp_split, be):
+        from src.config.settings import BUILTIN_PRESETS
+        p = BUILTIN_PRESETS[name]
+        assert p.tp_split == tp_split
+        assert p.move_sl_to_breakeven_after == be
+
+    def test_old_names_no_longer_exist(self):
+        from src.config.settings import BUILTIN_PRESETS
+        for old in ("runner", "conservative", "tp2_exit", "tp3_hold",
+                     "breakeven_filter", "small_runner"):
+            assert old not in BUILTIN_PRESETS
+
+    def test_get_active_preset_resolves_each_builtin(self):
+        from src.config.settings import BUILTIN_PRESETS, Config
+        for name in BUILTIN_PRESETS:
+            cfg = Config()
+            cfg.strategy.active_preset = name
+            assert cfg.get_active_preset().tp_split == BUILTIN_PRESETS[name].tp_split

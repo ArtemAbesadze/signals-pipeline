@@ -138,7 +138,7 @@ class TestCreateUser:
                 "user_id": "bob",
                 "display_name": "Bob",
                 "credentials": SAMPLE_CREDS,
-                "config": {"active_preset": "conservative", "max_leverage": 10},
+                "config": {"active_preset": "tp1_only", "max_leverage": 10},
             },
             headers=_headers(),
         )
@@ -249,13 +249,13 @@ class TestUpdateUser:
         )
         resp = await api_client.put(
             "/api/users/alice",
-            json={"config": {"max_leverage": 15, "active_preset": "tp2_exit"}},
+            json={"config": {"max_leverage": 15, "active_preset": "tp2_be"}},
             headers=_headers(),
         )
         assert resp.status == 200
         cfg = user_db.get_user_config("alice")
         assert cfg["max_leverage"] == 15
-        assert cfg["active_preset"] == "tp2_exit"
+        assert cfg["active_preset"] == "tp2_be"
 
     @pytest.mark.asyncio
     async def test_update_nonexistent_user(self, api_client):

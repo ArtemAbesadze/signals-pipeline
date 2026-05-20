@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS user_credentials (
 _USER_CONFIG_DDL = """\
 CREATE TABLE IF NOT EXISTS user_config (
     user_id                TEXT PRIMARY KEY REFERENCES users(user_id),
-    active_preset          TEXT NOT NULL DEFAULT 'runner',
+    active_preset          TEXT NOT NULL DEFAULT 'even_split',
     auto_execute           INTEGER NOT NULL DEFAULT 0,
     max_leverage           INTEGER NOT NULL DEFAULT 20,
     size_by_risk_json      TEXT NOT NULL DEFAULT '{"LOW":4.0,"MEDIUM":2.0,"HIGH":1.0}',
@@ -77,6 +77,18 @@ CREATE TABLE IF NOT EXISTS user_config (
 """
 
 VALID_PORT_MODES = ("withdraw", "compound", "watermark")
+
+# D2 preset rename — applied once via _migrate_active_preset. User-defined
+# custom presets (in custom_presets_json) are untouched; only references to
+# the six built-in names that no longer exist get rewritten.
+_PRESET_RENAMES: dict[str, str] = {
+    "runner": "even_split",            # same tp_split + BE-after-TP1
+    "conservative": "tp1_only",         # same tp_split, no BE
+    "tp2_exit": "tp2_be",               # both exit fully by TP2
+    "tp3_hold": "tp3_be",               # same tp_split + BE-after-TP1
+    "breakeven_filter": "even_split",   # same shape; old size_pct deferred to size_by_risk
+    "small_runner": "even_split",       # same shape; old size_pct deferred to size_by_risk
+}
 
 _TELEGRAM_ADMINS_DDL = """\
 CREATE TABLE IF NOT EXISTS telegram_admins (
@@ -198,7 +210,7 @@ class UserDatabase:
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     user_id,
-                    config.get("active_preset", "runner"),
+                    config.get("active_preset", "even_split"),
                     int(config.get("auto_execute", False)),
                     config.get("max_leverage", 20),
                     json.dumps(size_by_risk),
@@ -586,6 +598,25 @@ class UserDatabase:
             if col not in existing:
                 self._conn.execute(sql)
                 logger.info("Migrated user_config: added column %s", col)
+
+        self._migrate_active_preset()
+
+    def _migrate_active_preset(self) -> None:
+        """Rename old built-in preset names to their D2 equivalents.
+
+        Idempotent — re-running on an already-migrated DB is a no-op.
+        Custom presets (defined in custom_presets_json) are untouched.
+        """
+        for old_name, new_name in _PRESET_RENAMES.items():
+            cursor = self._conn.execute(
+                "UPDATE user_config SET active_preset = ? WHERE active_preset = ?",
+                (new_name, old_name),
+            )
+            if cursor.rowcount > 0:
+                logger.info(
+                    "Migrated active_preset for %d user(s): '%s' -> '%s'",
+                    cursor.rowcount, old_name, new_name,
+                )
 
     # ------------------------------------------------------------------
     # Telegram chat ID

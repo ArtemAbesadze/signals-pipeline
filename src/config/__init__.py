@@ -3,6 +3,7 @@ from src.config.settings import (
     Config,
     ConfigError,
     DatabaseConfig,
+    DEFAULT_PRESET,
     DiscordConfig,
     ExchangeConfig,
     InputConfig,

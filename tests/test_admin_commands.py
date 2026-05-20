@@ -100,7 +100,7 @@ class TestUsersCommand:
         user_db = MagicMock()
         user_db.list_users.return_value = [u1, u2]
         user_db.get_user_config.side_effect = [
-            {"active_preset": "runner"},
+            {"active_preset": "even_split"},
             {"active_preset": "scalper"},
         ]
         user_db.get_access_expiry.side_effect = [
@@ -117,7 +117,7 @@ class TestUsersCommand:
         assert "user-2" in text
         assert "Alice" in text
         assert "Bob" in text
-        assert "runner" in text
+        assert "even_split" in text
         assert "scalper" in text
         assert "2025-06-01" in text
         assert "unlimited" in text
