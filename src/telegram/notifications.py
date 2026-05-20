@@ -247,6 +247,25 @@ class TelegramNotifier:
         )
         await self._send(text)
 
+    async def notify_order_pending(self, trade_id: int, coin: str) -> None:
+        """CP says entry order is pending — price moved, waiting for pullback."""
+        text = (
+            f"⌛ *Order Pending — Trade #{trade_id}*\n\n"
+            f"💱 Coin: {coin}\n"
+            f"Price moved away from entry. Order resting on exchange, "
+            f"waiting for pullback."
+        )
+        await self._send(text)
+
+    async def notify_trade_live(self, trade_id: int, coin: str) -> None:
+        """CP confirms entry has filled — trade is live."""
+        text = (
+            f"✅ *Trade Live — #{trade_id}*\n\n"
+            f"💱 Coin: {coin}\n"
+            f"CP confirms entry filled."
+        )
+        await self._send(text)
+
     async def notify_pnl_alert(self, coin: str, side: str, pnl_pct: float, threshold_type: str) -> None:
         """PnL threshold alert — profit or loss."""
         emoji = "💹" if threshold_type == "profit" else "📉"

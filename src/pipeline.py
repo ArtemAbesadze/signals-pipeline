@@ -28,11 +28,13 @@ from src.parser.update_parser import (
     parse_breakeven,
     parse_canceled,
     parse_manual_update,
+    parse_order_pending,
     parse_preparation,
     parse_sl_update,
     parse_stop_hit,
     parse_tp_hit,
     parse_trade_closed,
+    parse_trade_live,
 )
 from src.state.database import TradeDatabase
 from src.state.models import TradeRecord, TradeStatus
@@ -79,6 +81,8 @@ class Pipeline:
 
         handlers = {
             MessageType.SIGNAL_ALERT: self._handle_signal,
+            MessageType.ORDER_PENDING: self._handle_order_pending,
+            MessageType.TRADE_LIVE: self._handle_trade_live,
             MessageType.TP_HIT: self._handle_tp_hit,
             MessageType.ALL_TP_HIT: self._handle_all_tp_hit,
             MessageType.BREAKEVEN: self._handle_breakeven,
@@ -359,6 +363,50 @@ class Pipeline:
         if self._notifier:
             self._notify(self._notifier.notify_trade_closed(
                 tc.trade_id, trade.coin, tc.detail,
+            ))
+
+    def _handle_order_pending(self, raw: str) -> None:
+        """Order pending — log + notify; entry order stays resting on exchange.
+
+        CP posts this when the entry price moved away before our limit
+        filled. No exchange action — our order is already in place.
+        """
+        op = parse_order_pending(raw)
+        trade = self._db.get_trade(op.trade_id)
+        if not trade:
+            logger.warning("ORDER_PENDING for unknown trade #%d", op.trade_id)
+            return
+
+        logger.info(
+            "ORDER_PENDING: trade #%d %s — CP says price moved, waiting for pullback",
+            op.trade_id, op.pair,
+        )
+
+        if self._notifier:
+            self._notify(self._notifier.notify_order_pending(
+                op.trade_id, trade.coin,
+            ))
+
+    def _handle_trade_live(self, raw: str) -> None:
+        """Trade live — log + notify; exchange remains authoritative for status.
+
+        CP confirms the entry has filled. We already know via the
+        exchange order-fill event, so this is corroboration / audit only.
+        """
+        tl = parse_trade_live(raw)
+        trade = self._db.get_trade(tl.trade_id)
+        if not trade:
+            logger.warning("TRADE_LIVE for unknown trade #%d", tl.trade_id)
+            return
+
+        logger.info(
+            "TRADE_LIVE: trade #%d %s — CP confirms entry filled",
+            tl.trade_id, tl.pair,
+        )
+
+        if self._notifier:
+            self._notify(self._notifier.notify_trade_live(
+                tl.trade_id, trade.coin,
             ))
 
     def _handle_preparation(self, raw: str) -> None:

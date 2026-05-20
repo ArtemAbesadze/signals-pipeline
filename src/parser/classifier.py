@@ -5,9 +5,11 @@ from enum import Enum
 
 
 class MessageType(Enum):
-    """All known Potion Perps message types."""
+    """All known CryptoPrinter message types."""
 
     SIGNAL_ALERT = "signal_alert"
+    ORDER_PENDING = "order_pending"     # signal sent, entry resting, price moved away
+    TRADE_LIVE = "trade_live"           # CP confirms entry has filled
     TP_HIT = "tp_hit"
     ALL_TP_HIT = "all_tp_hit"
     BREAKEVEN = "breakeven"
@@ -19,17 +21,31 @@ class MessageType(Enum):
     NOISE = "noise"
 
 
+# Discord-specific noise patterns we always strip before keyword matching.
+# Kept in sync with src/parser/signal_parser.py::_clean.
+_DISCORD_MENTION = re.compile(r"<@[&!]?\d+>")
+_PREV_REF = re.compile(r"\s*\(prev:[^)]*\)", re.IGNORECASE)
+_BRACKETED_URL = re.compile(r"<https?://[^>]+>")
+_BARE_URL = re.compile(r"https?://[^\s)<>]+")
+_CALLED_BY_FOOTER = re.compile(r"(?im)^\s*Called by\s*<@\d+>\s*$")
+_EMOJI = re.compile(
+    r"[\U0001f300-\U0001f9ff\U00002600-\U000027bf\U0000fe00-\U0000fe0f"
+    r"\U0001fa00-\U0001fa6f\U0001fa70-\U0001faff\U0000200d]+",
+)
+
+
 def _strip_markdown(text: str) -> str:
-    """Remove Discord markdown formatting (bold, emojis, backticks)."""
+    """Remove Discord markdown, mentions, URLs, and the Called-by footer."""
+    # Called-by footer must be stripped BEFORE general mention stripping —
+    # the footer regex anchors on the trailing <@NNN> to identify the line.
+    text = _CALLED_BY_FOOTER.sub("", text)
+    text = _DISCORD_MENTION.sub("", text)
+    text = _PREV_REF.sub("", text)
+    text = _BRACKETED_URL.sub("", text)
+    text = _BARE_URL.sub("", text)
     text = re.sub(r"\*+", "", text)
     text = text.replace("`", "")
-    # Strip common emoji characters (keep text between them)
-    text = re.sub(
-        r"[\U0001f300-\U0001f9ff\U00002600-\U000027bf\U0000fe00-\U0000fe0f"
-        r"\U0001fa00-\U0001fa6f\U0001fa70-\U0001faff\U0000200d]+",
-        "",
-        text,
-    )
+    text = _EMOJI.sub("", text)
     return text
 
 
@@ -53,6 +69,15 @@ def classify(raw_message: str) -> MessageType:
         return MessageType.NOISE
 
     # --- Lifecycle events (specific keywords) ---
+    # ORDER_PENDING and TRADE_LIVE must be checked BEFORE SIGNAL_ALERT —
+    # their messages can include a "Trading Signal Alert" header preamble
+    # that would otherwise win the classification.
+    if "ORDER PENDING" in text:
+        return MessageType.ORDER_PENDING
+
+    if "TRADE IS LIVE" in text:
+        return MessageType.TRADE_LIVE
+
     if "ALL TAKE-PROFIT TARGETS HIT" in text:
         return MessageType.ALL_TP_HIT
 

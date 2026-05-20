@@ -73,6 +73,59 @@ class TestSignalParser:
         assert s.tp3 == 0.3265
         assert s.leverage == 14
 
+    def test_signal_alert_07_bare_risk_with_mentions(self):
+        """New CP format: bare `LOW RISK` (no parens), ticker header,
+        Discord mentions, Called-by footer — all must parse cleanly."""
+        s = parse_signal(_load("signal_alert_07.txt"))
+        assert s.pair == "1000BONK/USDT"
+        assert s.trade_id == 2068
+        assert s.risk_level == RiskLevel.LOW
+        assert s.trade_type == "SWING"
+        assert s.size == "1-4%"
+        assert s.side == Side.SHORT
+        assert s.entry == 0.00713
+        assert s.stop_loss == 0.007268
+        assert s.tp1 == 0.007061
+        assert s.tp2 == 0.006961
+        assert s.tp3 == 0.00663
+        assert s.leverage == 16
+
+
+class TestSignalParserRiskLevelFormat:
+    """Both old (parenthesized) and new (bare) risk-level formats parse."""
+
+    def _build_signal(self, risk_field: str) -> str:
+        return (
+            "TRADING SIGNAL ALERT\n\n"
+            "PAIR: BTC/USDT #9999\n"
+            f"{risk_field}\n\n"
+            "TYPE: SWING\n"
+            "SIZE: 1-4%\n"
+            "SIDE: LONG\n\n"
+            "ENTRY: 100\n"
+            "SL: 90          (-10%)\n\n"
+            "TP1: 110      (10%)\n"
+            "TP2: 120      (20%)\n"
+            "TP3: 130      (30%)\n\n"
+            "LEVERAGE: 10x"
+        )
+
+    def test_parenthesized_risk_still_works(self):
+        s = parse_signal(self._build_signal("(MEDIUM RISK)"))
+        assert s.risk_level == RiskLevel.MEDIUM
+
+    def test_bare_risk_works(self):
+        s = parse_signal(self._build_signal("MEDIUM RISK"))
+        assert s.risk_level == RiskLevel.MEDIUM
+
+    def test_bare_low_risk_works(self):
+        s = parse_signal(self._build_signal("LOW RISK"))
+        assert s.risk_level == RiskLevel.LOW
+
+    def test_bare_high_risk_works(self):
+        s = parse_signal(self._build_signal("HIGH RISK"))
+        assert s.risk_level == RiskLevel.HIGH
+
 
 class TestSignalParserEdgeCases:
 

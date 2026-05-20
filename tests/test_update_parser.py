@@ -10,11 +10,13 @@ from src.parser.update_parser import (
     parse_breakeven,
     parse_canceled,
     parse_manual_update,
+    parse_order_pending,
     parse_preparation,
     parse_sl_update,
     parse_stop_hit,
     parse_tp_hit,
     parse_trade_closed,
+    parse_trade_live,
 )
 
 SAMPLES_DIR = Path("signals/samples")
@@ -54,6 +56,14 @@ class TestTpHit:
         assert r.profit_pct == 41.81
         assert r.period == "1 Minutes"
 
+    def test_tp_hit_04_signed_profit(self):
+        """1000BONK — CP's new '+'-signed PROFIT field must parse."""
+        r = parse_tp_hit(_load("tp_hit_04.txt"))
+        assert r.pair == "1000BONK/USDT"
+        assert r.trade_id == 2068
+        assert r.tp_number == 1
+        assert r.profit_pct == 15.48
+
 
 # ------------------------------------------------------------------
 # ALL_TP_HIT
@@ -80,6 +90,14 @@ class TestAllTpHit:
         assert r.trade_id == 1281
         assert r.profit_pct == 395.97
         assert r.period == "13 Hours 34 Minutes"
+
+    def test_all_tp_hit_04_pol_signed(self):
+        """POL — new CP format with '+'-signed PROFIT."""
+        r = parse_all_tp_hit(_load("all_tp_hit_04.txt"))
+        assert r.pair == "POL/USDT"
+        assert r.trade_id == 2074
+        assert r.profit_pct == 154.36
+        assert "15 HOURS 27 MINUTES" in r.period.upper()
 
 
 # ------------------------------------------------------------------
@@ -112,6 +130,25 @@ class TestBreakeven:
         assert r.trade_id == 1250
         assert r.tp_secured == 2
 
+    def test_breakeven_05_link_after_tp2(self):
+        r = parse_breakeven(_load("breakeven_05.txt"))
+        assert r.pair == "LINK/USDT"
+        assert r.trade_id == 2057
+        assert r.tp_secured == 2
+
+    def test_breakeven_06_jup_after_tp1(self):
+        r = parse_breakeven(_load("breakeven_06.txt"))
+        assert r.pair == "JUP/USDT"
+        assert r.trade_id == 2081
+        assert r.tp_secured == 1
+
+    def test_breakeven_07_tao_spaced_tp(self):
+        """TAO — 'TP 2' with a space between TP and digit; (prev: <url>) stripped."""
+        r = parse_breakeven(_load("breakeven_07.txt"))
+        assert r.pair == "TAO/USDT"
+        assert r.trade_id == 2062
+        assert r.tp_secured == 2
+
 
 # ------------------------------------------------------------------
 # STOP_HIT
@@ -124,6 +161,13 @@ class TestStopHit:
         assert r.pair == "WIF/USDT"
         assert r.trade_id == 1267
         assert r.loss_pct == -77.7
+
+    def test_stop_hit_02_trx_with_prev_url(self):
+        """TRX — bare prev URL + stacked role mentions must be stripped."""
+        r = parse_stop_hit(_load("stop_hit_02.txt"))
+        assert r.pair == "TRX/USDT"
+        assert r.trade_id == 2092
+        assert r.loss_pct == -29.04
 
 
 # ------------------------------------------------------------------
@@ -158,6 +202,16 @@ class TestCanceled:
         r = parse_canceled(_load("canceled_05.txt"))
         assert r.trade_id == 1250
 
+    def test_canceled_06_sei_tp1_before_entry(self):
+        r = parse_canceled(_load("canceled_06.txt"))
+        assert r.trade_id == 2072
+        assert r.pair == "SEI/USDT"
+
+    def test_canceled_07_stx_better_entry(self):
+        r = parse_canceled(_load("canceled_07.txt"))
+        assert r.trade_id == 2060
+        assert r.pair == "STX/USDT"
+
 
 # ------------------------------------------------------------------
 # TRADE_CLOSED
@@ -176,6 +230,52 @@ class TestTradeClosed:
         assert r.pair == "APT/USDT"
         assert r.trade_id == 1234
         assert "TAKE PROFIT 2" in r.detail.upper()
+
+    def test_trade_closed_03_xrp_with_prev_url(self):
+        r = parse_trade_closed(_load("trade_closed_03.txt"))
+        assert r.pair == "XRP/USDT"
+        assert r.trade_id == 2075
+        assert "TAKE PROFIT 1" in r.detail.upper()
+
+
+# ------------------------------------------------------------------
+# ORDER_PENDING (new lifecycle type — CP says price moved before fill)
+# ------------------------------------------------------------------
+
+class TestOrderPending:
+
+    def test_order_pending_01_1000bonk(self):
+        r = parse_order_pending(_load("order_pending_01.txt"))
+        assert r.pair == "1000BONK/USDT"
+        assert r.trade_id == 2068
+
+    def test_order_pending_missing_pair_raises(self):
+        with pytest.raises(UpdateParseError, match="ORDER_PENDING"):
+            parse_order_pending("ORDER PENDING\nNo pair here #1234")
+
+    def test_order_pending_missing_trade_id_raises(self):
+        with pytest.raises(UpdateParseError, match="ORDER_PENDING"):
+            parse_order_pending("ORDER PENDING\nPAIR: BTC/USDT")
+
+
+# ------------------------------------------------------------------
+# TRADE_LIVE (new lifecycle type — CP confirms entry filled)
+# ------------------------------------------------------------------
+
+class TestTradeLive:
+
+    def test_trade_live_01_ada(self):
+        r = parse_trade_live(_load("trade_live_01.txt"))
+        assert r.pair == "ADA/USDT"
+        assert r.trade_id == 2069
+
+    def test_trade_live_missing_pair_raises(self):
+        with pytest.raises(UpdateParseError, match="TRADE_LIVE"):
+            parse_trade_live("TRADE IS LIVE #1234 no pair")
+
+    def test_trade_live_missing_trade_id_raises(self):
+        with pytest.raises(UpdateParseError, match="TRADE_LIVE"):
+            parse_trade_live("TRADE IS LIVE\nPAIR: BTC/USDT")
 
 
 # ------------------------------------------------------------------

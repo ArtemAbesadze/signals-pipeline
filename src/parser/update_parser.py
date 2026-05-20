@@ -83,6 +83,30 @@ class Preparation:
 
 
 @dataclass
+class OrderPending:
+    """CP posts this when the signal's entry didn't fill — price moved away.
+
+    The bot's entry order is still resting on the exchange. No action
+    required from us; the message is informational + audit.
+    """
+
+    pair: str
+    trade_id: int
+
+
+@dataclass
+class TradeLive:
+    """CP confirms the entry order has filled and the position is open.
+
+    The exchange order-fill event is authoritative for our state; this
+    message is treated as corroboration / audit, not a status trigger.
+    """
+
+    pair: str
+    trade_id: int
+
+
+@dataclass
 class ManualUpdate:
     """Free-form manual instruction from the signal provider."""
 
@@ -124,7 +148,7 @@ def parse_tp_hit(raw: str) -> TpHit:
         raise UpdateParseError("TP_HIT: could not extract TP number")
     tp_number = int(m.group(1))
 
-    m = re.search(r"PROFIT[:\s]+([\d.]+)%", text, re.IGNORECASE)
+    m = re.search(r"PROFIT[:\s]+([+-]?[\d.]+)%", text, re.IGNORECASE)
     if not m:
         raise UpdateParseError("TP_HIT: could not extract profit %")
     profit_pct = float(m.group(1))
@@ -144,7 +168,7 @@ def parse_all_tp_hit(raw: str) -> AllTpHit:
     if not pair or trade_id is None:
         raise UpdateParseError("ALL_TP_HIT: could not extract pair/trade_id")
 
-    m = re.search(r"PROFIT[:\s]+([\d.]+)%", text, re.IGNORECASE)
+    m = re.search(r"PROFIT[:\s]+([+-]?[\d.]+)%", text, re.IGNORECASE)
     if not m:
         raise UpdateParseError("ALL_TP_HIT: could not extract profit %")
     profit_pct = float(m.group(1))
@@ -163,7 +187,8 @@ def parse_breakeven(raw: str) -> Breakeven:
     if not pair or trade_id is None:
         raise UpdateParseError("BREAKEVEN: could not extract pair/trade_id")
 
-    m = re.search(r"TP(\d)", text)
+    # CP sometimes writes "TP2" and sometimes "TP 2" with a space.
+    m = re.search(r"TP\s?(\d)", text)
     tp_secured = int(m.group(1)) if m else 1
 
     return Breakeven(pair=pair, trade_id=trade_id, tp_secured=tp_secured)
@@ -223,6 +248,28 @@ def parse_trade_closed(raw: str) -> TradeClosed:
     detail = lines[-1] if len(lines) > 1 else ""
 
     return TradeClosed(pair=pair, trade_id=trade_id, detail=detail)
+
+
+def parse_order_pending(raw: str) -> OrderPending:
+    text = _clean(raw)
+
+    pair = _extract_pair(text)
+    trade_id = _extract_trade_id(text)
+    if not pair or trade_id is None:
+        raise UpdateParseError("ORDER_PENDING: could not extract pair/trade_id")
+
+    return OrderPending(pair=pair, trade_id=trade_id)
+
+
+def parse_trade_live(raw: str) -> TradeLive:
+    text = _clean(raw)
+
+    pair = _extract_pair(text)
+    trade_id = _extract_trade_id(text)
+    if not pair or trade_id is None:
+        raise UpdateParseError("TRADE_LIVE: could not extract pair/trade_id")
+
+    return TradeLive(pair=pair, trade_id=trade_id)
 
 
 def parse_preparation(raw: str) -> Preparation:

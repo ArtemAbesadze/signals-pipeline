@@ -34,16 +34,31 @@ class ParsedSignal:
     leverage: int
 
 
+# Discord-specific noise patterns we always strip before parsing.
+# Kept in sync with src/parser/classifier.py.
+_DISCORD_MENTION = re.compile(r"<@[&!]?\d+>")
+_PREV_REF = re.compile(r"\s*\(prev:[^)]*\)", re.IGNORECASE)
+_BRACKETED_URL = re.compile(r"<https?://[^>]+>")
+_BARE_URL = re.compile(r"https?://[^\s)<>]+")
+_CALLED_BY_FOOTER = re.compile(r"(?im)^\s*Called by\s*<@\d+>\s*$")
+_EMOJI = re.compile(
+    r"[\U0001f300-\U0001f9ff\U00002600-\U000027bf\U0000fe00-\U0000fe0f"
+    r"\U0001fa00-\U0001fa6f\U0001fa70-\U0001faff\U0000200d]+",
+)
+
+
 def _clean(text: str) -> str:
-    """Strip Discord markdown (bold, emojis, backticks) from raw text."""
+    """Strip Discord markdown, mentions, URLs, and Called-by footer."""
+    # Called-by footer must be stripped BEFORE general mention stripping —
+    # the footer regex anchors on the trailing <@NNN> to identify the line.
+    text = _CALLED_BY_FOOTER.sub("", text)
+    text = _DISCORD_MENTION.sub("", text)
+    text = _PREV_REF.sub("", text)
+    text = _BRACKETED_URL.sub("", text)
+    text = _BARE_URL.sub("", text)
     text = re.sub(r"\*+", "", text)
     text = text.replace("`", "")
-    text = re.sub(
-        r"[\U0001f300-\U0001f9ff\U00002600-\U000027bf\U0000fe00-\U0000fe0f"
-        r"\U0001fa00-\U0001fa6f\U0001fa70-\U0001faff\U0000200d]+",
-        "",
-        text,
-    )
+    text = _EMOJI.sub("", text)
     return text
 
 
@@ -73,7 +88,8 @@ def parse_signal(raw_message: str) -> ParsedSignal:
     trade_id = int(m.group(2))
 
     # --- Risk Level ---
-    m = re.search(r"\((LOW|MEDIUM|HIGH)\s+RISK\)", text, re.IGNORECASE)
+    # CP uses both `(LOW RISK)` (older format) and bare `LOW RISK` (current).
+    m = re.search(r"\(?(LOW|MEDIUM|HIGH)\s+RISK\)?", text, re.IGNORECASE)
     if not m:
         raise SignalParseError("Could not extract risk level")
     risk_level = RiskLevel(m.group(1).upper())

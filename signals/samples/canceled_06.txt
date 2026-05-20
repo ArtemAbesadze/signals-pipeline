@@ -1,0 +1,8 @@
+TRADE CANCELED <@&1488219081063665784>
+🤝 **TRADE CANCELED**
+
+**PAIR:** SEI/USDT #2072
+
+**TP1 target hit** before reaching the entry
+
+Called by <@1436550935743565884>

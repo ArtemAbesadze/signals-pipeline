@@ -795,15 +795,16 @@ class TestEdgeCases:
         pipeline.process_message("12345")
         assert client.exchange.order.call_count == 0
 
-    def test_all_28_samples_dont_crash(self, pipeline, db):
+    def test_all_samples_dont_crash(self, pipeline, db):
         """Every single sample file should be processable without exception."""
         for f in sorted(SAMPLES_DIR.glob("*.txt")):
             pipeline.process_message(f.read_text().strip())
 
-        # We should have trades only from the 4 signal alerts
-        # (other messages are lifecycle events for trades that may not exist locally)
+        # We should have one trade per signal_alert sample — other messages
+        # are lifecycle events for trades that may not exist locally.
+        expected_trades = len(list(SAMPLES_DIR.glob("signal_alert_*.txt")))
         trades = db.get_open_trades()
-        assert len(trades) == 4
+        assert len(trades) == expected_trades
 
     def test_rapid_fire_same_signal(self, pipeline, db, client):
         """Processing the same signal 10 times should only create 1 trade."""
