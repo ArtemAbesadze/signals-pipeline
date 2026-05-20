@@ -463,6 +463,34 @@ class TradeDatabase:
             ).fetchall()
         return [self._row_to_event(r) for r in rows]
 
+    def get_port_changes(self, limit: int = 5) -> list[dict]:
+        """Return the N most recently closed trades with realized P&L.
+
+        Each entry includes ``delta_usd = position_size_usd * pnl_pct / 100``
+        — the raw per-trade port-delta. Whether that delta actually applied
+        depends on the user's ``port_mode`` (withdraw=ignored, compound=
+        applied both directions, watermark=clamped at floor on losses).
+        Display logic lives in the formatter; this method just returns
+        the candidates.
+        """
+        rows = self._conn.execute(
+            "SELECT trade_id, coin, close_reason, pnl_pct, position_size_usd, closed_at "
+            "FROM trades WHERE user_id = ? AND status = 'closed' "
+            "AND pnl_pct IS NOT NULL ORDER BY closed_at DESC LIMIT ?",
+            (self._user_id, limit),
+        ).fetchall()
+        return [
+            {
+                "trade_id": r["trade_id"],
+                "coin": r["coin"],
+                "close_reason": r["close_reason"],
+                "pnl_pct": r["pnl_pct"],
+                "delta_usd": float(r["position_size_usd"]) * float(r["pnl_pct"]) / 100.0,
+                "closed_at": _parse_dt(r["closed_at"]),
+            }
+            for r in rows
+        ]
+
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> TradeEvent:
         return TradeEvent(

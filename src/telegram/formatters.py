@@ -161,6 +161,161 @@ def _format_recent_event_line(event: Any, now_local: datetime, tz: ZoneInfo) -> 
     return f"  {icon} {time_str}  {action}"
 
 
+def _format_port_change_line(h: dict, tz: ZoneInfo, applies: bool) -> str:
+    """One row in the Port screen's history section."""
+    delta = h["delta_usd"]
+    sign = "+" if delta >= 0 else "-"
+    delta_str = f"{sign}${abs(delta):,.2f}"
+
+    reason_label = {
+        "all_tp_hit": "all TPs",
+        "stop_hit": "SL",
+        "manual_close": "manual",
+        "canceled": "canceled",
+    }.get(h.get("close_reason") or "", h.get("close_reason") or "closed")
+
+    closed_at = h.get("closed_at")
+    if closed_at is not None:
+        local = closed_at.replace(tzinfo=timezone.utc).astimezone(tz)
+        time_str = local.strftime("%b %-d %-I:%M%p")
+    else:
+        time_str = "—"
+
+    suffix = "" if applies else "  _(not applied — withdraw mode)_"
+    return f"  {delta_str}  #{h['trade_id']} {h['coin']} {reason_label}  {time_str}{suffix}"
+
+
+_MODE_DESCRIPTIONS = {
+    "withdraw": "profits stay in wallet, port unchanged",
+    "compound": "port += pnl on every close (both directions)",
+    "watermark": "profits raise floor; losses clamped at floor",
+}
+
+
+def format_port(
+    port_state: dict,
+    wallet_usd: float | None,
+    history: list[dict],
+    tz: ZoneInfo = _NY,
+) -> str:
+    """Render the Port management screen (state + recent history)."""
+    port_usd = port_state.get("port_usd")
+    port_mode = port_state.get("port_mode", "withdraw")
+    port_watermark = port_state.get("port_watermark")
+
+    # Header / status line
+    if port_usd is None:
+        header = "🛡 *Port:* _not configured_"
+        bounds_line = ""
+    else:
+        header = f"🛡 *Port: {format_usd(port_usd)}*  ({port_mode})"
+        if wallet_usd is None:
+            bounds_line = "💼 Wallet: —"
+        elif port_usd > wallet_usd:
+            bounds_line = (
+                f"💼 Wallet: {format_usd(wallet_usd)}  "
+                f"🛑 *port exceeds wallet — new trades halted*"
+            )
+        elif port_usd > wallet_usd * 0.95:
+            bounds_line = f"💼 Wallet: {format_usd(wallet_usd)}  ⚠️ within 5% of wallet"
+        else:
+            headroom_pct = (1 - port_usd / wallet_usd) * 100
+            bounds_line = (
+                f"💼 Wallet: {format_usd(wallet_usd)}  "
+                f"✅ within bounds ({headroom_pct:.0f}% headroom)"
+            )
+
+    lines = [header]
+    if port_mode == "watermark" and port_watermark is not None:
+        lines.append(f"Floor: {format_usd(port_watermark)}")
+    if bounds_line:
+        lines.append(bounds_line)
+    lines.append(f"_{_MODE_DESCRIPTIONS.get(port_mode, '')}_")
+
+    # History section
+    lines.append("")
+    if not history:
+        lines.append("📜 *Recent port changes:* _no closed trades yet_")
+    else:
+        applies = port_mode != "withdraw"
+        title = "Recent port changes" if applies else "Recent closed trades"
+        lines.append(f"📜 *{title}:*")
+        for h in history:
+            lines.append(_format_port_change_line(h, tz, applies))
+
+    return "\n".join(lines)
+
+
+def format_audit_trail(trade: Any, events: list[Any], tz: ZoneInfo = _NY) -> str:
+    """Render the audit trail for a single trade — snapshot + chronological events."""
+    side_emoji = "📈" if trade.side.upper() == "LONG" else "📉"
+    header = (
+        f"🔍 *Audit — Trade #{trade.trade_id} {trade.pair} "
+        f"{side_emoji} {trade.side.upper()}*"
+    )
+
+    # Decision snapshot
+    snap = trade.decision_snapshot
+    if snap:
+        opened = trade.created_at
+        opened_str = ""
+        if opened is not None:
+            local = opened.replace(tzinfo=timezone.utc).astimezone(tz)
+            opened_str = f" ({local.strftime('%Y-%m-%d %-I:%M %p ET')})"
+
+        snap_lines = [
+            f"\n🧠 *Decision at open{opened_str}*",
+            f"  Preset: {snap.get('preset', '—')}",
+            f"  Risk: {snap.get('risk_level', '—')} → size_pct = {snap.get('size_pct_applied', '—')}%",
+            f"  Port: {format_usd(snap.get('port_usd_at_open', 0))} ({snap.get('port_mode', '—')})"
+            f" | Wallet: {format_usd(snap.get('wallet_usd_at_open', 0))}",
+            f"  Size: {format_usd(snap.get('position_size_usd', 0))}"
+            f" | Leverage: {snap.get('leverage_applied', '—')}x"
+            f" (signal: {snap.get('leverage_signal', '—')}x)",
+            f"  Exposure: {snap.get('exposure_used_pct', 0):.2f}% of port",
+        ]
+        why = snap.get("why")
+        if why:
+            snap_lines.append(f"  _Why:_ {why}")
+        snapshot_section = "\n".join(snap_lines)
+    else:
+        snapshot_section = "\n_No decision snapshot recorded (trade opened before Phase 1.5)._"
+
+    # Events
+    event_icons = {
+        "signal_alert": "📡",
+        "tp_hit": "🎯",
+        "breakeven": "⚖️",
+        "stop_hit": "🛑",
+        "trade_closed": "🏁",
+        "cancel": "🚫",
+        "order_pending": "⌛",
+        "trade_live": "✅",
+        "sl_move": "🛡",
+        "error": "⚠️",
+    }
+
+    if events:
+        event_lines = ["\n📋 *Events*"]
+        for e in events:
+            icon = event_icons.get(e.event_type.value, "•")
+            occurred = e.occurred_at
+            if occurred is not None:
+                local = occurred.replace(tzinfo=timezone.utc).astimezone(tz)
+                time_str = local.strftime("%-I:%M %p")
+            else:
+                time_str = "—"
+            action = e.action_taken or e.event_type.value
+            if len(action) > 80:
+                action = action[:77] + "..."
+            event_lines.append(f"  {time_str}  {icon} {action}")
+        events_section = "\n".join(event_lines)
+    else:
+        events_section = "\n📋 *Events:* none"
+
+    return f"{header}\n{snapshot_section}\n{events_section}"
+
+
 def format_main_menu(
     display_name: str,
     port_state: dict,

@@ -46,9 +46,15 @@ from src.telegram.handlers.config import (
 )
 from src.telegram.handlers.help import cancel_command, help_command, start_command, start_register_callback, unknown_command
 from src.telegram.handlers.menu import menu_callback, menu_command
+from src.telegram.handlers.port import (
+    port_amount_text_handler,
+    port_callback,
+    port_command,
+)
 from src.telegram.middleware import dm_only_filter, global_error_handler, rate_limit_filter
 from src.telegram.handlers.registration import build_registration_handler
 from src.telegram.handlers.trades import (
+    audit_trail_callback,
     history_command,
     stats_command,
     trade_detail_callback,
@@ -109,6 +115,7 @@ class TelegramBot:
             BotCommand("trades", "Active trades"),
             BotCommand("history", "Trade history"),
             BotCommand("stats", "Trading statistics"),
+            BotCommand("port", "Port management"),
             BotCommand("config", "View & change settings"),
             BotCommand("cancel", "Cancel current action"),
             BotCommand("admin", "Admin commands"),
@@ -176,6 +183,19 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("stats", stats_command))
         self._app.add_handler(CallbackQueryHandler(trade_detail_callback, pattern=r"^(trade:|trades_page:|history_page:|back:trades|noop)"))
         self._app.add_handler(CallbackQueryHandler(trading_callback, pattern=r"^trading:"))
+
+        # Audit trail (per-trade)
+        self._app.add_handler(CallbackQueryHandler(audit_trail_callback, pattern=r"^audit:"))
+
+        # Port management
+        self._app.add_handler(CommandHandler("port", port_command))
+        self._app.add_handler(CallbackQueryHandler(port_callback, pattern=r"^port:"))
+        # Text handler for port-amount input — separate group so it cohabits
+        # cleanly with the config and note text handlers
+        self._app.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, port_amount_text_handler),
+            group=1,
+        )
 
         # Trade approval (Approve/Reject from push notifications, Close Position)
         self._app.add_handler(CallbackQueryHandler(signal_approval_callback, pattern=r"^signal:(approve|reject):"))

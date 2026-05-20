@@ -30,7 +30,7 @@ HELP_MESSAGE = (
     "/trades — Active trades\n"
     "/history — Trade history\n"
     "/stats — Trading statistics\n"
-    "/status — Risk dashboard\n\n"
+    "/port — Port management\n\n"
     "⚙️ *Config Shortcuts*\n"
     "/config — View & change settings\n"
     "/preset — Change strategy preset\n"

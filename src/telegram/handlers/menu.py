@@ -309,17 +309,6 @@ def _build_stats_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> str:
     return format_stats(closed, len(open_trades))
 
 
-def _build_port_placeholder() -> str:
-    """Placeholder for the Port screen. Real implementation lands in Commit B."""
-    return (
-        "🛡 *Port*\n\n"
-        "_Port management UI is coming in the next commit (Phase 2.2 Commit B)._\n\n"
-        "Port amount and mode can be set via the admin REST API in the "
-        "meantime:\n"
-        "  PUT /api/users/{id} {\"config\": {\"port_usd\": 1000, \"port_mode\": \"compound\"}}"
-    )
-
-
 def _build_config_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> str:
     from src.config.settings import BUILTIN_PRESETS
 
@@ -451,7 +440,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         elif data == "menu:port":
             _leave_calls_view(context, chat_id)
-            text = _build_port_placeholder()
+            from src.telegram.handlers.port import build_port_text
+            text = build_port_text(context, user_id)
             await query.edit_message_text(
                 text, parse_mode="Markdown", reply_markup=port_keyboard(),
             )
@@ -513,7 +503,8 @@ async def _refresh_screen(query, context, user_id, user_db, screen):
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=trading_hub_keyboard())
 
     elif screen == "port":
-        text = _build_port_placeholder()
+        from src.telegram.handlers.port import build_port_text
+        text = build_port_text(context, user_id)
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=port_keyboard())
 
     elif screen == "config":

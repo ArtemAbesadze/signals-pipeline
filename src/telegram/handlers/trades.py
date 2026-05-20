@@ -9,7 +9,7 @@ from telegram.ext import ContextTypes
 from src.orchestrator import Orchestrator
 from src.state.models import TradeRecord, TradeStatus
 from src.state.user_db import UserDatabase
-from src.telegram.formatters import format_balance, format_positions, format_stats
+from src.telegram.formatters import format_audit_trail, format_balance, format_positions, format_stats
 from src.telegram.keyboards import trading_sub_keyboard
 from src.telegram.middleware import registered_only
 
@@ -251,6 +251,9 @@ async def trade_detail_callback(update: Update, context: ContextTypes.DEFAULT_TY
             keyboard_rows.append(
                 [InlineKeyboardButton("🚫 Cancel Trade", callback_data=f"close_trade:{trade_id}")]
             )
+        keyboard_rows.append(
+            [InlineKeyboardButton("🔍 Audit Trail", callback_data=f"audit:{trade_id}")]
+        )
         note_label = "📝 Edit Note" if trade.notes else "📝 Add Note"
         keyboard_rows.append(
             [InlineKeyboardButton(note_label, callback_data=f"trade_note:{trade_id}")]
@@ -377,6 +380,37 @@ async def trading_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         open_trades = trade_db.get_open_trades()
         text = format_stats(closed, len(open_trades))
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=trading_sub_keyboard())
+
+
+async def audit_trail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle audit:{trade_id} — render the per-trade audit trail (D3)."""
+    query = update.callback_query
+    await query.answer()
+
+    user_db: UserDatabase = context.bot_data["user_db"]
+    chat_id = update.effective_chat.id
+    user_id = user_db.get_user_by_telegram_chat_id(chat_id)
+    if not user_id:
+        await query.edit_message_text("❌ You're not registered.")
+        return
+
+    trade_db = _get_trade_db(context, user_id)
+    if not trade_db:
+        await query.edit_message_text("⚠️ Your trading pipeline is not active.")
+        return
+
+    trade_id = int(query.data.split(":")[1])
+    trade = trade_db.get_trade(trade_id)
+    if not trade:
+        await query.edit_message_text(f"❌ Trade #{trade_id} not found.")
+        return
+
+    events = trade_db.get_events_for_trade(trade_id)
+    text = format_audit_trail(trade, events)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Back to Trade", callback_data=f"trade:{trade_id}")],
+    ])
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
 
 async def trade_note_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

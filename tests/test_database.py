@@ -218,3 +218,70 @@ class TestEventTypeEnum:
             "trade_closed", "cancel", "error",
         }
         assert {e.value for e in EventType} == expected
+
+
+# ====================================================================
+# Port-change history (Phase 2.2 Commit B)
+# ====================================================================
+
+
+class TestGetPortChanges:
+    """Per-closed-trade port-delta candidates surfaced for the Port screen."""
+
+    def _close_with_pnl(self, db, trade_id: int, pnl_pct: float, coin: str = "BTC"):
+        trade = _trade(trade_id=trade_id, coin=coin, position_size_usd=100.0)
+        db.create_trade(trade)
+        db.update_trade_status(
+            trade_id, TradeStatus.CLOSED, close_reason="all_tp_hit", pnl_pct=pnl_pct,
+        )
+
+    def test_returns_recent_closed_trades_with_realized_pnl(self, db):
+        self._close_with_pnl(db, trade_id=1, pnl_pct=10.0)   # +$10 delta
+        self._close_with_pnl(db, trade_id=2, pnl_pct=-25.0)  # -$25 delta
+        changes = db.get_port_changes(limit=5)
+        assert len(changes) == 2
+        # most-recent first; #2 came in second so it's first in DESC
+        deltas = {c["trade_id"]: c["delta_usd"] for c in changes}
+        assert deltas[1] == pytest.approx(10.0)
+        assert deltas[2] == pytest.approx(-25.0)
+
+    def test_skips_open_trades(self, db):
+        db.create_trade(_trade(trade_id=1))  # still PENDING
+        changes = db.get_port_changes()
+        assert changes == []
+
+    def test_skips_canceled_trades_without_pnl(self, db):
+        db.create_trade(_trade(trade_id=1))
+        db.update_trade_status(1, TradeStatus.CANCELED, close_reason="canceled")
+        changes = db.get_port_changes()
+        assert changes == []
+
+    def test_includes_canceled_with_pnl(self, db):
+        """Closed trades with pnl_pct set are included regardless of close_reason."""
+        db.create_trade(_trade(trade_id=1, position_size_usd=200.0))
+        db.update_trade_status(
+            1, TradeStatus.CLOSED, close_reason="stop_hit", pnl_pct=-30.0,
+        )
+        changes = db.get_port_changes()
+        assert len(changes) == 1
+        assert changes[0]["delta_usd"] == pytest.approx(-60.0)
+        assert changes[0]["close_reason"] == "stop_hit"
+
+    def test_limit_respected(self, db):
+        for i in range(1, 11):
+            self._close_with_pnl(db, trade_id=i, pnl_pct=5.0)
+        assert len(db.get_port_changes(limit=3)) == 3
+        assert len(db.get_port_changes(limit=100)) == 10
+
+    def test_user_isolation(self, tmp_path):
+        from src.state.database import TradeDatabase
+        path = tmp_path / "shared.db"
+        a = TradeDatabase(user_id="alice", db_path=path)
+        b = TradeDatabase(user_id="bob", db_path=path)
+        # alice's closed trade
+        a.create_trade(_trade(trade_id=1))
+        a.update_trade_status(1, TradeStatus.CLOSED, close_reason="all_tp_hit", pnl_pct=10.0)
+        assert len(a.get_port_changes()) == 1
+        assert b.get_port_changes() == []
+        a.close()
+        b.close()
