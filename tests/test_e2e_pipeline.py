@@ -31,6 +31,7 @@ from src.config.settings import (
     StrategyConfig,
     StrategyPreset,
     RiskConfig,
+    PortConfig,
     DatabaseConfig,
     LoggingConfig,
     HealthConfig,
@@ -106,8 +107,17 @@ def _mock_fill_response(oid: int = 1001, avg_px: float = 100.0) -> dict:
     }
 
 
-def _make_config(tmpdir: Path, auto_execute: bool = True) -> Config:
-    """Build a test config."""
+def _make_config(
+    tmpdir: Path,
+    auto_execute: bool = True,
+    port_usd: float | None = 10000.0,
+    port_mode: str = "withdraw",
+) -> Config:
+    """Build a test config.
+
+    Defaults port_usd to the same value as the mocked wallet ($10,000) so
+    sizing math matches the pre-D1 tests that used wallet balance directly.
+    """
     return Config(
         exchange=ExchangeConfig(
             network="testnet",
@@ -128,6 +138,11 @@ def _make_config(tmpdir: Path, auto_execute: bool = True) -> Config:
             max_position_size_usd=500.0,
             max_total_exposure_usd=2000.0,
             min_order_usd=10.0,
+        ),
+        port=PortConfig(
+            port_usd=port_usd,
+            port_mode=port_mode,
+            port_watermark=port_usd if port_mode == "watermark" else None,
         ),
         database=DatabaseConfig(path=str(tmpdir / "test.db")),
         logging=LoggingConfig(level="DEBUG", file=str(tmpdir / "test.log")),
@@ -875,3 +890,194 @@ class TestPositionSizeCalculation:
         assert ada_trade.position_size_usd > xrp_trade.position_size_usd
         db.close()
         db2.close()
+
+
+# ====================================================================
+# D1 — Port / wallet architecture
+# ====================================================================
+
+
+class TestPortGuardrails:
+    """Pre-trade port-vs-wallet checks from D1."""
+
+    def test_halt_when_port_not_configured(self, client, tmpdir):
+        """port_usd=None → trade skipped, no DB record, no exchange call."""
+        config = _make_config(tmpdir, port_usd=None)
+        db = TradeDatabase(user_id="test_user", db_path=tmpdir / "test.db")
+        pipeline = Pipeline(config=config, client=client, db=db)
+
+        pipeline.process_message(_load("signal_alert_06.txt"))  # ADA #1259
+
+        assert db.get_trade(1259) is None
+        assert client.exchange.order.call_count == 0
+
+    def test_halt_when_port_exceeds_wallet(self, client, tmpdir):
+        """port_usd > wallet → trade skipped, positions untouched, no DB record."""
+        # Mocked wallet returns $10,000 — set port to $20,000
+        config = _make_config(tmpdir, port_usd=20000.0)
+        db = TradeDatabase(user_id="test_user", db_path=tmpdir / "test.db")
+        pipeline = Pipeline(config=config, client=client, db=db)
+
+        pipeline.process_message(_load("signal_alert_06.txt"))
+
+        assert db.get_trade(1259) is None
+        assert client.exchange.order.call_count == 0
+
+    def test_warn_but_continue_when_port_near_wallet(self, client, tmpdir):
+        """port_usd > wallet*0.95 → trade proceeds, but warn-notify."""
+        # Wallet is $10,000; set port to $9,800 (98%)
+        config = _make_config(tmpdir, port_usd=9800.0)
+        db = TradeDatabase(user_id="test_user", db_path=tmpdir / "test.db")
+        pipeline = Pipeline(config=config, client=client, db=db)
+
+        pipeline.process_message(_load("signal_alert_06.txt"))
+
+        # Trade WAS created — only a warning, not a halt
+        assert db.get_trade(1259) is not None
+
+
+class TestPortSizing:
+    """Position size scales with port_usd, not wallet."""
+
+    def test_sizing_uses_port_not_wallet(self, client, tmpdir):
+        """Wallet $10K, port $500 — sizing is % of $500, not $10K."""
+        config = _make_config(tmpdir, port_usd=500.0)
+        db = TradeDatabase(user_id="test_user", db_path=tmpdir / "test.db")
+        pipeline = Pipeline(config=config, client=client, db=db)
+
+        pipeline.process_message(_load("signal_alert_06.txt"))  # ADA LOW (4%)
+        trade = db.get_trade(1259)
+        assert trade is not None
+        # 4% of $500 port = $20, NOT 4% of $10,000 wallet ($400)
+        assert trade.position_size_usd == 20.0
+
+    def test_sizing_scales_with_port_size(self, client, tmpdir):
+        """Doubling the port doubles the position size (subject to caps)."""
+        client2 = _make_client()
+        config_small = _make_config(tmpdir, port_usd=500.0)
+        config_large = _make_config(tmpdir, port_usd=1000.0)
+        db_a = TradeDatabase(user_id="test_user_a", db_path=tmpdir / "a.db")
+        db_b = TradeDatabase(user_id="test_user_b", db_path=tmpdir / "b.db")
+
+        Pipeline(config=config_small, client=client, db=db_a).process_message(
+            _load("signal_alert_06.txt")
+        )
+        Pipeline(config=config_large, client=client2, db=db_b).process_message(
+            _load("signal_alert_06.txt")
+        )
+
+        small_size = db_a.get_trade(1259).position_size_usd
+        large_size = db_b.get_trade(1259).position_size_usd
+        assert large_size == small_size * 2
+        db_a.close()
+        db_b.close()
+
+
+class TestPortUpdatesOnClose:
+    """ALL_TP_HIT and STOP_HIT update port_usd per the user's port_mode."""
+
+    @pytest.fixture(autouse=True)
+    def _encryption_key(self):
+        key = Fernet.generate_key()
+        reset_fernet()
+        with patch.dict(os.environ, {"ENCRYPTION_KEY": key.decode()}):
+            yield
+        reset_fernet()
+
+    def _setup(self, tmpdir, port_mode, port_usd=1000.0):
+        """Wire UserDatabase + TradeDatabase + Pipeline pointing at the same SQLite."""
+        user_db = UserDatabase(db_path=tmpdir / "test.db")
+        user_db.create_user(
+            "test_user", "Test",
+            credentials={
+                "account_address": "0xABC", "api_wallet": "0xWAL",
+                "api_secret": "0xSEC", "network": "testnet",
+            },
+        )
+        user_db.set_port("test_user", port_usd=port_usd, port_mode=port_mode)
+
+        config = _make_config(tmpdir, port_usd=port_usd, port_mode=port_mode)
+        client = _make_client()
+        trade_db = TradeDatabase(user_id="test_user", db_path=tmpdir / "test.db")
+        pipeline = Pipeline(
+            config=config, client=client, db=trade_db, user_db=user_db,
+        )
+
+        # Open the ADA trade so subsequent lifecycle events have a record to act on
+        pipeline.process_message(_load("signal_alert_06.txt"))  # ADA #1259
+        trade = trade_db.get_trade(1259)
+        assert trade is not None, "ADA trade should be created"
+
+        return user_db, trade_db, pipeline, trade
+
+    def test_withdraw_mode_unchanged_on_profit(self, tmpdir):
+        user_db, _, pipeline, trade = self._setup(tmpdir, port_mode="withdraw")
+        all_tp_msg = (
+            "🔥ALL TAKE-PROFIT TARGETS HIT\n\n"
+            "📝PAIR: ADA/USDT #1259\n\n"
+            "💰PROFIT: +50% 📈\n"
+            "⏳PERIOD: 1 HOURS"
+        )
+        pipeline.process_message(all_tp_msg)
+
+        state = user_db.get_port_state("test_user")
+        assert state["port_usd"] == 1000.0  # unchanged
+        user_db.close()
+
+    def test_compound_mode_applies_profit(self, tmpdir):
+        user_db, _, pipeline, trade = self._setup(tmpdir, port_mode="compound")
+        # ADA position_size_usd = 4% of $1000 = $40. PROFIT +50% → +$20
+        all_tp_msg = (
+            "🔥ALL TAKE-PROFIT TARGETS HIT\n\n"
+            "📝PAIR: ADA/USDT #1259\n\n"
+            "💰PROFIT: +50% 📈\n"
+            "⏳PERIOD: 1 HOURS"
+        )
+        pipeline.process_message(all_tp_msg)
+
+        state = user_db.get_port_state("test_user")
+        assert state["port_usd"] == 1020.0  # 1000 + (40 * 0.50)
+        user_db.close()
+
+    def test_compound_mode_applies_loss(self, tmpdir):
+        user_db, _, pipeline, trade = self._setup(tmpdir, port_mode="compound")
+        stop_msg = (
+            "**STOP TARGET HIT**\n\n"
+            "PAIR: ADA/USDT #1259\n\n"
+            "LOSS: -50% 📉"
+        )
+        pipeline.process_message(stop_msg)
+
+        state = user_db.get_port_state("test_user")
+        assert state["port_usd"] == 980.0  # 1000 + (40 * -0.50)
+        user_db.close()
+
+    def test_watermark_mode_profit_raises_floor(self, tmpdir):
+        user_db, _, pipeline, trade = self._setup(tmpdir, port_mode="watermark")
+        all_tp_msg = (
+            "🔥ALL TAKE-PROFIT TARGETS HIT\n\n"
+            "📝PAIR: ADA/USDT #1259\n\n"
+            "💰PROFIT: +50% 📈\n"
+            "⏳PERIOD: 1 HOURS"
+        )
+        pipeline.process_message(all_tp_msg)
+
+        state = user_db.get_port_state("test_user")
+        assert state["port_usd"] == 1020.0
+        assert state["port_watermark"] == 1020.0  # floor raised
+        user_db.close()
+
+    def test_watermark_mode_loss_clamps_at_floor(self, tmpdir):
+        """Loss is clamped at initial port_watermark — port_usd stays at the floor."""
+        user_db, _, pipeline, trade = self._setup(tmpdir, port_mode="watermark")
+        stop_msg = (
+            "**STOP TARGET HIT**\n\n"
+            "PAIR: ADA/USDT #1259\n\n"
+            "LOSS: -50% 📉"
+        )
+        pipeline.process_message(stop_msg)
+
+        state = user_db.get_port_state("test_user")
+        assert state["port_usd"] == 1000.0  # clamped at watermark
+        assert state["port_watermark"] == 1000.0
+        user_db.close()

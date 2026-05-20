@@ -38,12 +38,17 @@ from src.parser.update_parser import (
 )
 from src.state.database import TradeDatabase
 from src.state.models import TradeRecord, TradeStatus
+from src.state.user_db import UserDatabase
 from src.strategy.position_sizer import (
     PositionSizeError,
     RiskLimitBreached,
     calculate_position_size,
     check_risk_limits,
 )
+
+# Port-vs-wallet warning threshold (D1): warn but continue if port is more
+# than this fraction of wallet, halt entirely if port > wallet outright.
+_PORT_WARN_FRACTION = 0.95
 
 logger = logging.getLogger(__name__)
 
@@ -62,11 +67,13 @@ class Pipeline:
         config: Config,
         client: HyperliquidClient,
         db: TradeDatabase,
+        user_db: UserDatabase | None = None,
         notifier: TelegramNotifier | None = None,
     ):
         self._config = config
         self._client = client
         self._db = db
+        self._user_db = user_db
         self._pm = PositionManager(client, db)
         self._asset_meta = client.get_asset_meta()
         self._notifier = notifier
@@ -107,7 +114,7 @@ class Pipeline:
     # ------------------------------------------------------------------
 
     def _handle_signal(self, raw: str) -> None:
-        """Parse signal → size → build orders → submit."""
+        """Parse signal → port guardrails → size → build orders → submit."""
         signal = parse_signal(raw)
         preset = self._config.get_active_preset()
         auto_execute = self._config.strategy.auto_execute
@@ -118,12 +125,48 @@ class Pipeline:
             logger.warning("Trade #%d already exists (status=%s), skipping", signal.trade_id, existing.status.value)
             return
 
-        # Calculate position size
-        balance = self._get_balance_usd()
+        # --- Port / wallet guardrails (D1) ---
+        port_state = self._get_port_state()
+        port_usd = port_state["port_usd"]
+
+        if port_usd is None:
+            logger.warning(
+                "Trade #%d skipped: port not configured for user %s",
+                signal.trade_id, self._db.user_id,
+            )
+            if self._notifier:
+                self._notify(self._notifier.notify_port_not_configured(
+                    signal.trade_id, signal.pair,
+                ))
+            return
+
+        wallet_usd = self._get_wallet_balance_usd()
+        if port_usd > wallet_usd:
+            logger.warning(
+                "Trade #%d halted: port $%.2f exceeds wallet $%.2f",
+                signal.trade_id, port_usd, wallet_usd,
+            )
+            if self._notifier:
+                self._notify(self._notifier.notify_port_exceeds_wallet(
+                    signal.trade_id, signal.pair, port_usd, wallet_usd,
+                ))
+            return
+
+        if port_usd > wallet_usd * _PORT_WARN_FRACTION:
+            logger.warning(
+                "Trade #%d: port $%.2f > 95%% of wallet $%.2f — proceeding with warning",
+                signal.trade_id, port_usd, wallet_usd,
+            )
+            if self._notifier:
+                self._notify(self._notifier.notify_port_warning(
+                    signal.trade_id, signal.pair, port_usd, wallet_usd,
+                ))
+
+        # --- Calculate position size from port (not wallet — D1) ---
         size_warning: str | None = None
         try:
             position_size_usd = calculate_position_size(
-                balance, signal.risk_level.value, preset,
+                port_usd, signal.risk_level.value, preset,
                 self._config.strategy, self._config.risk,
             )
         except PositionSizeError as e:
@@ -282,6 +325,9 @@ class Pipeline:
             close_reason="all_tp_hit", pnl_pct=atp.profit_pct,
         )
 
+        # Apply realized P&L to the user's port (D1 — withdraw/compound/watermark)
+        self._apply_pnl_to_port(trade.position_size_usd, atp.profit_pct)
+
         if self._notifier:
             self._notify(self._notifier.notify_all_tp_hit(
                 atp.trade_id, trade.coin, atp.profit_pct,
@@ -321,6 +367,9 @@ class Pipeline:
             sh.trade_id, TradeStatus.CLOSED,
             close_reason="stop_hit", pnl_pct=sh.loss_pct,
         )
+
+        # Apply realized P&L to the user's port (D1 — withdraw/compound/watermark)
+        self._apply_pnl_to_port(trade.position_size_usd, sh.loss_pct)
 
         if self._notifier:
             self._notify(self._notifier.notify_stop_hit(
@@ -466,7 +515,41 @@ class Pipeline:
         except RuntimeError:
             logger.debug("No event loop available for notification")
 
-    def _get_balance_usd(self) -> float:
-        """Get current USDC balance."""
+    def _get_wallet_balance_usd(self) -> float:
+        """Get current USDC wallet balance (used for the port-vs-wallet guardrail)."""
         bal = self._client.get_balance()
         return float(bal["usdc_balance"])
+
+    def _get_port_state(self) -> dict:
+        """Return the current {port_usd, port_mode, port_watermark} for the user.
+
+        Reads live from the UserDatabase when one is wired up. Falls back to
+        the snapshot config when no user_db is attached (test paths, single-user
+        ``.env`` fallback).
+        """
+        if self._user_db is not None:
+            state = self._user_db.get_port_state(self._db.user_id)
+            if state is not None:
+                return state
+        return {
+            "port_usd": self._config.port.port_usd,
+            "port_mode": self._config.port.port_mode,
+            "port_watermark": self._config.port.port_watermark,
+        }
+
+    def _apply_pnl_to_port(self, position_size_usd: float, pnl_pct: float) -> None:
+        """Apply realized P&L (percent of collateral) to the user's port.
+
+        No-op when there is no user_db wired up. Errors are caught and
+        logged — port mis-updates must never crash the pipeline.
+        """
+        if self._user_db is None:
+            return
+        pnl_usd = position_size_usd * pnl_pct / 100.0
+        try:
+            self._user_db.apply_pnl_to_port(self._db.user_id, pnl_usd)
+        except Exception:
+            logger.exception(
+                "Failed to apply port P&L for user %s (pnl_usd=%.2f)",
+                self._db.user_id, pnl_usd,
+            )

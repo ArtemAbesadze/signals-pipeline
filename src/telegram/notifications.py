@@ -266,6 +266,41 @@ class TelegramNotifier:
         )
         await self._send(text)
 
+    async def notify_port_not_configured(self, trade_id: int, pair: str) -> None:
+        """Signal arrived but the user hasn't set a port yet — trade skipped."""
+        text = (
+            f"⚙️ *Trade Skipped — #{trade_id}*\n\n"
+            f"💱 Pair: {pair}\n"
+            f"Your port is not configured yet. Set your trading port "
+            f"before signals can be acted on."
+        )
+        await self._send(text)
+
+    async def notify_port_exceeds_wallet(
+        self, trade_id: int, pair: str, port_usd: float, wallet_usd: float,
+    ) -> None:
+        """Port is larger than wallet — new trades halted, positions untouched."""
+        text = (
+            f"🛑 *Trade Halted — #{trade_id}*\n\n"
+            f"💱 Pair: {pair}\n"
+            f"Port ${port_usd:,.2f} exceeds wallet ${wallet_usd:,.2f}.\n"
+            f"Top up your account or reduce your port. Existing positions "
+            f"are not affected."
+        )
+        await self._send(text)
+
+    async def notify_port_warning(
+        self, trade_id: int, pair: str, port_usd: float, wallet_usd: float,
+    ) -> None:
+        """Port > 95% of wallet — trade still proceeds, but warn the user."""
+        text = (
+            f"⚠️ *Port Warning — Trade #{trade_id}*\n\n"
+            f"💱 Pair: {pair}\n"
+            f"Port ${port_usd:,.2f} is more than 95% of wallet ${wallet_usd:,.2f}.\n"
+            f"Trade proceeded, but you're running close to the edge."
+        )
+        await self._send(text)
+
     async def notify_pnl_alert(self, coin: str, side: str, pnl_pct: float, threshold_type: str) -> None:
         """PnL threshold alert — profit or loss."""
         emoji = "💹" if threshold_type == "profit" else "📉"

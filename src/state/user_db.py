@@ -16,6 +16,7 @@ from typing import Any
 from src.config.settings import (
     Config,
     ExchangeConfig,
+    PortConfig,
     RiskConfig,
     StrategyConfig,
     StrategyPreset,
@@ -67,10 +68,15 @@ CREATE TABLE IF NOT EXISTS user_config (
     telegram_chat_id       INTEGER,
     invite_code            TEXT,
     access_expires_at      TEXT,
+    port_usd               REAL,
+    port_mode              TEXT NOT NULL DEFAULT 'withdraw',
+    port_watermark         REAL,
     created_at             TEXT NOT NULL,
     updated_at             TEXT NOT NULL
 );
 """
+
+VALID_PORT_MODES = ("withdraw", "compound", "watermark")
 
 _TELEGRAM_ADMINS_DDL = """\
 CREATE TABLE IF NOT EXISTS telegram_admins (
@@ -339,6 +345,9 @@ class UserDatabase:
             "max_total_exposure_usd": row["max_total_exposure_usd"],
             "min_order_usd": row["min_order_usd"],
             "invite_code": row["invite_code"],
+            "port_usd": row["port_usd"],
+            "port_mode": row["port_mode"],
+            "port_watermark": row["port_watermark"],
         }
 
     def update_user_config(self, user_id: str, **kwargs: Any) -> None:
@@ -353,6 +362,7 @@ class UserDatabase:
             "active_preset", "auto_execute", "max_leverage",
             "max_open_positions", "max_daily_loss_pct",
             "max_position_size_usd", "max_total_exposure_usd", "min_order_usd",
+            "port_usd", "port_mode", "port_watermark",
         }
 
         for key, value in kwargs.items():
@@ -362,6 +372,10 @@ class UserDatabase:
             elif key in direct_fields:
                 if key == "auto_execute":
                     value = int(value)
+                if key == "port_mode" and value not in VALID_PORT_MODES:
+                    raise ValueError(
+                        f"Invalid port_mode '{value}'; expected one of {VALID_PORT_MODES}"
+                    )
                 updates.append(f"{key} = ?")
                 params.append(value)
 
@@ -378,6 +392,123 @@ class UserDatabase:
                 params,
             )
         logger.info("Updated config for user %s", user_id)
+
+    # ------------------------------------------------------------------
+    # Port management (D1 — port/wallet separation)
+    # ------------------------------------------------------------------
+
+    def set_port(
+        self,
+        user_id: str,
+        port_usd: float,
+        port_mode: str = "withdraw",
+    ) -> None:
+        """Configure a user's port — the trading capital subset their
+        position sizing scales against.
+
+        For ``watermark`` mode, the initial ``port_usd`` also becomes the
+        initial ``port_watermark`` (floor). For ``withdraw`` and ``compound``,
+        ``port_watermark`` is set to NULL (unused).
+
+        Raises:
+            ValueError: If port_mode is not one of VALID_PORT_MODES, or
+                port_usd is not positive.
+        """
+        if port_mode not in VALID_PORT_MODES:
+            raise ValueError(
+                f"Invalid port_mode '{port_mode}'; expected one of {VALID_PORT_MODES}"
+            )
+        if port_usd <= 0:
+            raise ValueError(f"port_usd must be positive, got {port_usd}")
+
+        watermark = port_usd if port_mode == "watermark" else None
+        now = _now()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE user_config SET port_usd = ?, port_mode = ?, "
+                "port_watermark = ?, updated_at = ? WHERE user_id = ?",
+                (port_usd, port_mode, watermark, now, user_id),
+            )
+        logger.info(
+            "Set port for user %s: usd=%.2f mode=%s watermark=%s",
+            user_id, port_usd, port_mode, watermark,
+        )
+
+    def get_port_state(self, user_id: str) -> dict[str, Any] | None:
+        """Return port_usd, port_mode, port_watermark for *user_id*.
+
+        Returns:
+            ``{"port_usd": float|None, "port_mode": str, "port_watermark": float|None}``
+            or None if the user doesn't exist.
+        """
+        row = self._conn.execute(
+            "SELECT port_usd, port_mode, port_watermark FROM user_config "
+            "WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "port_usd": row["port_usd"],
+            "port_mode": row["port_mode"],
+            "port_watermark": row["port_watermark"],
+        }
+
+    def apply_pnl_to_port(self, user_id: str, pnl_usd: float) -> dict[str, float | None]:
+        """Apply realized P&L to a user's port according to their mode.
+
+        - ``withdraw``: no change to port_usd.
+        - ``compound``: ``port_usd += pnl_usd`` (both signs).
+        - ``watermark``: profits raise port + floor; losses clamp at floor
+          (per D1 — "losses never below the highest floor reached").
+
+        No-op if the user has no port_usd configured or doesn't exist.
+
+        Returns:
+            The new {"port_usd", "port_watermark"} after the update (or the
+            existing values if no change was made).
+        """
+        state = self.get_port_state(user_id)
+        if not state or state["port_usd"] is None:
+            return state or {"port_usd": None, "port_watermark": None}
+
+        port_usd = state["port_usd"]
+        port_mode = state["port_mode"]
+        port_watermark = state["port_watermark"]
+
+        if port_mode == "withdraw":
+            return {"port_usd": port_usd, "port_watermark": port_watermark}
+
+        if port_mode == "compound":
+            new_port = port_usd + pnl_usd
+            self._write_port_values(user_id, new_port, port_watermark)
+            return {"port_usd": new_port, "port_watermark": port_watermark}
+
+        # watermark
+        new_port = port_usd + pnl_usd
+        new_watermark = port_watermark if port_watermark is not None else port_usd
+        if pnl_usd >= 0:
+            # Profit: raise floor if we crossed the old high.
+            if new_port > new_watermark:
+                new_watermark = new_port
+        else:
+            # Loss: clamp at the floor (D1 — "never below the highest floor reached").
+            if new_port < new_watermark:
+                new_port = new_watermark
+        self._write_port_values(user_id, new_port, new_watermark)
+        return {"port_usd": new_port, "port_watermark": new_watermark}
+
+    def _write_port_values(
+        self, user_id: str, port_usd: float, port_watermark: float | None
+    ) -> None:
+        """Persist port_usd + port_watermark for *user_id*."""
+        now = _now()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE user_config SET port_usd = ?, port_watermark = ?, "
+                "updated_at = ? WHERE user_id = ?",
+                (port_usd, port_watermark, now, user_id),
+            )
 
     def get_user_config_as_config(self, user_id: str, global_config: Config) -> Config:
         """Build a per-user Config by merging DB values into the global config.
@@ -424,6 +555,11 @@ class UserDatabase:
                 max_total_exposure_usd=user_cfg["max_total_exposure_usd"],
                 min_order_usd=user_cfg["min_order_usd"],
             ),
+            port=PortConfig(
+                port_usd=user_cfg.get("port_usd"),
+                port_mode=user_cfg.get("port_mode", "withdraw"),
+                port_watermark=user_cfg.get("port_watermark"),
+            ),
             database=global_config.database,
             logging=global_config.logging,
             health=global_config.health,
@@ -442,6 +578,9 @@ class UserDatabase:
             "telegram_chat_id": "ALTER TABLE user_config ADD COLUMN telegram_chat_id INTEGER",
             "invite_code": "ALTER TABLE user_config ADD COLUMN invite_code TEXT",
             "access_expires_at": "ALTER TABLE user_config ADD COLUMN access_expires_at TEXT",
+            "port_usd": "ALTER TABLE user_config ADD COLUMN port_usd REAL",
+            "port_mode": "ALTER TABLE user_config ADD COLUMN port_mode TEXT NOT NULL DEFAULT 'withdraw'",
+            "port_watermark": "ALTER TABLE user_config ADD COLUMN port_watermark REAL",
         }
         for col, sql in migrations.items():
             if col not in existing:

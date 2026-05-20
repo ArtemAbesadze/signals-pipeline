@@ -232,3 +232,200 @@ class TestGetUserConfigAsConfig:
         assert "my_preset" in cfg.strategy.presets
         assert cfg.strategy.presets["my_preset"].tp_split == [0.5, 0.3, 0.2]
         assert cfg.strategy.presets["my_preset"].size_pct == 3.0
+
+
+# ====================================================================
+# Port management (D1)
+# ====================================================================
+
+
+class TestPortDefaults:
+    """A freshly created user has no port configured."""
+
+    def test_new_user_has_no_port(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        state = db.get_port_state("alice")
+        assert state == {"port_usd": None, "port_mode": "withdraw", "port_watermark": None}
+
+    def test_unknown_user_returns_none(self, db):
+        assert db.get_port_state("nobody") is None
+
+    def test_port_fields_in_get_user_config(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        cfg = db.get_user_config("alice")
+        assert cfg["port_usd"] is None
+        assert cfg["port_mode"] == "withdraw"
+        assert cfg["port_watermark"] is None
+
+    def test_port_fields_in_config_dataclass(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        cfg = db.get_user_config_as_config("alice", Config())
+        assert cfg.port.port_usd is None
+        assert cfg.port.port_mode == "withdraw"
+        assert cfg.port.port_watermark is None
+
+
+class TestSetPort:
+    """set_port stores the configuration and initializes the watermark."""
+
+    def test_set_port_withdraw(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        db.set_port("alice", port_usd=1000.0, port_mode="withdraw")
+        state = db.get_port_state("alice")
+        assert state["port_usd"] == 1000.0
+        assert state["port_mode"] == "withdraw"
+        assert state["port_watermark"] is None
+
+    def test_set_port_compound(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        db.set_port("alice", port_usd=1000.0, port_mode="compound")
+        state = db.get_port_state("alice")
+        assert state["port_mode"] == "compound"
+        assert state["port_watermark"] is None
+
+    def test_set_port_watermark_initializes_floor(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        db.set_port("alice", port_usd=1000.0, port_mode="watermark")
+        state = db.get_port_state("alice")
+        assert state["port_usd"] == 1000.0
+        assert state["port_mode"] == "watermark"
+        assert state["port_watermark"] == 1000.0
+
+    def test_invalid_port_mode_rejected(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        with pytest.raises(ValueError, match="Invalid port_mode"):
+            db.set_port("alice", port_usd=1000.0, port_mode="bogus")
+
+    def test_non_positive_port_rejected(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        with pytest.raises(ValueError, match="must be positive"):
+            db.set_port("alice", port_usd=0.0)
+        with pytest.raises(ValueError, match="must be positive"):
+            db.set_port("alice", port_usd=-100.0)
+
+    def test_update_user_config_validates_port_mode(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        with pytest.raises(ValueError, match="Invalid port_mode"):
+            db.update_user_config("alice", port_mode="bogus")
+
+
+class TestApplyPnlToPort:
+    """apply_pnl_to_port implements the three modes from D1."""
+
+    def test_no_op_when_port_unconfigured(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        # No set_port call — port_usd is None
+        result = db.apply_pnl_to_port("alice", pnl_usd=50.0)
+        assert result["port_usd"] is None
+
+    def test_withdraw_mode_ignores_profit(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        db.set_port("alice", port_usd=1000.0, port_mode="withdraw")
+        result = db.apply_pnl_to_port("alice", pnl_usd=50.0)
+        assert result["port_usd"] == 1000.0
+
+    def test_withdraw_mode_ignores_loss(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        db.set_port("alice", port_usd=1000.0, port_mode="withdraw")
+        result = db.apply_pnl_to_port("alice", pnl_usd=-50.0)
+        assert result["port_usd"] == 1000.0
+
+    def test_compound_mode_applies_profit(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        db.set_port("alice", port_usd=1000.0, port_mode="compound")
+        result = db.apply_pnl_to_port("alice", pnl_usd=150.0)
+        assert result["port_usd"] == 1150.0
+
+    def test_compound_mode_applies_loss(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        db.set_port("alice", port_usd=1000.0, port_mode="compound")
+        result = db.apply_pnl_to_port("alice", pnl_usd=-200.0)
+        assert result["port_usd"] == 800.0
+
+    def test_compound_loss_can_drive_port_below_initial(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        db.set_port("alice", port_usd=1000.0, port_mode="compound")
+        db.apply_pnl_to_port("alice", pnl_usd=-300.0)
+        result = db.apply_pnl_to_port("alice", pnl_usd=-200.0)
+        assert result["port_usd"] == 500.0
+
+    def test_watermark_profit_raises_both(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        db.set_port("alice", port_usd=1000.0, port_mode="watermark")
+        result = db.apply_pnl_to_port("alice", pnl_usd=150.0)
+        assert result["port_usd"] == 1150.0
+        assert result["port_watermark"] == 1150.0
+
+    def test_watermark_loss_clamps_at_floor(self, db):
+        """Loss can't drop port below the highest historical floor."""
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        db.set_port("alice", port_usd=1000.0, port_mode="watermark")
+        # Win first to raise the floor
+        db.apply_pnl_to_port("alice", pnl_usd=200.0)  # port=1200, wm=1200
+        # Loss attempt — clamped to current watermark
+        result = db.apply_pnl_to_port("alice", pnl_usd=-300.0)
+        assert result["port_usd"] == 1200.0
+        assert result["port_watermark"] == 1200.0
+
+    def test_watermark_loss_from_initial_clamps_at_initial(self, db):
+        """Initial port_usd is also the initial floor — first loss is clamped."""
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        db.set_port("alice", port_usd=1000.0, port_mode="watermark")
+        result = db.apply_pnl_to_port("alice", pnl_usd=-100.0)
+        assert result["port_usd"] == 1000.0  # clamped
+        assert result["port_watermark"] == 1000.0
+
+    def test_watermark_sequence(self, db):
+        """Realistic sequence: win, loss (clamped), win raises floor, loss (clamped)."""
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        db.set_port("alice", port_usd=1000.0, port_mode="watermark")
+
+        r = db.apply_pnl_to_port("alice", pnl_usd=200.0)
+        assert (r["port_usd"], r["port_watermark"]) == (1200.0, 1200.0)
+
+        r = db.apply_pnl_to_port("alice", pnl_usd=-100.0)
+        assert (r["port_usd"], r["port_watermark"]) == (1200.0, 1200.0)  # clamped
+
+        r = db.apply_pnl_to_port("alice", pnl_usd=300.0)
+        assert (r["port_usd"], r["port_watermark"]) == (1500.0, 1500.0)  # new high
+
+        r = db.apply_pnl_to_port("alice", pnl_usd=-1000.0)
+        assert (r["port_usd"], r["port_watermark"]) == (1500.0, 1500.0)  # clamped
+
+
+class TestMigration:
+    """An existing DB without port columns gets them added via migration."""
+
+    def test_migration_adds_port_columns(self, tmp_path):
+        """Simulate an older DB without port columns and verify migration adds them."""
+        import sqlite3
+
+        db_path = tmp_path / "legacy.db"
+        # Create a minimal user_config table without the port columns
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE user_config (user_id TEXT PRIMARY KEY, "
+            "active_preset TEXT NOT NULL DEFAULT 'runner', "
+            "auto_execute INTEGER NOT NULL DEFAULT 0, "
+            "max_leverage INTEGER NOT NULL DEFAULT 20, "
+            "size_by_risk_json TEXT NOT NULL DEFAULT '{}', "
+            "custom_presets_json TEXT NOT NULL DEFAULT '{}', "
+            "max_open_positions INTEGER NOT NULL DEFAULT 10, "
+            "max_daily_loss_pct REAL NOT NULL DEFAULT 10.0, "
+            "max_position_size_usd REAL NOT NULL DEFAULT 500.0, "
+            "max_total_exposure_usd REAL NOT NULL DEFAULT 2000.0, "
+            "min_order_usd REAL NOT NULL DEFAULT 10.0, "
+            "created_at TEXT NOT NULL, "
+            "updated_at TEXT NOT NULL)"
+        )
+        conn.commit()
+        conn.close()
+
+        # Opening via UserDatabase should run the migration
+        db = UserDatabase(db_path=db_path)
+        cursor = db._conn.execute("PRAGMA table_info(user_config)")
+        cols = {row[1] for row in cursor.fetchall()}
+        assert "port_usd" in cols
+        assert "port_mode" in cols
+        assert "port_watermark" in cols
+        db.close()

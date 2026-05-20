@@ -1,7 +1,7 @@
 """Position size calculator and risk gate.
 
 Determines how much USD to allocate per trade based on:
-  1. Account balance
+  1. The user's configured port (a subset of their wallet — see D1)
   2. Strategy preset (size_pct)
   3. Risk level override (size_by_risk)
   4. Risk limits (max_position_size_usd, min_order_usd)
@@ -28,13 +28,16 @@ class RiskLimitBreached(Exception):
 
 
 def calculate_position_size(
-    balance_usd: float,
+    port_usd: float,
     risk_level: str,
     preset: StrategyPreset,
     strategy_config: StrategyConfig,
     risk_config: RiskConfig,
 ) -> float:
     """Calculate the USD position size for a trade.
+
+    Sizing is a percentage of the user's port (their configured trading
+    capital subset — D1), not their wallet balance.
 
     Resolution order for size_pct:
       1. size_by_risk[risk_level] if the risk level exists in the map
@@ -43,7 +46,7 @@ def calculate_position_size(
     The result is then clamped to risk limits.
 
     Args:
-        balance_usd: Current account balance in USD.
+        port_usd: User's currently allocated trading capital in USD.
         risk_level: Signal risk level ("LOW", "MEDIUM", "HIGH").
         preset: The active strategy preset.
         strategy_config: Strategy config (contains size_by_risk overrides).
@@ -58,8 +61,8 @@ def calculate_position_size(
     # Resolve size percentage
     size_pct = strategy_config.size_by_risk.get(risk_level, preset.size_pct)
 
-    # Calculate raw USD size
-    raw_size = balance_usd * (size_pct / 100.0)
+    # Calculate raw USD size from port (not wallet — see D1)
+    raw_size = port_usd * (size_pct / 100.0)
 
     # Clamp to max position size
     clamped_size = min(raw_size, risk_config.max_position_size_usd)
@@ -67,15 +70,15 @@ def calculate_position_size(
     # Check minimum
     if clamped_size < risk_config.min_order_usd:
         raise PositionSizeError(
-            f"Position size ${clamped_size:.2f} ({size_pct}% of ${balance_usd:.2f}) "
+            f"Position size ${clamped_size:.2f} ({size_pct}% of port ${port_usd:.2f}) "
             f"is below minimum ${risk_config.min_order_usd:.2f}"
         )
 
     logger.info(
-        "Position size: $%.2f (%.1f%% of $%.2f, risk=%s, clamped to max=$%.2f)",
+        "Position size: $%.2f (%.1f%% of port $%.2f, risk=%s, clamped to max=$%.2f)",
         clamped_size,
         size_pct,
-        balance_usd,
+        port_usd,
         risk_level,
         risk_config.max_position_size_usd,
     )

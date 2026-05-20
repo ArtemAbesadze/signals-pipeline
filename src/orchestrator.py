@@ -113,7 +113,13 @@ class Orchestrator:
             )
 
         notifier = self._notifier_factory(user_id) if self._notifier_factory else None
-        pipeline = Pipeline(config=user_config, client=client, db=db, notifier=notifier)
+        pipeline = Pipeline(
+            config=user_config,
+            client=client,
+            db=db,
+            user_db=self._user_db,
+            notifier=notifier,
+        )
 
         self._pipelines[user_id] = UserPipelineContext(
             user_id=user_id,
@@ -257,7 +263,13 @@ class Orchestrator:
             )
 
         notifier = self._notifier_factory(user_id) if self._notifier_factory else None
-        pipeline = Pipeline(config=self._global_config, client=client, db=db, notifier=notifier)
+        pipeline = Pipeline(
+            config=self._global_config,
+            client=client,
+            db=db,
+            user_db=self._user_db,
+            notifier=notifier,
+        )
 
         self._pipelines[user_id] = UserPipelineContext(
             user_id=user_id,

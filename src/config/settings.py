@@ -125,6 +125,29 @@ class RiskConfig:
 
 
 @dataclass
+class PortConfig:
+    """User-allocated trading capital — the 'port'.
+
+    Position sizing is a % of ``port_usd``, not wallet balance. Three modes
+    determine how port_usd evolves with realized P&L (see D1 in the rework
+    brief):
+
+    - ``withdraw``: port_usd never changes from its configured value.
+        Profits/losses accumulate in the wallet but don't affect sizing.
+    - ``compound``: port_usd += pnl_usd on every close (both signs).
+    - ``watermark``: profits push port_usd up and the new value becomes the
+        new floor (port_watermark). Losses can bring port_usd down but never
+        below the highest floor reached. ``port_watermark`` is the lower bound.
+
+    When ``port_usd is None`` the bot refuses to open new trades.
+    """
+
+    port_usd: float | None = None
+    port_mode: str = "withdraw"
+    port_watermark: float | None = None
+
+
+@dataclass
 class DatabaseConfig:
     """State persistence settings."""
 
@@ -173,6 +196,7 @@ class Config:
     input: InputConfig = field(default_factory=InputConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
+    port: PortConfig = field(default_factory=PortConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     health: HealthConfig = field(default_factory=HealthConfig)

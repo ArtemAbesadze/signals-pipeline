@@ -7,6 +7,7 @@ from src.config.settings import (
     ExchangeConfig,
     InputConfig,
     LoggingConfig,
+    PortConfig,
     RiskConfig,
     StrategyConfig,
     StrategyPreset,
