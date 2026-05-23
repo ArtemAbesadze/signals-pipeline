@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    launchd agent for potion-perps-bot (Phase 3.2 of the rework).
+
+    User-level agent: installed under ~/Library/LaunchAgents/, runs as the
+    logged-in user, reads .env and data/.encryption_key with user perms.
+    Restart policy: respawn on crash, respect clean exits (so launchctl
+    bootout / SIGTERM stop the bot without launchd fighting back).
+
+    Tokens substituted by deploy/launchd/install.sh:
+        {{PROJECT_DIR}} — absolute path to the repo root
+        {{PYTHON}}      — absolute path to python3 (resolved at install time)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.potion-perps-bot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{PROJECT_DIR}}/deploy/launchd/run.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>{{PROJECT_DIR}}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONBIN</key>
+        <string>{{PYTHON}}</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>{{PROJECT_DIR}}/logs/launchd.out</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{PROJECT_DIR}}/logs/launchd.err</string>
+</dict>
+</plist>
