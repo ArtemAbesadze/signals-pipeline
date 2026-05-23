@@ -61,6 +61,16 @@ risk:
 database:
   path: data/trades.db             # SQLite database path
 
+# --- Daily SQLite backups (D9) ---
+# Uses the SQLite online backup API — concurrent writers are not blocked.
+# Backups land on the same disk as the DB. For real DR, add an offsite
+# rsync/scp step (deferred to Phase 5).
+backups:
+  enabled: true
+  directory: backups               # destination dir (relative or absolute)
+  retention_days: 30               # files older than this are pruned
+  daily_at_utc: "06:00"            # HH:MM, UTC. No DST surprises.
+
 # --- Logging ---
 logging:
   level: INFO                      # DEBUG | INFO | WARNING | ERROR

@@ -18,6 +18,8 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
+from src.state.backup import BackupConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -211,6 +213,7 @@ class Config:
     health: HealthConfig = field(default_factory=HealthConfig)
     discord: DiscordConfig = field(default_factory=DiscordConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    backups: BackupConfig = field(default_factory=BackupConfig)
 
     def get_active_preset(self) -> StrategyPreset:
         """Resolve the currently active strategy preset.
@@ -332,6 +335,7 @@ def load_config(
             bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
             admin_ids=_parse_admin_ids(os.getenv("TELEGRAM_ADMIN_IDS", "")),
         ),
+        backups=_build_dataclass(BackupConfig, yaml_data.get("backups", {})),
     )
 
     _validate(config)
@@ -404,6 +408,18 @@ def _validate(config: Config) -> None:
             errors.append(f"Preset '{name}' tp_split must have 3 values summing to 1.0, got {tp}")
         if preset.move_sl_to_breakeven_after not in ("tp1", "tp2", "never"):
             errors.append(f"Preset '{name}' move_sl_to_breakeven_after invalid: '{preset.move_sl_to_breakeven_after}'")
+
+    # Backups
+    if config.backups.enabled:
+        if config.backups.retention_days < 1:
+            errors.append(
+                f"backups.retention_days must be >= 1, got {config.backups.retention_days}"
+            )
+        try:
+            from src.state.backup import _parse_hhmm
+            _parse_hhmm(config.backups.daily_at_utc)
+        except ValueError as e:
+            errors.append(f"backups.daily_at_utc invalid: {e}")
 
     # Risk
     if config.risk.max_open_positions < 1:

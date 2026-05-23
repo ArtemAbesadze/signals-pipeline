@@ -186,6 +186,9 @@ data/.encryption_key
 # Logs
 logs/
 
+# Daily SQLite backups (D9)
+backups/
+
 # Shadow-mode captures — ignore contents, keep dir
 signals/captures/*
 !signals/captures/.gitkeep

@@ -15,6 +15,7 @@ from src.health import HealthServer
 from src.input.cli_adapter import CLIAdapter
 from src.input.simulation_adapter import SimulationAdapter
 from src.orchestrator import Orchestrator
+from src.state.backup import run_daily_backup_loop
 from src.state.user_db import UserDatabase
 from src.utils.logger import setup_logging
 
@@ -160,6 +161,15 @@ async def run(config: Config) -> None:
         adapter_name, len(orchestrator.pipelines),
     )
 
+    # --- Start daily backup loop (D9) ---
+    backup_task = asyncio.create_task(
+        run_daily_backup_loop(
+            db_path=config.database.path,
+            config=config.backups,
+            stop_event=shutdown_event,
+        )
+    )
+
     # --- Run ---
     adapter_task = asyncio.create_task(adapter.start())
 
@@ -182,6 +192,11 @@ async def run(config: Config) -> None:
             await adapter_task
         except asyncio.CancelledError:
             pass
+        # Backup loop exits on shutdown_event; await its completion.
+        try:
+            await asyncio.wait_for(backup_task, timeout=5.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            backup_task.cancel()
         if pnl_monitor:
             await pnl_monitor.stop()
         if telegram_bot:
