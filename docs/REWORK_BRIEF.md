@@ -195,8 +195,8 @@ Status legend: ✅ shipped on `rework/scope-v1` · ⏳ next · ◻ pending
 
 | # | Status | Task |
 |---|---|---|
-| 3.1 | ⏳ | **Backups (D9)** — daily SQLite backup via `sqlite3 .backup` to a `backups/` directory, date-stamped, prune >30 days. Schedule via asyncio background task in `main.py`. |
-| 3.2 | ◻ | **Local deployment setup** — `launchd` plist for macOS so the bot runs 24/7. SIGTERM/SIGINT already wired. |
+| 3.1 | ✅ | `a3770a8` | **Backups (D9)** — daily SQLite backup via `sqlite3.Connection.backup()` (stdlib, server-portable) to `backups/`, mtime-based 30-day prune, 06:00 UTC default, no catch-up on miss, asyncio task wired into `main.py` with shared `shutdown_event`. |
+| 3.2 | ⏳ | | **Local deployment setup** — `launchd` plist for macOS so the bot runs 24/7. SIGTERM/SIGINT already wired. Must address laptop-sleep (CP signals during sleep are lost — `caffeinate -i` in `ExecStart` or "prevent sleep when plugged in"). |
 | 3.3 | ◻ | **Log rotation polish** — confirm the existing rotating-file handler (10 MB × 5) caps correctly under sustained load. Tune if needed. |
 | 3.4 | ◻ | **README rewrite** — the README is frozen during the rework. This is the slot for the full rewrite. |
 | 3.5 | ◻ | **Mainnet promotion gate** — conservative defaults, big-trade confirmation dialog in Telegram, etc. |
@@ -223,7 +223,7 @@ Status legend: ✅ shipped on `rework/scope-v1` · ⏳ next · ◻ pending
 
 ## Tests
 
-**541/541 passing** as of `d772548` (the baseline at `170abbd` was 414).
+**560/560 passing** as of `a3770a8` (the baseline at `170abbd` was 414).
 
 ---
 

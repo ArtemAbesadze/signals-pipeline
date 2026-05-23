@@ -100,8 +100,8 @@ Key files when something breaks:
 
 ## Current phase
 
-**Phase 3 — Pre-launch.** Phases 1 (foundation) and 2 (Telegram redesign)
-are shipped. Branch `rework/scope-v1` is at `d772548` on GitHub.
+**Phase 3 — Pre-launch.** Phases 1, 2 and Phase 3.1 are shipped. Branch
+`rework/scope-v1` is at `a3770a8` on GitHub.
 
 Done:
 
@@ -115,14 +115,34 @@ Done:
 | 1.6 | `7bbc3a4` | Defensive parsing (D6) — typed errors, never crashes |
 | 2.1 | `c366c55` | SaaS layer ripped (D4) |
 | 2.2 | `80320b3` + `d772548` | Condensed dashboard, Port screen, Audit Trail |
+| 3.1 | `a3770a8` | Daily SQLite backup task (D9) — stdlib only, server-portable, 06:00 UTC default, mtime-based prune, no catch-up on miss |
 
 Up next (Phase 3 — pre-launch polish):
 
-1. **3.1 Backups (D9)** — daily SQLite backup to `backups/` with `sqlite3 .backup`, date-stamped, prune >30d. Schedule via asyncio background task in `main.py`.
-2. **3.2 Local deployment** — `launchd` plist for macOS so the bot runs 24/7 on Artem's laptop. SIGTERM is already wired.
-3. **3.3 Log rotation polish** — confirm rotating logs cap correctly under sustained load; tune if needed.
-4. **3.4 README rewrite** — the README is frozen during rework; this is where it gets the full rewrite for the new scope.
-5. **3.5 Mainnet promotion gate** — conservative defaults + big-trade confirmation dialog in Telegram before flipping to mainnet.
+1. **3.2 Local deployment** — `launchd` plist for macOS so the bot runs 24/7 on Artem's laptop. SIGTERM/SIGINT already wired. **Must address laptop sleep** (see "Picking up" below — it's the biggest operational gap and was flagged during 3.1).
+2. **3.3 Log rotation polish** — confirm rotating logs cap correctly under sustained load; tune if needed.
+3. **3.4 README rewrite** — the README is frozen during rework; this is where it gets the full rewrite for the new scope. Surface the same-disk-backup DR caveat and the `0.0.0.0` admin-port caveat (both noted below) here.
+4. **3.5 Mainnet promotion gate** — conservative defaults + big-trade confirmation dialog in Telegram before flipping to mainnet.
+
+### Picking up where we left off (session paused mid-Phase-3)
+
+Sanity checks before doing anything else:
+
+```bash
+git branch --show-current        # should print: rework/scope-v1
+git log --oneline -3             # HEAD should be a3770a8 (Phase 3.1)
+git status                       # should be clean
+python3 -m pytest tests/ 2>&1 | tail -2   # 560 passed
+```
+
+If all four are green, you're at the right checkpoint. **Phase 3.2 (`launchd` plist) is next** — propose a plan before writing code. Key notes that won't be obvious from `git log`:
+
+- **Laptop sleep is the silent killer of this deployment.** macOS sleep stops the bot, and CP signals that fire during sleep are **gone** — `on_message` only fires while the process is up, and there's no queue. `launchd` respawns on crash, not on sleep-wake. Mitigation for 3.2: wrap `ExecStart` in `caffeinate -i`, or instruct the user to set System Settings → "Prevent sleep when plugged in." This is the strongest argument for the eventual VPS move (Phase 5.2) and should be called out clearly in 3.2's plist + README copy.
+- **The backup loop's "skip on miss" policy was a deliberate choice** (over a catch-up-on-wake policy) made during 3.1. Don't re-litigate it without a reason. If catch-up is added later, it needs a marker file for "last successful backup."
+- **Two structural assumptions worth knowing for the eventual server move (Phase 5.2):**
+  - `:8080` health + `:8081` admin bind to `0.0.0.0` (`src/health.py:65`, `src/api/admin.py:83`). Behind NAT on a laptop = harmless. On a public VPS = the `X-API-Key` is the entire perimeter — bind to `127.0.0.1` + reverse proxy, or add IP allowlist + TLS, before exposing.
+  - `backups/` lands on the same disk as the DB (`src/state/backup.py`). For real DR, add an offsite `rsync`/`scp` step. Documented inline in `config/config.example.yaml`; deferred to Phase 5.
+- **D8 ("designed local, portable") has held up.** The only laptop-bound item in Phase 3 is 3.2's `launchd` plist itself — by design. The structural code is deployment-agnostic.
 
 Phase 4 = go live (wire CP's real Discord, Artem onboards on testnet, then friends, then mainnet per-user).
 Phase 5 = parking lot (weekly performance report, VPS, CI/CD, backtest tooling).
@@ -131,7 +151,7 @@ Full phase breakdown: `docs/REWORK_BRIEF.md`.
 
 ## Tests
 
-**541/541 passing** as of `d772548` (up from 414 at the start of the rework — +127 tests across 11 commits).
+**560/560 passing** as of `a3770a8` (up from 414 at the start of the rework — +146 tests across 12 commits).
 
 ---
 
