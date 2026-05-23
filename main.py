@@ -131,9 +131,17 @@ async def run(config: Config) -> None:
         )
         await pnl_monitor.start()
 
+        # Mainnet confirmation sweeper (Phase 3.5) — auto-declines pending
+        # big-trade confirmations after the configured timeout. Lives next
+        # to PnLMonitor because both fan out across pipelines on a timer.
+        from src.telegram.confirmation_sweeper import ConfirmationSweeper
+        confirmation_sweeper = ConfirmationSweeper(orchestrator=orchestrator)
+        await confirmation_sweeper.start()
+
         logger.info("Telegram bot started with trade notifications")
     else:
         pnl_monitor = None
+        confirmation_sweeper = None
         logger.info("Telegram bot disabled (no TELEGRAM_BOT_TOKEN in .env)")
 
     # --- Select input adapter ---
@@ -199,6 +207,8 @@ async def run(config: Config) -> None:
             backup_task.cancel()
         if pnl_monitor:
             await pnl_monitor.stop()
+        if confirmation_sweeper:
+            await confirmation_sweeper.stop()
         if telegram_bot:
             await telegram_bot.stop()
         await admin_api.stop()

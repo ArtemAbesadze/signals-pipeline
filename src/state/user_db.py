@@ -389,6 +389,37 @@ class UserDatabase:
         logger.info("Updated config for user %s", user_id)
 
     # ------------------------------------------------------------------
+    # Mainnet defaults (Phase 3.5)
+    # ------------------------------------------------------------------
+
+    # Position cap applied to users on mainnet — stricter than the testnet
+    # default ($500) to slow real-money mistakes. Above this value, the
+    # mainnet promotion gate also forces manual confirmation.
+    MAINNET_DEFAULT_POSITION_CAP_USD = 100.0
+
+    def apply_mainnet_defaults(self, user_id: str) -> None:
+        """Tighten a user's per-user config to mainnet-appropriate defaults.
+
+        Currently lowers max_position_size_usd from the testnet default of
+        $500 to $100. ``auto_execute`` is left untouched — the default is
+        already OFF, and if the user has explicitly turned it ON we don't
+        silently flip it back (would surprise them). The big-trade
+        confirmation gate handles the auto-execute-on case.
+
+        Called by:
+        - Registration mainnet path (registration.py).
+        - /promote_to_mainnet conversation (promotion.py).
+        """
+        self.update_user_config(
+            user_id,
+            max_position_size_usd=self.MAINNET_DEFAULT_POSITION_CAP_USD,
+        )
+        logger.info(
+            "Applied mainnet defaults for user %s (max_position_size_usd=%.2f)",
+            user_id, self.MAINNET_DEFAULT_POSITION_CAP_USD,
+        )
+
+    # ------------------------------------------------------------------
     # Port management (D1 — port/wallet separation)
     # ------------------------------------------------------------------
 

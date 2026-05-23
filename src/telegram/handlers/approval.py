@@ -15,7 +15,7 @@ from src.exchange.order_builder import build_orders
 from src.exchange.position_manager import OrderSubmissionError, PositionManager, _round_price
 from src.orchestrator import Orchestrator
 from src.parser.signal_parser import ParsedSignal, RiskLevel, Side
-from src.state.models import TradeRecord, TradeStatus
+from src.state.models import EventType, TradeRecord, TradeStatus
 from src.state.user_db import UserDatabase
 from src.telegram.handlers.menu import _build_calls_text, is_in_calls_view, set_calls_view_msg
 from src.telegram.handlers.trades import _format_trade_detail
@@ -82,9 +82,24 @@ async def signal_approval_callback(update: Update, context: ContextTypes.DEFAULT
         )
         return
 
+    # Phase 3.5: distinguish between an ordinary manual-mode reject and a
+    # big-mainnet-trade confirmation decline — the audit trail should make
+    # the reason traceable. Same buttons, different event types.
+    is_confirmation = trade.requires_confirmation
+
     if action == "reject":
-        ctx.db.update_trade_status(trade_id, TradeStatus.CANCELED, close_reason="rejected")
-        status_text = f"❌ *Rejected* — Trade #{trade_id} canceled."
+        close_reason = "confirmation_declined" if is_confirmation else "rejected"
+        ctx.db.update_trade_status(trade_id, TradeStatus.CANCELED, close_reason=close_reason)
+        if is_confirmation:
+            ctx.db.record_event(
+                trade_id=trade_id,
+                event_type=EventType.CONFIRMATION_DECLINED,
+                raw_text=None,
+                action_taken=f"user declined via Telegram (size=${trade.position_size_usd:.2f})",
+            )
+            status_text = f"❌ *Declined* — Trade #{trade_id} not submitted."
+        else:
+            status_text = f"❌ *Rejected* — Trade #{trade_id} canceled."
     else:
         # action == "approve"
         # Block $0 trades — balance too small for minimum trade size
@@ -108,7 +123,16 @@ async def signal_approval_callback(update: Update, context: ContextTypes.DEFAULT
 
                 pm = PositionManager(ctx.client, ctx.db)
                 pm.submit_trade(trade_set)
-                status_text = f"✅ *Approved* — Trade #{trade_id} submitted to exchange."
+                if is_confirmation:
+                    ctx.db.record_event(
+                        trade_id=trade_id,
+                        event_type=EventType.CONFIRMATION_APPROVED,
+                        raw_text=None,
+                        action_taken=f"user approved via Telegram (size=${trade.position_size_usd:.2f})",
+                    )
+                    status_text = f"✅ *Confirmed* — Trade #{trade_id} submitted to mainnet."
+                else:
+                    status_text = f"✅ *Approved* — Trade #{trade_id} submitted to exchange."
             except OrderSubmissionError as e:
                 logger.error("Trade #%d submission failed: %s", trade_id, e)
                 ctx.db.update_trade_status(trade_id, TradeStatus.CANCELED, close_reason="submission_failed")

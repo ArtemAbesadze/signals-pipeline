@@ -56,6 +56,14 @@ risk:
   max_position_size_usd: 500       # absolute max USD per single position
   max_total_exposure_usd: 2000     # max total USD across all open positions combined
   min_order_usd: 10.0              # Hyperliquid minimum order value
+  # Mainnet promotion gate (Phase 3.5). When a mainnet user has
+  # auto_execute=ON and a trade's sized position exceeds this threshold,
+  # the trade is held PENDING with Approve/Reject buttons in Telegram
+  # instead of being submitted automatically. Testnet trades are never
+  # gated. The timeout below is how long the bot waits for a response
+  # before auto-declining the trade.
+  mainnet_confirm_above_usd: 100.0
+  mainnet_confirm_timeout_min: 5
 
 # --- State persistence ---
 database:

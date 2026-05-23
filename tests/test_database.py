@@ -210,12 +210,16 @@ class TestRecordEvent:
 
 
 class TestEventTypeEnum:
-    def test_ten_event_types(self):
-        """D3 spec + Phase 1.2 additions = 10."""
+    def test_event_types(self):
+        """D3 spec + Phase 1.2 + Phase 3.5 mainnet confirmation events."""
         expected = {
+            # D3 + Phase 1.2
             "signal_alert", "order_pending", "trade_live",
             "tp_hit", "breakeven", "stop_hit", "sl_move",
             "trade_closed", "cancel", "error",
+            # Phase 3.5 — mainnet promotion gate
+            "confirmation_requested", "confirmation_approved",
+            "confirmation_declined", "confirmation_timeout",
         }
         assert {e.value for e in EventType} == expected
 

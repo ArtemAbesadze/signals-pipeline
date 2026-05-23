@@ -49,6 +49,11 @@ class EventType(Enum):
     TRADE_CLOSED = "trade_closed"       # ALL_TP_HIT or explicit TRADE_CLOSED
     CANCEL = "cancel"                   # Trade canceled
     ERROR = "error"                     # Parse failure, exchange rejection, etc.
+    # Mainnet promotion gate (Phase 3.5)
+    CONFIRMATION_REQUESTED = "confirmation_requested"  # Big mainnet trade held for manual approval
+    CONFIRMATION_APPROVED = "confirmation_approved"    # User approved via Telegram
+    CONFIRMATION_DECLINED = "confirmation_declined"    # User rejected via Telegram
+    CONFIRMATION_TIMEOUT = "confirmation_timeout"      # No response within mainnet_confirm_timeout_min
 
 
 @dataclass
@@ -82,6 +87,10 @@ class TradeRecord:
     # D3 audit fields — verbatim signal text + decision snapshot captured at open
     raw_signal_text: str | None = None
     decision_snapshot: dict | None = None
+    # Phase 3.5 — set when a mainnet trade above the confirm threshold is held
+    # PENDING for the user to approve/reject via Telegram. Auto-declines on
+    # the configured timeout via the pipeline's confirmation sweep.
+    requires_confirmation: bool = False
 
 
 @dataclass

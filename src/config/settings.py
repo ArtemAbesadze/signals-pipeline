@@ -133,6 +133,16 @@ class RiskConfig:
     max_position_size_usd: float = 500.0
     max_total_exposure_usd: float = 2000.0
     min_order_usd: float = 10.0
+    # Mainnet promotion gate (Phase 3.5): when a mainnet user has
+    # auto_execute=ON and the trade's position_size_usd exceeds this
+    # threshold, the trade is held PENDING and pushed to Telegram with
+    # Approve/Reject buttons instead of being submitted automatically.
+    # Testnet trades are never gated; small mainnet trades fire normally.
+    mainnet_confirm_above_usd: float = 100.0
+    # Minutes before an unanswered confirmation auto-declines. Tight on
+    # purpose — perp price action makes signals go stale fast. See
+    # CLAUDE.md memory for the rationale on the 5-minute default.
+    mainnet_confirm_timeout_min: int = 5
 
 
 @dataclass

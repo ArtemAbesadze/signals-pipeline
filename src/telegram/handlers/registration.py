@@ -29,7 +29,11 @@ from src.telegram.formatters import mask_address
 logger = logging.getLogger(__name__)
 
 # Conversation states
-ACCOUNT_ADDRESS, API_WALLET, API_SECRET, NETWORK = range(4)
+ACCOUNT_ADDRESS, API_WALLET, API_SECRET, NETWORK, MAINNET_CONFIRM = range(5)
+
+# Phase 3.5 — mainnet selection requires typing this exact word (case-insensitive)
+# as a small friction step. Inline-button-only would be too easy to fat-finger.
+MAINNET_CONFIRM_TOKEN = "MAINNET"
 
 # Regex for 0x-prefixed hex addresses/keys
 _HEX_PATTERN = re.compile(r"^0x[0-9a-fA-F]+$")
@@ -159,7 +163,12 @@ async def receive_api_secret(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def receive_network(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle network selection, validate credentials, complete registration."""
+    """Handle network selection.
+
+    Testnet completes registration immediately. Mainnet routes to a typed-
+    confirmation step (Phase 3.5) before continuing — inline-button-only is
+    too easy to fat-finger for a real-money switch.
+    """
     query = update.callback_query
     await query.answer()
 
@@ -169,24 +178,68 @@ async def receive_network(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return NETWORK
 
     if network == "mainnet":
+        context.user_data["network"] = "mainnet"
         await query.edit_message_text(
-            "⚠️ Only *Testnet* trading is available at the moment.\n\n"
-            "Please select 🧪 Testnet to continue.",
+            "⚠️ *Mainnet registration — real-money trading.*\n\n"
+            "Mainnet accounts get stricter defaults applied automatically:\n"
+            f"• Position cap: *${UserDatabase.MAINNET_DEFAULT_POSITION_CAP_USD:.0f}* "
+            "(testnet default: $500)\n"
+            "• Trades above this size require explicit confirmation per signal "
+            "(see Phase 3.5 mainnet promotion gate)\n"
+            "• Auto-execute stays OFF until you turn it on\n\n"
+            f"Type *{MAINNET_CONFIRM_TOKEN}* to confirm, or /cancel to abort.",
             parse_mode="Markdown",
         )
-        return NETWORK
+        return MAINNET_CONFIRM
 
-    context.user_data["network"] = network
-    await query.edit_message_text("🔄 Validating credentials...")
+    # Testnet — complete immediately
+    context.user_data["network"] = "testnet"
+    return await _complete_registration(update, context, network="testnet")
 
-    user_db = _get_user_db(context)
+
+async def receive_mainnet_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle typed MAINNET confirmation token (Phase 3.5)."""
+    text = (update.message.text or "").strip()
+    if text.upper() != MAINNET_CONFIRM_TOKEN:
+        await update.effective_chat.send_message(
+            f"❌ Confirmation token did not match.\n\n"
+            f"Type *{MAINNET_CONFIRM_TOKEN}* exactly to confirm mainnet, "
+            "or /cancel to abort.",
+            parse_mode="Markdown",
+        )
+        return MAINNET_CONFIRM
+
+    return await _complete_registration(update, context, network="mainnet")
+
+
+async def _complete_registration(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    network: str,
+) -> int:
+    """Shared completion: validate credentials, persist, activate.
+
+    For ``network='mainnet'`` also applies the mainnet defaults (lower
+    position cap) — see UserDatabase.apply_mainnet_defaults.
+    """
     chat_id = update.effective_chat.id
 
+    # Where to send the "validating..." progress message — callback_query for
+    # the testnet button path, plain send_message for the mainnet typed path.
+    query = update.callback_query
+    if query is not None:
+        progress = lambda text, **kw: query.edit_message_text(text, **kw)
+    else:
+        progress = lambda text, **kw: update.effective_chat.send_message(text, **kw)
+
+    await progress("🔄 Validating credentials...")
+
+    user_db = _get_user_db(context)
     account_address = context.user_data["account_address"]
     api_wallet = context.user_data["api_wallet"]
     api_secret = context.user_data["api_secret"]
 
-    # Validate credentials against Hyperliquid
     try:
         client = HyperliquidClient(
             account_address=account_address,
@@ -196,7 +249,7 @@ async def receive_network(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         client.get_account_state()
     except Exception as e:
         logger.warning("Credential validation failed for chat %d: %s", chat_id, e)
-        await query.edit_message_text(
+        await progress(
             f"❌ *Credential validation failed:*\n{e}\n\n"
             "Please check your credentials and try /register again.",
             parse_mode="Markdown",
@@ -204,7 +257,6 @@ async def receive_network(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         _clear_user_data(context)
         return ConversationHandler.END
 
-    # Create user in DB
     user_id = str(chat_id)
     try:
         user_db.create_user(
@@ -219,16 +271,21 @@ async def receive_network(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
     except Exception as e:
         logger.error("Failed to create user %s: %s", user_id, e)
-        await query.edit_message_text(
+        await progress(
             "❌ Registration failed. You may already be registered. Contact admin."
         )
         _clear_user_data(context)
         return ConversationHandler.END
 
-    # Store telegram chat ID
+    # Mainnet: tighten position cap so the first real-money trade can't be huge.
+    if network == "mainnet":
+        try:
+            user_db.apply_mainnet_defaults(user_id)
+        except Exception:
+            logger.exception("Failed to apply mainnet defaults for user %s", user_id)
+
     user_db.set_telegram_chat_id(user_id, chat_id)
 
-    # Activate pipeline via orchestrator
     orchestrator = _get_orchestrator(context)
     if orchestrator:
         try:
@@ -236,16 +293,21 @@ async def receive_network(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except Exception as e:
             logger.error("Failed to activate pipeline for user %s: %s", user_id, e)
 
-    # Build congratulations message with Continue button
+    cap = (
+        UserDatabase.MAINNET_DEFAULT_POSITION_CAP_USD
+        if network == "mainnet" else 500.0
+    )
+    network_label = "🌐 *Mainnet*" if network == "mainnet" else "🧪 *Testnet*"
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🚀 Continue", callback_data="menu:main")],
     ])
-    await query.edit_message_text(
+    await progress(
         "🎉 *Registration Complete!*\n\n"
-        "Welcome — your account is set up and ready to go.\n\n"
+        f"Network: {network_label}\n"
         f"🎯 Strategy: even_split (33/33/34)\n"
         f"⚡ Auto-execute: OFF\n"
-        f"📊 Max leverage: 20x\n\n"
+        f"📊 Max leverage: 20x\n"
+        f"💰 Position cap: ${cap:.0f}\n\n"
         "Press Continue to open the main menu!",
         parse_mode="Markdown",
         reply_markup=keyboard,
@@ -278,6 +340,9 @@ def build_registration_handler() -> ConversationHandler:
             API_WALLET: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_wallet)],
             API_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_secret)],
             NETWORK: [CallbackQueryHandler(receive_network, pattern=r"^network:")],
+            MAINNET_CONFIRM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_mainnet_confirm),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel_command)],
     )

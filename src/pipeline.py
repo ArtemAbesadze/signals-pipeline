@@ -155,7 +155,11 @@ class Pipeline:
     # ------------------------------------------------------------------
 
     def _handle_signal(self, raw: str) -> None:
-        """Parse signal → port guardrails → size → build orders → submit."""
+        """Parse signal → port guardrails → size → build orders → submit.
+
+        Phase 3.5: large mainnet trades go through the manual-approval path
+        even when auto_execute is ON. See ``requires_confirmation`` below.
+        """
         signal = parse_signal(raw)
         preset = self._config.get_active_preset()
         auto_execute = self._config.strategy.auto_execute
@@ -312,6 +316,19 @@ class Pipeline:
             leverage_applied=leverage,
         )
 
+        # Mainnet promotion gate (Phase 3.5): when auto_execute is ON on
+        # mainnet AND the sized position exceeds the configured threshold,
+        # the trade is NOT submitted automatically — it's held PENDING and
+        # the user gets an Approve/Reject prompt in Telegram. Testnet trades
+        # and small mainnet trades are unaffected. effective_auto_execute is
+        # what the downstream submit/notify branches actually use.
+        requires_confirmation = (
+            auto_execute
+            and self._config.exchange.network == "mainnet"
+            and position_size_usd > self._config.risk.mainnet_confirm_above_usd
+        )
+        effective_auto_execute = auto_execute and not requires_confirmation
+
         # Record trade in DB (verbatim signal text + decision snapshot)
         trade_record = TradeRecord(
             trade_id=signal.trade_id,
@@ -333,6 +350,7 @@ class Pipeline:
             position_size_coin=position_size_coin,
             raw_signal_text=raw,
             decision_snapshot=decision_snapshot,
+            requires_confirmation=requires_confirmation,
         )
         self._db.create_trade(trade_record)
 
@@ -345,19 +363,39 @@ class Pipeline:
                 f"opened #{signal.trade_id} {signal.pair} {signal.side.value} "
                 f"size=${position_size_usd:.2f} lev={leverage}x"
                 + (f" auto_execute=off" if not auto_execute else "")
+                + (f" requires_confirmation" if requires_confirmation else "")
             ),
         )
+
+        # Mainnet promotion-gate audit event — distinct from SIGNAL_ALERT so
+        # post-mortems can find "trades that required confirmation" with one
+        # query against trade_events.event_type.
+        if requires_confirmation:
+            self._record_event(
+                trade_id=signal.trade_id,
+                event_type=EventType.CONFIRMATION_REQUESTED,
+                raw_text=raw,
+                action_taken=(
+                    f"mainnet $%.2f > threshold $%.2f — held for manual approval "
+                    f"(timeout {self._config.risk.mainnet_confirm_timeout_min}m)"
+                ) % (position_size_usd, self._config.risk.mainnet_confirm_above_usd),
+            )
 
         # Notify new signal
         if self._notifier:
             self._notify(self._notifier.notify_new_signal(
                 signal, trade_set or signal, position_size_usd,
-                auto_execute=auto_execute,
+                auto_execute=effective_auto_execute,
                 warning=size_warning,
+                requires_confirmation=requires_confirmation,
+                confirm_timeout_min=(
+                    self._config.risk.mainnet_confirm_timeout_min
+                    if requires_confirmation else None
+                ),
             ))
 
         # Submit to exchange
-        if auto_execute:
+        if effective_auto_execute:
             try:
                 self._pm.submit_trade(trade_set)
                 logger.info(
@@ -384,9 +422,10 @@ class Pipeline:
                         signal.trade_id, trade_set.coin, str(e),
                     ))
         else:
+            reason = "confirmation_required" if requires_confirmation else "auto_execute=false"
             logger.info(
-                "Trade #%d ready (auto_execute=false): %s %s @ %s (lev=%dx, size=$%.2f)",
-                signal.trade_id, coin, signal.side.value,
+                "Trade #%d ready (%s): %s %s @ %s (lev=%dx, size=$%.2f)",
+                signal.trade_id, reason, coin, signal.side.value,
                 signal.entry, leverage, position_size_usd,
             )
 

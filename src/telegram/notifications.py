@@ -84,16 +84,26 @@ class TelegramNotifier:
         position_size_usd: float,
         auto_execute: bool = True,
         warning: str | None = None,
+        requires_confirmation: bool = False,
+        confirm_timeout_min: int | None = None,
     ) -> None:
         """New signal received — notify user with trade details.
 
         Gating logic:
-        - auto_execute=True  → always send (informational, no buttons)
-        - auto_execute=False → only send if user is in Calls View
-          (otherwise the signal stays PENDING in the DB)
+        - auto_execute=True, requires_confirmation=False → always send
+          (informational, no buttons)
+        - auto_execute=False, requires_confirmation=False → only send if user
+          is in Calls View (otherwise the signal stays PENDING in the DB)
+        - requires_confirmation=True → ALWAYS send with Approve/Reject
+          buttons. Bypasses the calls-view gate because a big mainnet trade
+          needs immediate user attention regardless of where they are in the
+          UI. ``auto_execute`` is passed False by the caller in this case so
+          the existing approval plumbing (signal_approval_callback) reuses
+          unchanged.
         """
-        # Gate: when manual approval is needed, only notify if user is in calls view
-        if not auto_execute:
+        # Calls-view gate applies only to ordinary manual-mode signals.
+        # Confirmation prompts always push.
+        if not auto_execute and not requires_confirmation:
             in_calls = (
                 self._calls_view_checker()
                 if self._calls_view_checker is not None
@@ -112,22 +122,37 @@ class TelegramNotifier:
                 return
 
         side_emoji = "📈 LONG" if signal.side.value.upper() == "LONG" else "📉 SHORT"
-        text = (
-            f"🔔 *New Signal — Trade #{signal.trade_id}*\n\n"
-            f"💱 Pair: {signal.pair}\n"
-            f"Direction: {side_emoji}\n"
-            f"🎯 Entry: {signal.entry}\n"
-            f"🛡 Stop Loss: {signal.stop_loss}\n"
-            f"💰 Size: {format_usd(position_size_usd)}\n"
-            f"📊 Leverage: {trade_set.leverage}x"
-        )
+
+        if requires_confirmation:
+            timeout_str = f"{confirm_timeout_min}m" if confirm_timeout_min else "the timeout"
+            text = (
+                f"🚨 *MAINNET CONFIRMATION REQUIRED — Trade #{signal.trade_id}*\n\n"
+                f"💱 Pair: {signal.pair}\n"
+                f"Direction: {side_emoji}\n"
+                f"🎯 Entry: {signal.entry}\n"
+                f"🛡 Stop Loss: {signal.stop_loss}\n"
+                f"💰 Size: {format_usd(position_size_usd)} *(above auto threshold)*\n"
+                f"📊 Leverage: {trade_set.leverage}x\n\n"
+                f"_⏱ Auto-declines in {timeout_str} if no response._"
+            )
+        else:
+            text = (
+                f"🔔 *New Signal — Trade #{signal.trade_id}*\n\n"
+                f"💱 Pair: {signal.pair}\n"
+                f"Direction: {side_emoji}\n"
+                f"🎯 Entry: {signal.entry}\n"
+                f"🛡 Stop Loss: {signal.stop_loss}\n"
+                f"💰 Size: {format_usd(position_size_usd)}\n"
+                f"📊 Leverage: {trade_set.leverage}x"
+            )
 
         if warning:
             text += f"\n\n⚠️ {warning}"
 
         reply_markup = None
         if not auto_execute:
-            text += "\n\n_⚡ Auto-execute is OFF. Approve or reject this trade:_"
+            if not requires_confirmation:
+                text += "\n\n_⚡ Auto-execute is OFF. Approve or reject this trade:_"
             reply_markup = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("✅ Approve", callback_data=f"signal:approve:{signal.trade_id}"),
@@ -137,14 +162,32 @@ class TelegramNotifier:
 
         await self._send(text, reply_markup=reply_markup)
 
-        # Also refresh the calls view so it shows the new signal inline
-        if not auto_execute and self._calls_view_refresher is not None:
+        # Refresh the calls view for ordinary manual-mode signals only —
+        # a confirmation prompt is a one-off push, not a calls-view update.
+        if not auto_execute and not requires_confirmation and self._calls_view_refresher is not None:
             try:
                 await self._calls_view_refresher()
             except Exception:
                 logger.exception(
                     "Failed to refresh calls view for user %s", self._user_id,
                 )
+
+    async def notify_confirmation_timeout(
+        self,
+        trade_id: int,
+        timeout_min: int,
+    ) -> None:
+        """A pending mainnet-confirmation trade auto-declined.
+
+        Sent by ConfirmationSweeper when ``mainnet_confirm_timeout_min``
+        elapses with no Approve/Reject response.
+        """
+        text = (
+            f"⏱ *Confirmation Timed Out — Trade #{trade_id}*\n\n"
+            f"No response within {timeout_min} minutes. Trade was auto-declined.\n\n"
+            "_The signal is preserved in the audit trail — see /history._"
+        )
+        await self._send(text)
 
     async def notify_trade_opened(
         self, trade_id: int, coin: str, side: str, entry_price: float, size_usd: float,

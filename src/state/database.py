@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS trades (
     notes           TEXT,
     raw_signal_text TEXT,
     decision_snapshot TEXT,    -- JSON; see pipeline._build_decision_snapshot
+    requires_confirmation INTEGER NOT NULL DEFAULT 0,  -- Phase 3.5 mainnet gate
     PRIMARY KEY (user_id, trade_id)
 );
 """
@@ -143,6 +144,7 @@ class TradeDatabase:
                 "ALTER TABLE trades ADD COLUMN notes TEXT",
                 "ALTER TABLE trades ADD COLUMN raw_signal_text TEXT",
                 "ALTER TABLE trades ADD COLUMN decision_snapshot TEXT",
+                "ALTER TABLE trades ADD COLUMN requires_confirmation INTEGER NOT NULL DEFAULT 0",
             ):
                 try:
                     self._conn.execute(sql)
@@ -170,8 +172,8 @@ class TradeDatabase:
                     size_hint, entry_price, stop_loss, tp1, tp2, tp3,
                     leverage, signal_leverage, position_size_usd, position_size_coin,
                     status, created_at, updated_at,
-                    raw_signal_text, decision_snapshot
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    raw_signal_text, decision_snapshot, requires_confirmation
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     trade.trade_id, self._user_id, trade.pair, trade.coin,
                     trade.side, trade.risk_level, trade.trade_type, trade.size_hint,
@@ -180,6 +182,7 @@ class TradeDatabase:
                     trade.position_size_usd, trade.position_size_coin,
                     trade.status.value, now, now,
                     trade.raw_signal_text, snapshot_json,
+                    int(trade.requires_confirmation),
                 ),
             )
         trade.user_id = self._user_id
@@ -264,6 +267,22 @@ class TradeDatabase:
             (self._user_id, today),
         ).fetchone()
         return float(row["total"])
+
+    def get_expired_confirmations(self, cutoff_iso: str) -> list[int]:
+        """Return trade_ids of pending trades requiring confirmation whose
+        created_at is older than ``cutoff_iso``. Phase 3.5 — the pipeline's
+        sweep loop uses this to surface trades that need auto-decline.
+        """
+        rows = self._conn.execute(
+            """SELECT trade_id FROM trades
+               WHERE user_id = ?
+                 AND status = 'pending'
+                 AND requires_confirmation = 1
+                 AND created_at < ?
+               ORDER BY created_at""",
+            (self._user_id, cutoff_iso),
+        ).fetchall()
+        return [row["trade_id"] for row in rows]
 
     def get_total_open_exposure_usd(self) -> float:
         """Return the total USD exposure across all open/pending trades."""
@@ -385,6 +404,7 @@ class TradeDatabase:
             notes=row["notes"],
             raw_signal_text=row["raw_signal_text"],
             decision_snapshot=snapshot,
+            requires_confirmation=bool(row["requires_confirmation"]) if "requires_confirmation" in row.keys() else False,
         )
 
     @staticmethod
