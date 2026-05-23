@@ -75,6 +75,17 @@ def setup_logging(logging_config) -> None:
     root.addHandler(file_handler)
     root.setLevel(log_level)
 
+    # Per-library level overrides — quiet chatty third-party loggers without
+    # raising the root level. Unknown level names fall back to the root.
+    for name, level_name in (logging_config.loggers or {}).items():
+        level = getattr(logging, level_name.upper(), None)
+        if not isinstance(level, int):
+            logging.getLogger(__name__).warning(
+                "Ignoring invalid logger level: %s=%s", name, level_name,
+            )
+            continue
+        logging.getLogger(name).setLevel(level)
+
     # Configure structlog to use stdlib
     structlog.configure(
         processors=[

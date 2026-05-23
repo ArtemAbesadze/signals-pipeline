@@ -74,7 +74,21 @@ backups:
 # --- Logging ---
 logging:
   level: INFO                      # DEBUG | INFO | WARNING | ERROR
-  file: logs/bot.log               # log file path
+  file: logs/bot.log               # log file path (rotates: 10 MB × 5 backups)
+  # Per-library overrides applied on top of the root level. Keeps chatty
+  # third-party libraries from drowning the bot's own trade events. These
+  # are ALSO the in-code defaults (LoggingConfig._default_logger_levels) —
+  # omit this block to accept them as-is. If you uncomment it, your keys
+  # replace the defaults wholesale; merging is not performed.
+  # loggers:
+  #   httpx: WARNING
+  #   httpcore: WARNING
+  #   urllib3: WARNING
+  #   discord: INFO
+  #   discord.gateway: WARNING     # quiet the heartbeat noise
+  #   telegram: INFO
+  #   aiohttp.access: WARNING      # admin / health endpoint request log
+  #   asyncio: WARNING
 
 # --- Discord (Phase 4) ---
 # Bot token is in .env (DISCORD_BOT_TOKEN)

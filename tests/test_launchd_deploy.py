@@ -172,6 +172,36 @@ def test_run_sh_cd_to_project_root():
     assert 'cd "$(dirname "$0")/../.."' in RUN_SH.read_text()
 
 
+def test_run_sh_rotates_launchd_log_files():
+    """run.sh must rotate launchd.{out,err} on startup (Phase 3.3). Without
+    this, launchd's stdout/stderr files grow unboundedly because launchd
+    doesn't rotate them itself.
+
+    Must use `cp` + truncate, not `mv` — launchd opens the files before
+    exec'ing run.sh, so a rename would orphan the open fd onto the renamed
+    inode and the new process's output would land in .1, not the fresh
+    file. See deploy/launchd/README.md."""
+    text = RUN_SH.read_text()
+    assert "logs/launchd.out" in text
+    assert "logs/launchd.err" in text
+
+    # Strip comment lines before checking command usage — comments mention
+    # `mv` to explain why we DON'T use it.
+    code_lines = [
+        ln for ln in text.splitlines()
+        if ln.strip() and not ln.lstrip().startswith("#")
+    ]
+    code = "\n".join(code_lines)
+
+    assert "cp " in code, (
+        "run.sh must `cp` (not `mv`) launchd logs — open fd would orphan"
+    )
+    assert "mv " not in code, (
+        "run.sh must not `mv` launchd log files — would orphan launchd's "
+        "fd onto the renamed inode. See deploy/launchd/README.md."
+    )
+
+
 # ------------------------------------------------------------------
 # install.sh / uninstall.sh content sanity
 # ------------------------------------------------------------------

@@ -46,6 +46,26 @@ tail -f logs/launchd.err
 launchctl kickstart -k gui/$(id -u)/local.potion-perps-bot
 ```
 
+## Log files & rotation
+
+The bot writes two streams of logs:
+
+| File | Written by | Rotation |
+|---|---|---|
+| `logs/bot.log` | The bot (structlog, JSON) | Size-based: 10 MB per file, 5 backups (`logs/bot.log.1` … `.5`) |
+| `logs/launchd.out`, `logs/launchd.err` | launchd directly (stdout/stderr) | 2-deep ring; rotated on every bot startup by `run.sh` |
+
+The launchd files exist for **pre-structlog crash diagnostics only** — import
+errors, config-load errors, anything that crashes before logging is wired up.
+On every restart, `run.sh` copies the current `launchd.{out,err}` to `.1`
+(overwriting the previous `.1`) and truncates the original in place. Because
+`ThrottleInterval=30` caps respawn frequency, per-cycle growth is bounded.
+
+We `cp` and truncate-in-place rather than `mv` because launchd has already
+opened the file by the time `run.sh` runs — a rename would leave the open
+file descriptor pointing at the renamed inode and the new process's output
+would land in `.1`, not the fresh file.
+
 ## What this gives you
 
 - **Auto-respawn on crash.** `KeepAlive.SuccessfulExit = false` means launchd

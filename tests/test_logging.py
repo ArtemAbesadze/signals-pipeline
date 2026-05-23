@@ -2,7 +2,7 @@
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -14,6 +14,7 @@ class FakeLoggingConfig:
     level: str = "INFO"
     file: str = ""
     format: str = "json"
+    loggers: dict[str, str] = field(default_factory=dict)
 
 
 class TestStructuredLogging:

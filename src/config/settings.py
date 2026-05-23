@@ -165,6 +165,27 @@ class DatabaseConfig:
     path: str = "data/trades.db"
 
 
+def _default_logger_levels() -> dict[str, str]:
+    """Per-library log level overrides applied on top of the root level.
+
+    These quiet libraries that are too chatty at INFO/DEBUG and would
+    otherwise drown the bot's own trade events. Override or extend by
+    setting ``logging.loggers`` in config.yaml — keys replace these
+    defaults wholesale (we don't merge), so users who customise should
+    copy the full block from config.example.yaml.
+    """
+    return {
+        "httpx": "WARNING",
+        "httpcore": "WARNING",
+        "urllib3": "WARNING",
+        "discord": "INFO",
+        "discord.gateway": "WARNING",
+        "telegram": "INFO",
+        "aiohttp.access": "WARNING",
+        "asyncio": "WARNING",
+    }
+
+
 @dataclass
 class LoggingConfig:
     """Logging settings."""
@@ -172,6 +193,7 @@ class LoggingConfig:
     level: str = "INFO"
     file: str = "logs/bot.log"
     format: str = "json"  # "json" (server) or "console" (dev)
+    loggers: dict[str, str] = field(default_factory=_default_logger_levels)
 
 
 @dataclass
