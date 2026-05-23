@@ -26,17 +26,18 @@ Every concrete decision in this codebase ties back to that goal: per-trade decis
 potion-perps-bot/
 ├── main.py                              # Entry — wires everything, runs the loop
 ├── CLAUDE.md                            # ← this file
-├── README.md                            # Stale during rework (rewritten in Phase 3.4)
+├── README.md                            # Rewritten in Phase 3.4 for the private-tool scope
 ├── config/
 │   ├── config.example.yaml
 │   └── config.yaml                      # active, gitignored
+├── deploy/launchd/                      # launchd plist + install/uninstall scripts (Phase 3.2)
 ├── docs/
 │   ├── REWORK_BRIEF.md                  # full rework spec (D1–D9 + phases)
 │   ├── telegram-bot-plan.md             # legacy SaaS design — being reversed
 │   └── telegram-implementation-steps.md # legacy SaaS plan — being reversed
 ├── src/
 │   ├── orchestrator.py                  # Multi-user fan-out
-│   ├── pipeline.py                      # Per-user signal processor
+│   ├── pipeline.py                      # Per-user signal processor; mainnet gate lives here
 │   ├── crypto.py                        # Fernet credential encryption
 │   ├── health.py                        # :8080 health endpoint
 │   ├── api/admin.py                     # :8081 admin REST API
@@ -46,9 +47,9 @@ potion-perps-bot/
 │   ├── parser/                          # classifier + signal/update parsers
 │   ├── state/                           # SQLite — trades, orders, users, encrypted creds
 │   ├── strategy/position_sizer.py       # sizing + pre-trade risk gate
-│   ├── telegram/                        # bot + handlers + notifications + monitors
+│   ├── telegram/                        # bot + handlers + notifications + monitors + confirmation_sweeper
 │   └── utils/                           # structlog setup, symbol mapper
-├── tests/                               # ~370 tests across 24 files
+├── tests/                               # ~594 tests across 31 files
 └── signals/
     ├── samples/                         # Real Discord samples for parser tests
     └── test/                            # E2E test fixtures
@@ -76,9 +77,9 @@ Key files when something breaks:
 5. **Per-user isolation.** Composite PK `(user_id, trade_id)` on `trades` and `orders`. All queries filter by `user_id`. One user's bug cannot touch another user's data.
 6. **DM-only for Telegram.** `dm_only_filter` middleware rejects group messages. Credential-collection messages are deleted on receipt.
 7. **No Discord edit handling.** CP sends all updates as new messages, never edits existing ones. `on_message` only — do not add `on_message_edit`.
-8. **Tests close behind code.** ~370 tests today across `tests/`. New features land with tests, not after.
+8. **Tests close behind code.** ~594 tests today across `tests/`. New features land with tests, not after.
 9. **Branch first during rework.** Active branch: `rework/scope-v1`. No commits to `main` until the rework is feature-complete.
-10. **README is frozen during rework.** Gets a full rewrite in Phase 3.4. Don't update it incrementally.
+10. **README is current.** Phase 3.4 rewrote it for the private-tool scope. Keep it accurate as the codebase evolves — no longer frozen.
 
 ---
 
@@ -100,8 +101,9 @@ Key files when something breaks:
 
 ## Current phase
 
-**Phase 3 — Pre-launch.** Phases 1, 2 and Phase 3.1 are shipped. Branch
-`rework/scope-v1` is at `a3770a8` on GitHub.
+**Phase 3 is shipped end-to-end.** Branch `rework/scope-v1` is at `0ee481f`
+on GitHub. The bot is feature-complete for laptop deployment and ready for
+the operational go-live (Phase 4).
 
 Done:
 
@@ -116,42 +118,54 @@ Done:
 | 2.1 | `c366c55` | SaaS layer ripped (D4) |
 | 2.2 | `80320b3` + `d772548` | Condensed dashboard, Port screen, Audit Trail |
 | 3.1 | `a3770a8` | Daily SQLite backup task (D9) — stdlib only, server-portable, 06:00 UTC default, mtime-based prune, no catch-up on miss |
+| 3.2 | `59ccc25` | launchd agent for 24/7 local deployment — `caffeinate -i` blocks idle sleep, `KeepAlive.SuccessfulExit=false` respects clean exits, 2-deep launchd-log ring via `cp + truncate` |
+| 3.3 | `b897d8d` | Log rotation polish — launchd files bounded, per-library level overrides for httpx/discord.gateway/etc., sustained-load test for `RotatingFileHandler` |
+| 3.4 | `747eaeb` | README rewrite — operator's manual for the private-tool scope; full inventory of what's on disk, DB inspection recipes, cleanup commands, VPS migration playbook |
+| 3.5 | `0ee481f` | Mainnet promotion gate — typed `MAINNET` confirmation in `/register` + `/promote_to_mainnet`, big-trade Telegram confirmation dialog ($100 / 5-min defaults), ConfirmationSweeper background task |
 
-Up next (Phase 3 — pre-launch polish):
-
-1. **3.2 Local deployment** — `launchd` plist for macOS so the bot runs 24/7 on Artem's laptop. SIGTERM/SIGINT already wired. **Must address laptop sleep** (see "Picking up" below — it's the biggest operational gap and was flagged during 3.1).
-2. **3.3 Log rotation polish** — confirm rotating logs cap correctly under sustained load; tune if needed.
-3. **3.4 README rewrite** — the README is frozen during rework; this is where it gets the full rewrite for the new scope. Surface the same-disk-backup DR caveat and the `0.0.0.0` admin-port caveat (both noted below) here.
-4. **3.5 Mainnet promotion gate** — conservative defaults + big-trade confirmation dialog in Telegram before flipping to mainnet.
-
-### Picking up where we left off (session paused mid-Phase-3)
+### Picking up where we left off (Phase 4 — go live)
 
 Sanity checks before doing anything else:
 
 ```bash
-git branch --show-current        # should print: rework/scope-v1
-git log --oneline -3             # HEAD should be a3770a8 (Phase 3.1)
-git status                       # should be clean
-python3 -m pytest tests/ 2>&1 | tail -2   # 560 passed
+git branch --show-current        # rework/scope-v1
+git log --oneline -3             # HEAD should be 0ee481f (Phase 3.5)
+git status                       # clean
+python3 -m pytest tests/ 2>&1 | tail -2   # 594 passed
 ```
 
-If all four are green, you're at the right checkpoint. **Phase 3.2 (`launchd` plist) is next** — propose a plan before writing code. Key notes that won't be obvious from `git log`:
+If all four are green, you're at the right checkpoint. **Phase 4 = operational, not architectural.** The shape of work is different from Phase 3 — less code, more careful flipping of real-world switches and watching what happens.
 
-- **Laptop sleep is the silent killer of this deployment.** macOS sleep stops the bot, and CP signals that fire during sleep are **gone** — `on_message` only fires while the process is up, and there's no queue. `launchd` respawns on crash, not on sleep-wake. Mitigation for 3.2: wrap `ExecStart` in `caffeinate -i`, or instruct the user to set System Settings → "Prevent sleep when plugged in." This is the strongest argument for the eventual VPS move (Phase 5.2) and should be called out clearly in 3.2's plist + README copy.
-- **The backup loop's "skip on miss" policy was a deliberate choice** (over a catch-up-on-wake policy) made during 3.1. Don't re-litigate it without a reason. If catch-up is added later, it needs a marker file for "last successful backup."
-- **Two structural assumptions worth knowing for the eventual server move (Phase 5.2):**
-  - `:8080` health + `:8081` admin bind to `0.0.0.0` (`src/health.py:65`, `src/api/admin.py:83`). Behind NAT on a laptop = harmless. On a public VPS = the `X-API-Key` is the entire perimeter — bind to `127.0.0.1` + reverse proxy, or add IP allowlist + TLS, before exposing.
-  - `backups/` lands on the same disk as the DB (`src/state/backup.py`). For real DR, add an offsite `rsync`/`scp` step. Documented inline in `config/config.example.yaml`; deferred to Phase 5.
-- **D8 ("designed local, portable") has held up.** The only laptop-bound item in Phase 3 is 3.2's `launchd` plist itself — by design. The structural code is deployment-agnostic.
+#### Phase 4 subphases (suggested ordering, not locked)
 
-Phase 4 = go live (wire CP's real Discord, Artem onboards on testnet, then friends, then mainnet per-user).
-Phase 5 = parking lot (weekly performance report, VPS, CI/CD, backtest tooling).
+1. **4.1 Wire live Discord.** Flip `input.adapter: simulation` → `discord` in `config/config.yaml`, set `discord.channel_id` to CP's channel, ensure `DISCORD_BOT_TOKEN` in `.env`. Verify CP messages arrive in `logs/bot.log` before doing anything else. Consider running `input.shadow_mode: true` first to confirm raw capture without trading.
+2. **4.2 Artem self-onboards on testnet.** `/register` from your own Telegram. Pick testnet. Soak for at least one full CP signal day — multiple opens, at least one TP hit, at least one SL hit. Audit per the README's "Inspecting a single trade end-to-end" section.
+3. **4.3 Friends onboard on testnet.** Same flow, after 4.2 is clean.
+4. **4.4 Mainnet promotion per user.** Use `/promote_to_mainnet` (preserves trade history) rather than re-register. The gate from Phase 3.5 catches big first trades automatically.
 
-Full phase breakdown: `docs/REWORK_BRIEF.md`.
+#### Key things that won't be obvious from `git log`
+
+- **The bot's deployment is `launchd`, not `python3 main.py`.** Status: `launchctl print gui/$(id -u)/local.potion-perps-bot`. Logs: `tail -f logs/bot.log`. Don't suggest foreground commands unless explicitly testing.
+- **Laptop-sleep gap is still real after 3.2.** `caffeinate -i` blocks idle sleep, but lid-closed-on-battery (clamshell power-management override) still sleeps the machine. Signals fired during sleep are *lost* — no backfill, no edit-event listener. Mitigation: stay plugged in + lid open, or move to a VPS (Phase 5.2). This was *the* operational argument for VPS migration since 3.2.
+- **Mainnet gate defaults: $100 USD threshold, 5-minute timeout.** Both in `config.example.yaml` under `risk.mainnet_confirm_above_usd` / `mainnet_confirm_timeout_min`. The 5-minute timeout is deliberate — perp signals go stale fast, see `feedback_mainnet_confirm_timeout` memory.
+- **`auto_execute=OFF` is still the safest default for first testnet days,** even though the gate exists. The gate catches *big mainnet auto-execute* trades; it doesn't second-guess routine ones. For the first signal day, let trades land in PENDING and approve each one manually via Telegram. Turn on auto_execute only after you trust the parse + size + risk-gate behaviour for the user's account.
+- **Confirmation prompts bypass the calls-view gate** (they always push). When friends onboard, make sure their Telegram notifications are on for the bot or they'll miss approval prompts on big trades.
+- **`/promote_to_mainnet` re-validates credentials against mainnet before flipping anything.** If the API key is testnet-only, validation fails and the user stays on testnet. No DB rollback drama. (`src/telegram/handlers/promotion.py`.)
+- **The ConfirmationSweeper runs every 30 seconds** (`src/telegram/confirmation_sweeper.py`). Pending confirmations older than `mainnet_confirm_timeout_min` minutes get auto-declined with a `confirmation_timeout` close reason + `CONFIRMATION_TIMEOUT` event row. State survives bot restarts because the marker is in the DB (`trades.requires_confirmation`), not in an asyncio task.
+- **Backup-loop "skip on miss" was a deliberate 3.1 choice** (over a catch-up-on-wake policy). Don't re-litigate without a reason. If catch-up is added later, it needs a marker file for "last successful backup."
+- **`cp + truncate` not `mv` in `deploy/launchd/run.sh`.** launchd opens the stdout/stderr files before exec'ing the wrapper — renaming would orphan the open fd onto the renamed inode and the new process's output would land in `.1`, not the fresh file. There's a dedicated lint test (`test_launchd_deploy.py::test_run_sh_rotates_launchd_log_files`) so future "tidy-ups" can't quietly break this.
+
+#### Structural assumptions still on the parking lot for Phase 5 / VPS
+
+- `:8080` health + `:8081` admin bind to `0.0.0.0` (`src/health.py:65`, `src/api/admin.py:83`). Harmless on a laptop behind NAT; on a public VPS the `X-API-Key` is the entire perimeter — bind `127.0.0.1` + reverse proxy or add IP allowlist + TLS first.
+- `backups/` lands on the same disk as the DB (`src/state/backup.py`). For real DR, add an offsite `rsync`/`scp` step. Documented in `config/config.example.yaml` and the README's VPS migration section.
+- The `launchd` plist is the only macOS-specific artefact. Replacement systemd unit sketch lives in `README.md` § "Moving to a remote server."
+
+Phase 5 = parking lot (weekly performance report, VPS, CI/CD, backtest tooling). Full breakdown: `docs/REWORK_BRIEF.md`.
 
 ## Tests
 
-**560/560 passing** as of `a3770a8` (up from 414 at the start of the rework — +146 tests across 12 commits).
+**594/594 passing** as of `0ee481f` (up from 414 at the start of the rework — +180 tests across 16 commits).
 
 ---
 
@@ -159,14 +173,20 @@ Full phase breakdown: `docs/REWORK_BRIEF.md`.
 
 | Need | Command |
 |------|---------|
-| Run bot | `python3 main.py` (Ctrl+C to stop) |
+| Install launchd agent | `deploy/launchd/install.sh` |
+| Bot status | `launchctl print gui/$(id -u)/local.potion-perps-bot \| head -20` |
+| Restart bot | `launchctl kickstart -k gui/$(id -u)/local.potion-perps-bot` |
+| Stop bot | `launchctl bootout gui/$(id -u)/local.potion-perps-bot` |
+| Foreground run (testing only) | `python3 main.py` (Ctrl+C to stop) |
 | Tests | `python3 -m pytest tests/ -v` |
 | New branch | `git checkout -b <name>` from `rework/scope-v1` |
 | Env vars | `.env` (gitignored); template in `.env.example` |
 | Active config | `config/config.yaml` (gitignored); template in `config/config.example.yaml` |
-| Logs | `logs/bot.log` (rotating, 10 MB × 5) |
+| App logs | `logs/bot.log` (structlog JSON, rotating 10 MB × 5) |
+| Pre-structlog crashes | `logs/launchd.err` (2-deep ring, rotated on each restart) |
 | DB | `data/trades.db` (SQLite, WAL mode) |
 | Encryption key | `data/.encryption_key` (auto-generated if missing) |
+| Backups | `backups/trades-YYYYMMDD-HHMMSS.db` (30-day retention, daily 06:00 UTC) |
 
 ---
 
@@ -177,4 +197,4 @@ Full phase breakdown: `docs/REWORK_BRIEF.md`.
 - **Be opinionated; push back.** If something violates auditability, introduces surprise behavior, or risks crashes, say so directly.
 - **Ask when a tradeoff is genuinely ambiguous.** One question now beats untangling a wrong assumption later.
 - **Flag issues seen during reading.** Even out-of-scope contradictions to the design goals get surfaced — document, don't fix unilaterally.
-- **Don't update the README during rework** (Phase 3.4 owns that).
+- **Phase 4 is operational, not architectural.** Less code, more careful flipping of real-world switches. When proposing work, prefer "smallest change that lets us observe and learn" over "comprehensive instrumentation up front."
