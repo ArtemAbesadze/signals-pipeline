@@ -1,480 +1,500 @@
 # Potion Perps Bot
 
-Multi-user automated trading service that ingests Potion Perps signals from Discord, parses them in real time, and executes perpetual futures trades on Hyperliquid on behalf of each registered user — with per-user strategy presets, encrypted credentials, risk guardrails, and a Telegram bot for onboarding, configuration, approval, and monitoring.
+A private automation tool for **three known users** (Artem + two friends). It
+listens to CryptoPrinter's trade calls on Discord, parses them, executes the
+corresponding perp trades on each user's Hyperliquid account, and exposes
+monitoring & control through a per-user Telegram bot.
 
-**Status:** Phase 4 complete — multi-user pipeline, Discord signal ingestion, encrypted per-user credentials, full Telegram bot UI, admin REST API, Docker deploy, ~370 tests. **Testnet only** (mainnet registration is intentionally blocked).
+This is **not** a marketable SaaS. There is no signup, no broadcast, no paid
+tier. The invite-code / subscription layer that existed in earlier versions
+was removed during the rework. See [`docs/REWORK_BRIEF.md`](docs/REWORK_BRIEF.md)
+for the full reframe.
 
----
-
-## Architecture
-
-```
-Discord (Potion Perps)
-        │
-        ▼
-┌─────────────────┐
-│ Discord Adapter │  (one process, listens to one channel + source bot)
-└────────┬────────┘
-         │  asyncio.Queue
-         ▼
-┌──────────────────────────────────────────────────────────────┐
-│                       Orchestrator                           │
-│  one signal in → fan out to every active user pipeline       │
-│                                                              │
-│  ├── User Pipeline (alice) ─→ Hyperliquid (alice's creds)    │
-│  ├── User Pipeline (bob)   ─→ Hyperliquid (bob's creds)      │
-│  └── User Pipeline (…)     ─→ Hyperliquid (…)                │
-└────────────────────┬─────────────────────────────────────────┘
-                     │
-        ┌────────────┼────────────┬────────────┬────────────┐
-        ▼            ▼            ▼            ▼            ▼
-   SQLite        Telegram     Admin REST    Health      PnL +
-   (state +     Bot (users)   API (8081)    (8080)      Expiry
-   encrypted                                             monitors
-   creds)
-```
-
-A single Discord adapter feeds one signal into the orchestrator, which dispatches it to each active user's pipeline. Each pipeline runs the same classify → parse → size → build → submit flow, but uses that user's credentials, config, and database scope. The Telegram bot is the user-facing layer for registration, approval, and monitoring; the admin REST API is the operator-facing layer for user management and emergency control.
+The design spine: **CryptoPrinter's calls should be the only possible source
+of fallacy.** Every decision the bot makes is recorded so that "did CP get it
+wrong, or did the bot do something CP didn't say?" can be answered from the
+database in under 30 seconds.
 
 ---
 
-## Components
-
-| Component | Responsibility |
-|-----------|---------------|
-| `main.py` | Loads config, wires the orchestrator, starts adapter / admin API / health / Telegram bot / background monitors, runs the main message loop, handles graceful shutdown. |
-| `src/orchestrator.py` | Multi-user fan-out. Manages per-user `Pipeline` contexts, activate/deactivate, pause/resume, kill switch. |
-| `src/pipeline.py` | Per-user signal processor. Classifies messages, dispatches to handlers, runs the size + risk + order-build + submit flow. |
-| `src/input/` | Signal source adapters: `discord` (live), `simulation` (file replay), `cli` (paste), `file` (stub). |
-| `src/parser/` | `classifier.py` (10 message types) and parsers that turn raw text into typed dataclasses (`ParsedSignal`, `TpHit`, `StopHit`, etc.). |
-| `src/strategy/position_sizer.py` | USD allocation based on balance, risk level, preset; pre-trade risk gate. |
-| `src/exchange/` | `HyperliquidClient` (SDK wrapper + retries + rate-limit handling), `order_builder` (signal → orders), `position_manager` (submit / cancel / close / move SL / startup sync). |
-| `src/state/` | SQLite. `TradeDatabase` (trades + orders, user-scoped) and `UserDatabase` (users, encrypted creds, per-user config, invite codes, Telegram admins). |
-| `src/crypto.py` | Fernet symmetric encryption for credentials at rest. |
-| `src/telegram/` | Telegram bot: registration flow, menu UI, approval callbacks, trade notifications, admin commands, PnL + expiry background monitors. |
-| `src/api/admin.py` | aiohttp REST API for user management and kill switch (port 8081, `X-API-Key` auth). |
-| `src/health.py` | Zero-dependency async HTTP health endpoint (port 8080). |
-| `src/utils/` | Structured logging (structlog → JSON), symbol mapping (Potion pair → Hyperliquid coin). |
-
----
-
-## Quick Start
+## Quick start
 
 ```bash
-# Install
+git clone git@github.com:ArtemAbesadze/signals-pipeline.git potion-perps-bot
+cd potion-perps-bot
 pip install -r requirements.txt
-cp .env.example .env
+
+cp .env.example .env                      # add HL creds + bot tokens
 cp config/config.example.yaml config/config.yaml
 
-# Edit .env with your secrets (see below)
-# Edit config/config.yaml with your input adapter and risk preferences
-
-# Run
-python main.py
-
-# Run tests
-python -m pytest tests/ -v
+python3 -m pytest tests/                  # 578 should pass
+python3 main.py                           # foreground; Ctrl-C to stop
 ```
 
-### `.env` secrets
+To run 24/7 on macOS via launchd:
 
 ```bash
-# Hyperliquid (used by single-user fallback mode and admin operations)
-HL_ACCOUNT_ADDRESS=0x_your_master_account_address
-HL_API_WALLET=0x_your_api_wallet_address
-HL_API_SECRET=0x_your_api_wallet_private_key
-
-# Discord signal source
-DISCORD_BOT_TOKEN=your_discord_bot_token
-
-# Telegram bot (omit to run without Telegram)
-TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
-TELEGRAM_ADMIN_IDS=12345678,87654321
-
-# Admin REST API
-ADMIN_API_KEY=long_random_string
-ADMIN_API_PORT=8081
-
-# Credential encryption (auto-generated to data/.encryption_key if unset)
-ENCRYPTION_KEY=base64_fernet_key
+deploy/launchd/install.sh                 # see deploy/launchd/README.md
 ```
 
-Hyperliquid uses a **master account + API wallet** model:
-- **Master account** — owns the funds, used for all queries.
-- **API wallet** — only signs transactions on behalf of the master account.
+---
 
-Per-user credentials submitted via Telegram registration are validated against Hyperliquid before being stored Fernet-encrypted in SQLite. The master `.env` credentials are only used in single-user fallback mode (when the user DB is empty).
+## What's installed locally
+
+After `git clone` + `deploy/launchd/install.sh`, this is the full inventory of
+what physically exists on the machine:
+
+| Artifact | Path | Created by | Purpose |
+|---|---|---|---|
+| Code | `~/ClaudeProjects/potion-perps-bot/` | `git clone` | The repo |
+| launchd agent | `~/Library/LaunchAgents/local.potion-perps-bot.plist` | `deploy/launchd/install.sh` | Auto-starts on login, respawns on crash |
+| Bot process | one `python3 main.py` under `caffeinate -i` | launchd → `run.sh` | The actual bot |
+| Database | `data/trades.db` (+ `.db-wal`, `.db-shm`) | First run | All persistent state |
+| Encryption key | `data/.encryption_key` | First run (auto) | Fernet master key for credential encryption |
+| App logs | `logs/bot.log` (+ `.1`…`.5`) | structlog | Structured JSON, rotated at 10 MB × 5 |
+| launchd logs | `logs/launchd.{out,err}` (+ `.1`) | launchd / `run.sh` | Pre-structlog crash diagnostics, 2-deep ring |
+| Daily backups | `backups/trades-YYYYMMDD-HHMMSS.db` | Background task in the bot | 30-day retention, mtime-based prune |
+| Ports | `:8080` (health), `:8081` (admin API) | The bot | Both bind `0.0.0.0` — harmless behind laptop NAT, see [§ remote server](#moving-to-a-remote-server) |
+
+**Not on disk (must be set up):**
+
+- `.env` — `HL_ACCOUNT_ADDRESS`, `HL_API_WALLET`, `HL_API_SECRET`, optionally `TELEGRAM_BOT_TOKEN`, `DISCORD_BOT_TOKEN`, `ADMIN_API_KEY`. Template: `.env.example`.
+- `config/config.yaml` — non-secret runtime settings. Template: `config/config.example.yaml`.
+
+Both are gitignored. They are the only files you bring with you across machines.
 
 ---
 
-## Telegram Bot
+## The database & auditability
 
-The Telegram bot is the user-facing interface. Users only interact with the bot — they never touch the admin API or config files.
+One SQLite file at `data/trades.db`, WAL mode. Single-writer (the bot), so no
+contention. Four tables:
 
-### User onboarding
+| Table | What it holds |
+|---|---|
+| `users` | Per-user state — Fernet-encrypted HL credentials, active preset, port settings |
+| `trades` | One row per CP signal-derived position; includes `raw_signal_text` + `decision_snapshot` (JSON) |
+| `orders` | Every order ever submitted to Hyperliquid (entry, TPs, SLs, replacements) |
+| `trade_events` | Append-only audit log — every lifecycle event (signal received, parse error, TP hit, SL moved, manual close, etc.) with `raw_text` + `action_taken` |
 
-1. Admin runs `/generate_code 30` and shares the resulting `PPB-XXXX-XXXX` code with a paying member.
-2. User sends `/register` to the bot in a DM.
-3. Multi-step `ConversationHandler` collects: invite code → master account address → API wallet address → API private key → network. Credential messages are deleted on receipt.
-4. Bot validates credentials against Hyperliquid, encrypts them, creates the user row, marks the code redeemed, and activates a pipeline for them.
+**Per-user isolation:** composite PK `(user_id, trade_id)` on `trades` and
+`orders`. All queries filter by `user_id`. One user's bug cannot touch another
+user's data.
 
-### Main menu
+**The audit spine:**
+- `trades.decision_snapshot` — JSON captured at trade open. Includes the
+  active preset, the resolved sizing, the risk gate's verdict. Read this to
+  answer "why did the bot size it that way?"
+- `trade_events` — append-only. Read this to answer "what did the bot see,
+  and what did it do about it?" Parse errors land here as `event_type='error'`
+  rows, not as crashes (D6).
 
-`/menu` opens an inline-keyboard menu with screens:
+**Daily backups:** taken via the SQLite online backup API at 06:00 UTC, so
+writers are not blocked during the snapshot. Files land in `backups/`,
+30-day retention. **Caveat:** same-disk DR — see [§ remote server](#moving-to-a-remote-server).
 
-| Screen | Purpose |
-|--------|---------|
-| **Account** | Masked wallet info, network, subscription status, expiry, code used, "Renew Access" button. |
-| **Calls View** | Live feed of the last 10 signals (≤3 days old) as full signal cards. In manual-approve mode, each pending signal gets Approve / Reject buttons. The view auto-refreshes when new signals arrive. |
-| **Trading** | Balance, open positions (with close buttons), active trades (paginated), trade history (last 15). |
-| **Statistics** | Win rate, total / average / best / worst PnL %, wins / losses / breakeven counts. |
-| **Dashboard** | Pipeline status, preset, leverage cap, risk limits, expiry. |
-| **Configuration** | Change preset, toggle auto-execute, set max leverage, set risk limits, activate/deactivate the pipeline. |
+### Inspecting a single trade end-to-end
 
-### Approval flow
+The whole point of the audit trail is being able to reconstruct a trade
+from the DB. The flow:
 
-When `auto_execute` is **OFF**, new signals are recorded as `PENDING` and only surfaced as Approve/Reject buttons if the user is currently in Calls View (so push notifications never spam users who aren't actively monitoring). Approving rebuilds the order set from the stored trade and submits it. Rejecting marks the trade `CANCELED`.
+```bash
+# 1. Find the trade you care about (most recent for a user)
+sqlite3 -header -column data/trades.db \
+  "SELECT trade_id, coin, side, status, created_at, close_reason
+   FROM trades WHERE user_id = 'artem' ORDER BY trade_id DESC LIMIT 5;"
 
-When `auto_execute` is **ON**, signals are submitted immediately and users receive informational push notifications (no buttons).
+# 2. The raw signal text the bot received
+sqlite3 data/trades.db \
+  "SELECT raw_signal_text FROM trades WHERE user_id = 'artem' AND trade_id = 42;"
 
-### Push notifications
+# 3. The decision snapshot — preset, sizing, risk gate
+sqlite3 data/trades.db \
+  "SELECT decision_snapshot FROM trades WHERE user_id = 'artem' AND trade_id = 42;" \
+  | python3 -m json.tool
 
-Per-user notifications fire on: new signal, trade opened, trade failed, TP hit, all TPs hit, stop hit, trade canceled, trade closed, SL moved to breakeven, SL adjusted, PnL alert (±5% / -3%), signal skipped, risk warning, access expiry warnings (3d / 1d), expired.
+# 4. Every lifecycle event for that trade, in order
+sqlite3 -header -column data/trades.db \
+  "SELECT occurred_at, event_type, action_taken, substr(raw_text, 1, 60) AS raw
+   FROM trade_events
+   WHERE user_id = 'artem' AND trade_id = 42
+   ORDER BY occurred_at;"
 
-### Admin commands
+# 5. The orders submitted to Hyperliquid for that trade
+sqlite3 -header -column data/trades.db \
+  "SELECT order_type, side, size, price, status, fill_price
+   FROM orders WHERE user_id = 'artem' AND trade_id = 42;"
+```
 
-| Command | Description |
-|---------|-------------|
-| `/generate_code [days]` / `/generate_codes <count> [days]` | Generate single or batch invite codes. |
-| `/list_codes` / `/revoke_code <code>` | Inspect / revoke invite codes. |
-| `/users` | List all registered users with status, preset, expiry. |
-| `/extend <user_id> <days>` / `/revoke <user_id>` | Adjust user access. |
-| `/add_admin <id>` / `/remove_admin <id>` / `/list_admins` | Manage who can run admin commands. |
-| `/kill` / `/resume` | Emergency switch — cancels all orders, market-closes all positions across all users, blocks new signals until resumed. |
-| `/broadcast <message>` | Send a message to all active users. |
-| `/inject` | ⚠️ Testing only — inject synthetic signals into the pipeline using live testnet prices. |
-
-DM-only and per-user rate limiting (30 commands / 60s) are enforced via pre-processing middleware.
+This is the answer to "did CP get it wrong, or did our bot do something the
+signal didn't say?"
 
 ---
 
-## Admin REST API
+## Daily operations
 
-`aiohttp` server on `ADMIN_API_PORT` (default 8081), authenticated via `X-API-Key`.
+```bash
+# Is the bot running?
+launchctl print gui/$(id -u)/local.potion-perps-bot | head -20
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `POST` | `/api/users` | Create user (credentials + optional config). |
-| `GET` | `/api/users` | List users (filter by `?status=`). |
-| `GET` | `/api/users/{user_id}` | User detail (no secrets). |
-| `PUT` | `/api/users/{user_id}` | Update display name / config / credentials. |
-| `POST` | `/api/users/{user_id}/activate` | Mark active + spin up pipeline. |
-| `POST` | `/api/users/{user_id}/deactivate` / `DELETE /api/users/{user_id}` | Mark inactive + tear down pipeline. |
-| `POST` | `/api/kill` | Kill switch — close everything, block new signals. |
-| `POST` | `/api/resume` | Resume signal processing after kill. |
+# Live application logs
+tail -f logs/bot.log
+
+# Early-startup crashes (config error, import error)
+tail -f logs/launchd.err
+
+# Manual restart
+launchctl kickstart -k gui/$(id -u)/local.potion-perps-bot
+
+# Stop (won't auto-restart)
+launchctl bootout gui/$(id -u)/local.potion-perps-bot
+```
+
+### Where to look when X breaks
+
+| Symptom | Start here |
+|---|---|
+| Bot didn't act on a CP message | `src/parser/classifier.py` → `pipeline.process_message` |
+| Wrong size on a trade | `trades.decision_snapshot` → `src/strategy/position_sizer.py` |
+| Order rejected by Hyperliquid | `src/exchange/order_builder.py` (sizing/rounding) → `position_manager.submit_trade` |
+| Telegram command misbehaved | `src/telegram/handlers/` (one file per command group) |
+| User can't register | `src/telegram/handlers/registration.py` + `src/state/user_db.py` |
+| State out of sync after restart | `src/exchange/position_manager.py::sync_positions` |
 
 ---
 
 ## Configuration
 
-Two sources of truth:
-- `.env` — secrets only (HL credentials, Discord/Telegram tokens, admin API key, encryption key).
-- `config/config.yaml` — non-secret defaults (input adapter, risk limits, logging, network). Per-user values override these from the `user_config` table.
+Two files, both gitignored, both templated:
+
+- **`.env`** — secrets. Hyperliquid keys, Telegram & Discord tokens, optional
+  admin API key. Template: `.env.example`.
+- **`config/config.yaml`** — everything else. Template: `config/config.example.yaml`.
+
+The example YAML is the source of truth for what's available; this section is
+just the orientation map.
+
+| Block | What it controls |
+|---|---|
+| `input.adapter` | `simulation` / `cli` / `file` / `discord` — where the bot pulls signals from |
+| `exchange.network` | `testnet` or `mainnet`. Each user picks at registration (D7); this is the global default. |
+| `strategy.active_preset` | Which preset all users default to. Override per-user in their Telegram config. |
+| `strategy_presets.*` | Custom presets (override built-ins by re-using the name) |
+| `strategy.size_by_risk` | Override preset `size_pct` per CP risk level (`LOW` / `MEDIUM` / `HIGH`) |
+| `risk.*` | Pre-trade circuit breakers: max open positions, daily loss, position cap, total exposure cap |
+| `backups.*` | Daily backup schedule + retention |
+| `logging.*` | Level + file path + per-library overrides (see `config/config.example.yaml`) |
 
 ### Strategy presets
 
-A "strategy" is just three settings: `tp_split`, `move_sl_to_breakeven_after`, `size_pct`. Built-in presets:
+The seven built-in presets (D2) mirror CryptoPrinter's weekly report rows so
+your per-user PnL lines up directly with CP's columns:
 
-| Preset | TP Split | SL to BE | Size % | Description |
-|--------|----------|----------|--------|-------------|
-| `runner` | 33 / 33 / 34 | After TP1 | 2% | Default — let winners run. |
-| `conservative` | 100 / 0 / 0 | Never | 2% | Close everything at TP1. |
-| `tp2_exit` | 50 / 50 / 0 | After TP1 | 2% | Exit fully at TP2. |
-| `tp3_hold` | 0 / 0 / 100 | After TP1 | 2% | Hold everything for TP3. |
-| `breakeven_filter` | 33 / 33 / 34 | After TP1 | 1.5% | Smaller size, same split. |
-| `small_runner` | 33 / 33 / 34 | After TP1 | 0.5% | Minimal risk runner. |
+| Preset | TP split (1/2/3) | SL → breakeven? | Default size |
+|---|---|---|---|
+| `tp1_only` | 100% / 0 / 0 | no | 2% |
+| `tp2_only` | 0 / 100% / 0 | no | 2% |
+| `tp3_only` | 0 / 0 / 100% | no | 2% |
+| `tp2_be` | 0 / 100% / 0 | after TP1 | 2% |
+| `tp3_be` | 0 / 0 / 100% | after TP1 | 2% |
+| `hybrid` | 10% / 70% / 20% | after TP1 | 2% |
+| `even_split` *(default)* | 33% / 33% / 34% | after TP1 | 2% |
 
-Custom presets are defined in `config.yaml` and override built-ins with the same name. Each user can also override `size_pct` per risk level via `size_by_risk` (e.g. `LOW: 4.0`, `MEDIUM: 2.0`, `HIGH: 1.0`).
-
-### Risk controls (enforced before every new trade)
-
-| Guard | Config key | Default | What it does |
-|-------|-----------|---------|--------------|
-| Max open positions | `risk.max_open_positions` | 10 | Reject new trades when reached. |
-| Daily loss circuit breaker | `risk.max_daily_loss_pct` | 10% | Stop trading when cumulative daily losses exceed threshold. |
-| Total exposure cap | `risk.max_total_exposure_usd` | $2,000 | Cap combined USD across all open positions. |
-| Max position size | `risk.max_position_size_usd` | $500 | Per-trade USD cap. |
-| Min order value | `risk.min_order_usd` | $10 | Hyperliquid minimum notional. |
-| Leverage cap | `strategy.max_leverage` | 20× | `min(signal_leverage, config_max, exchange_max)`. |
-
-Per-user values override these defaults via the Telegram Configuration menu.
+**No bot-imposed exit logic.** The active preset is the only authority on
+when and how positions are exited (D2). No "smart" overrides, no surprise
+closures.
 
 ---
 
-## Signal Handling
+## Cleaning up local disk
 
-### Supported message types
+Everything that grows is already bounded:
 
-| Type | Action |
-|------|--------|
-| `SIGNAL_ALERT` | Parse → size → build orders → submit (or record as pending if auto-execute is off). |
-| `TP_HIT` | Notify + optionally move SL to breakeven. |
-| `ALL_TP_HIT` | Mark trade closed with profit. |
-| `BREAKEVEN` | Move SL to entry price. |
-| `STOP_HIT` | Mark trade closed with loss. |
-| `CANCELED` | Cancel orders, market-close any position. |
-| `TRADE_CLOSED` | Market-close remaining position. |
-| `PREPARATION` | Log only — do NOT execute (heads-up message). |
-| `MANUAL_UPDATE` | Detect SL moves (`Move SL to 1985`, `SL → 0.025`, etc.), otherwise log. |
-| `NOISE` | Ignore. |
+| Source | Cap |
+|---|---|
+| `logs/bot.log*` | 50 MB hard (10 MB × 5 backups, rotated by `RotatingFileHandler`) |
+| `logs/launchd.{out,err}*` | ~`ThrottleInterval × stderr-spam-rate`, 2-deep ring (rotated by `run.sh` on every restart) |
+| `backups/trades-*.db` | 30 days, mtime-based prune by the bot |
+| `data/trades.db` | Grows with trade events; ~MB-class after a year of active trading |
 
-### Symbol mapping
-
-110+ pairs mapped from Potion Perps format to Hyperliquid coin names:
-
-| Pattern | Example | Handling |
-|---------|---------|----------|
-| Direct 1:1 | `ETH/USDT` → `ETH` | Strip `/USDT`. |
-| Kilo-prefix | `1000BONK/USDT` → `kBONK` | Convert `1000X` to `kX`. |
-| Bare meme coins | `BONK/USDT` → `kBONK` | Explicit override. |
-| Rebrands | `MATIC/USDT` → `POL`, `FTM/USDT` → `S` | Explicit override. |
-
-Validated against live exchange metadata at runtime. Assets not listed on Hyperliquid are caught and rejected with a clear error.
-
-### Startup position sync
-
-On startup, every active user's pipeline reconciles its local DB state with the actual exchange:
-
-| Scenario | Action |
-|----------|--------|
-| `OPEN` in DB, position exists on exchange | Verified — no change. |
-| `OPEN` in DB, no position | Marked `CLOSED` (SL/TP filled while offline). |
-| `PENDING` in DB, entry still resting | Verified — no change. |
-| `PENDING` in DB, position exists | Promoted to `OPEN` (filled while offline). |
-| `PENDING` in DB, no order / no position | Marked `CANCELED` (expired while offline). |
-| Position on exchange, no DB record | Logged as orphan (never auto-managed). |
-
-Conservative — only updates DB state, never auto-opens or auto-closes positions during sync.
-
----
-
-## Multi-User Model
-
-Every runtime component is instance-scoped — no globals.
-
-| Component | Scope |
-|-----------|-------|
-| `HyperliquidClient` | Per-user credentials and SDK clients. |
-| `Pipeline` | Per-user config, client, database. |
-| `TradeDatabase` | All queries filtered by `user_id`; composite PK `(user_id, trade_id)`. |
-| `PositionManager` | Per-user (carries client + DB). |
-| `TelegramNotifier` | Per-user (carries chat ID + calls-view checker). |
-| Parsers + order builder | Stateless pure functions. |
-| Input adapter | Single shared instance — one signal source for everyone. |
-
-Users share one SQLite file safely (WAL mode + composite keys). The orchestrator dispatches each incoming signal to every active user's pipeline in a try/except so one user's error never affects another.
-
----
-
-## Database Schema
-
-One SQLite file (`data/trades.db` by default). Tables:
-
-**`trades`** — one row per signal
-```
-(user_id, trade_id) PRIMARY KEY
-pair, coin, side, risk_level, trade_type, size_hint
-entry_price, stop_loss, tp1, tp2, tp3
-leverage, signal_leverage, position_size_usd, position_size_coin
-status (preparing | pending | open | closed | canceled)
-created_at, updated_at, closed_at, close_reason, pnl_pct, notes
-```
-
-**`orders`** — one row per exchange order
-```
-id PRIMARY KEY AUTOINCREMENT
-trade_id, user_id  → FK to trades
-order_type (entry | stop_loss | tp1 | tp2 | tp3)
-coin, side, size, price, oid (Hyperliquid order ID)
-status (pending | submitted | filled | canceled | rejected)
-fill_price, created_at, updated_at
-```
-
-**`users`** — registered users
-```
-user_id PRIMARY KEY, display_name, status (active | inactive)
-created_at, updated_at
-```
-
-**`user_credentials`** — Fernet-encrypted secrets
-```
-user_id PRIMARY KEY → FK users
-account_address_enc, api_wallet_enc, api_secret_enc
-network, created_at, updated_at
-```
-
-**`user_config`** — per-user overrides
-```
-user_id PRIMARY KEY → FK users
-active_preset, auto_execute, max_leverage
-size_by_risk_json, custom_presets_json
-max_open_positions, max_daily_loss_pct,
-max_position_size_usd, max_total_exposure_usd, min_order_usd
-telegram_chat_id, invite_code, access_expires_at
-created_at, updated_at
-```
-
-**`invite_codes`**
-```
-code PRIMARY KEY, created_by, created_at
-duration_days, redeemed_by, redeemed_at, expires_at
-status (active | redeemed | revoked | expired)
-```
-
-**`telegram_admins`** — dynamically added admins
-```
-telegram_id PRIMARY KEY, added_by, created_at
-```
-
----
-
-## Project Structure
-
-```
-potion-perps-bot/
-├── main.py                              # Entry point — wires everything, runs the loop
-├── Dockerfile, docker-compose.yml       # Container deployment
-├── requirements.txt
-├── config/
-│   ├── config.example.yaml              # Template with comments
-│   └── config.yaml                      # Active config (gitignored)
-├── src/
-│   ├── orchestrator.py                  # Multi-user fan-out
-│   ├── pipeline.py                      # Per-user signal processor
-│   ├── crypto.py                        # Fernet encryption
-│   ├── health.py                        # Health endpoint
-│   ├── api/
-│   │   └── admin.py                     # Admin REST API
-│   ├── config/
-│   │   └── settings.py                  # YAML + .env loader, typed dataclasses, validation
-│   ├── exchange/
-│   │   ├── hyperliquid.py               # SDK wrapper + retries + rate-limit handling
-│   │   ├── order_builder.py             # ParsedSignal → Hyperliquid orders
-│   │   └── position_manager.py          # Submit / cancel / close / move SL / startup sync
-│   ├── input/
-│   │   ├── base_adapter.py              # Abstract interface
-│   │   ├── discord_adapter.py           # Live Discord listener
-│   │   ├── simulation_adapter.py        # Replay .txt files
-│   │   ├── cli_adapter.py               # Paste from terminal
-│   │   └── file_adapter.py              # (stub)
-│   ├── parser/
-│   │   ├── classifier.py                # 10 MessageType enum + classify()
-│   │   ├── signal_parser.py             # TRADING SIGNAL ALERT → ParsedSignal
-│   │   └── update_parser.py             # All lifecycle events → typed dataclasses
-│   ├── state/
-│   │   ├── models.py                    # TradeRecord, OrderRecord, enums
-│   │   ├── database.py                  # SQLite trades + orders, user-scoped
-│   │   └── user_db.py                   # Users, encrypted creds, config, invite codes
-│   ├── strategy/
-│   │   └── position_sizer.py            # Sizing + pre-trade risk gate
-│   ├── telegram/
-│   │   ├── bot.py                       # Application setup, handler registration
-│   │   ├── keyboards.py                 # Inline keyboard builders
-│   │   ├── formatters.py                # Message formatting helpers
-│   │   ├── middleware.py                # Auth, admin check, DM-only, rate limit, error handler
-│   │   ├── notifications.py             # TelegramNotifier — push trade events
-│   │   ├── expiry_checker.py            # Hourly background task — expiry + warnings
-│   │   ├── pnl_monitor.py               # 60s background task — PnL threshold alerts
-│   │   ├── invite_codes.py              # Code generation
-│   │   └── handlers/
-│   │       ├── help.py                  # /start, /help, /cancel, unknown
-│   │       ├── registration.py          # /register ConversationHandler
-│   │       ├── menu.py                  # Main menu + screen routing
-│   │       ├── account.py               # /balance, /positions, /status, /activate, /deactivate
-│   │       ├── trades.py                # /trades, /history, /stats, notes, sub-views
-│   │       ├── config.py                # /config, /preset, /auto, inline edits
-│   │       ├── approval.py              # Approve / Reject / Close Position callbacks
-│   │       └── admin.py                 # Invite codes, user management, kill, broadcast, /inject
-│   └── utils/
-│       ├── logger.py                    # structlog → JSON file + console
-│       └── symbol_mapper.py             # Potion pair → Hyperliquid coin (110+ mappings)
-├── tests/                               # ~370 tests across 24 files
-└── signals/
-    ├── samples/                         # Real Discord signal samples (all 10 types)
-    └── test/                            # End-to-end test fixtures
-```
-
----
-
-## Testing
+That said, manual recipes:
 
 ```bash
-python -m pytest tests/ -v
+# Drop log backups (keeps current bot.log, drops .1 through .5 and launchd .1s)
+rm -f logs/bot.log.[1-9] logs/launchd.{out,err}.1
+
+# Drop old DB backups beyond retention (the bot does this itself; manual = belt + braces)
+find backups -name 'trades-*.db' -mtime +30 -delete
+
+# Shrink the DB after large deletes / closed-trade pruning
+# IMPORTANT: stop the bot first — VACUUM acquires an exclusive lock
+launchctl bootout gui/$(id -u)/local.potion-perps-bot
+sqlite3 data/trades.db 'VACUUM;'
+deploy/launchd/install.sh                  # re-bootstrap
+
+# Delete shadow-mode captures (when Phase 4.1 lands)
+find signals/captures -name '*.txt' -delete
 ```
 
-~370 tests, all passing. Coverage by area:
-
-| Area | Files |
-|------|-------|
-| Parsing & symbol mapping | `test_classifier.py`, `test_signal_parser.py`, `test_update_parser.py`, `test_symbol_mapper.py` |
-| Strategy & risk | `test_risk_controls.py` |
-| State & encryption | `test_user_db.py`, `test_crypto.py`, `test_invite_codes.py` |
-| Exchange & retries | `test_retry.py` |
-| Orchestrator & pipeline | `test_orchestrator.py`, `test_e2e_pipeline.py` (40 cases — full pipeline with mocked exchange) |
-| Telegram | `test_notifications.py`, `test_approval.py`, `test_admin_commands.py`, `test_pnl_monitor.py`, `test_trade_notes.py`, `test_expiry_enforcement.py` |
-| API & infra | `test_admin_api.py`, `test_health.py`, `test_logging.py`, `test_discord_adapter.py` |
-| Hardening | `test_step12_hardening.py` |
-
----
-
-## Docker Deployment
+**Nuclear reset** (lose everything, re-register all users):
 
 ```bash
-docker compose up -d --build
+launchctl bootout gui/$(id -u)/local.potion-perps-bot
+rm -rf data/ logs/ backups/
+deploy/launchd/install.sh
+# Then /register from each user's Telegram
 ```
 
-- Built on `python:3.12-slim` with a stdlib-based `HEALTHCHECK`.
-- Mounts `config/`, `data/`, `logs/`, and `signals/incoming/` from the host.
-- Exposes the health endpoint (`HEALTH_PORT`, default 8080) and admin REST API (`ADMIN_API_PORT`, default 8081).
-- `restart: unless-stopped`, `stop_grace_period: 10s`.
-- Logs rotate at 10 MB × 5 backups (configured in `src/utils/logger.py`).
-
-The bot handles `SIGTERM` / `SIGINT` and shuts down components in order: PnL monitor → expiry checker → Telegram bot → admin API → health server → orchestrator (per-user cleanup) → user DB.
+Do this only if (a) the DB is corrupt past the point of recovery from
+backups, or (b) you're moving to a clean environment and want a fresh start.
+Not for routine cleanup.
 
 ---
 
-## Hyperliquid Integration Notes
+## Re-registering a user
 
-Lessons baked into the code:
+There are three scenarios that look similar but have different blast radii.
 
-- **szDecimals**: Each asset has a fixed number of size decimal places (e.g. ETH=4, ADA=0, ZK=0). Sizes are **floored** (not rounded) to the per-asset precision from `get_asset_meta()`.
-- **Price precision**: 5 significant figures, enforced via `_round_price()`.
-- **Minimum notional**: $10 per order (size × mid price, not limit price).
-- **Trigger orders**: `triggerPx` must be a float. SL/TP use `{"trigger": {"triggerPx": float, "isMarket": True, "tpsl": "sl" | "tp"}}`.
-- **Portfolio margin**: USDC lives in the spot clearinghouse but is available for perps; `get_balance()` queries both.
-- **maxLeverage**: Per-asset cap from metadata. Effective leverage is `min(signal_leverage, config_max_leverage, exchange_max_leverage)`.
-- **Retries**: Transient errors and rate-limit responses (`429`, `"rate limit"`, `"too many requests"`) are retried with exponential backoff + jitter.
+### A. User wants to change their HL API wallet (rotation, not loss)
+
+1. From Telegram, run `/cancel` to abort any in-flight registration, then `/register`.
+2. The conversation flow walks them through entering the new credentials.
+3. Old credentials are overwritten in the `users` row. Trade history is preserved.
+
+### B. `data/.encryption_key` is lost or rotated
+
+This is the destructive case — losing the master key means every Fernet-encrypted
+credential in the DB is now undecryptable. **Trade history is still intact**,
+but every user has to re-enter their HL credentials.
+
+1. Stop the bot: `launchctl bootout gui/$(id -u)/local.potion-perps-bot`.
+2. Delete the dead key: `rm data/.encryption_key`.
+3. Re-start: `deploy/launchd/install.sh`. A fresh key is generated automatically on first run.
+4. Each user runs `/register` again from Telegram. The flow detects that their
+   stored creds are now garbage and prompts for re-entry.
+5. Trades opened before the rotation are still in the DB and visible — only
+   the credentials needed to operate on the exchange were lost.
+
+### C. Replace a user wholesale
+
+For example, one of the friends drops out and a different one takes their slot.
+
+1. From Telegram, the admin runs `/admin` to list users.
+2. Use the admin REST API to deactivate the old user — `curl -X POST -H "X-API-Key: $K" http://127.0.0.1:8081/api/users/<uid>/deactivate`. This stops dispatching CP signals to them; their trade history is preserved.
+3. The new user `/register`s from their own Telegram account.
+
+Never delete a `users` row directly. Deactivation is reversible, deletion
+cascades into orphaned `trades` / `orders` / `trade_events` rows that
+confuse the audit trail.
 
 ---
 
-## Changelog
+## Moving to a remote server
 
-**2026-02-26 — Phase 4 complete**
-- Full Telegram bot UI: menu, registration with invite codes, calls view with approve/reject, trading sub-views, statistics, dashboard, configuration, trade notes, user-initiated renewal.
-- Per-user trade notifications, PnL threshold alerts (+5% / -3%), access expiry warnings (3d / 1d).
-- Admin Telegram commands: invite codes, users, extend/revoke, kill switch, broadcast, dynamic admin management, test signal injection.
-- Discord adapter wired to live channel. Multi-user orchestrator dispatches each signal to every active pipeline.
-- Encrypted credential storage (Fernet) and admin REST API for user CRUD + kill switch.
-- Hardening: DM-only filter, per-user rate limit, global error handler, retry on transient errors, structured JSON logging, log rotation.
-- Mainnet registration intentionally blocked — testnet only for now.
-- ~370 tests passing.
+The laptop deployment is *one* deployment. It is not the canonical one.
 
-**2026-02-11 — Phase 2 complete, E2E verified**
-- Strategy presets (6 built-in + user-defined), position sizing with risk-level overrides.
-- Risk controls: daily loss circuit breaker, total exposure cap, consolidated risk gate.
-- Position sync on startup reconciles DB state with exchange after restart.
-- Symbol mapper: 110+ pairs, rebrands (MATIC→POL, FTM→S), kilo-prefix, validation.
-- Dynamic SL adjustment from manual update messages.
-- Full pipeline orchestrator with 10-type message handling and `auto_execute` support.
-- Market close price rounding fixed for low-price assets.
-- End-to-end testnet run verified: signal → orders → lifecycle → cleanup.
+### Why you'd move
+
+Laptop sleep is the silent killer. `caffeinate -i` prevents idle sleep, but
+macOS will still sleep the machine when the lid closes on battery (clamshell
+power management). The bot process is paused, and any CryptoPrinter signal
+fired during that window is **lost** — Discord delivers `on_message` events
+live only, with no backfill. A VPS doesn't sleep.
+
+### Three structural things to fix before exposing to the internet
+
+1. **`:8080` health + `:8081` admin currently bind `0.0.0.0`.** On a public
+   VPS, the `X-API-Key` is the entire perimeter. Either bind to `127.0.0.1`
+   and put a reverse proxy in front, or add an IP allowlist + TLS.
+   (`src/health.py:65`, `src/api/admin.py:83`.)
+2. **`backups/` is same-disk.** For real DR you need an offsite copy step.
+   Add a cron / systemd timer that `rsync`s `backups/` to another host or
+   object store after the bot's daily backup completes.
+3. **Replace launchd with systemd.** The plist is the only macOS-specific
+   thing in this repo. Everything else is portable Python + stdlib + YAML
+   config + env vars.
+
+### Migration checklist
+
+1. **Provision** a Linux VPS. Python 3.10+. Any small instance handles the
+   load — this is one process doing IO-bound work.
+2. **Clone and install dependencies**:
+   ```bash
+   git clone git@github.com:ArtemAbesadze/signals-pipeline.git
+   cd signals-pipeline
+   python3 -m venv .venv && source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+3. **Copy secrets and config out-of-band** (not via git):
+   - `.env`
+   - `config/config.yaml`
+4. **Preserve credentials and history** (optional but usually wanted):
+   - `data/.encryption_key`
+   - `data/trades.db`
+   The key has to come over with the DB — without it, the encrypted
+   credentials in the DB are unreadable and every user has to re-register
+   (see § re-registering, scenario B).
+5. **Write a systemd unit.** Sketch (`/etc/systemd/system/potion-perps-bot.service`):
+   ```ini
+   [Unit]
+   Description=Potion Perps Bot
+   After=network-online.target
+   Wants=network-online.target
+
+   [Service]
+   Type=simple
+   User=potion
+   WorkingDirectory=/home/potion/signals-pipeline
+   ExecStart=/home/potion/signals-pipeline/.venv/bin/python3 main.py
+   Restart=on-failure
+   RestartSec=30s
+   StandardOutput=append:/home/potion/signals-pipeline/logs/systemd.out
+   StandardError=append:/home/potion/signals-pipeline/logs/systemd.err
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+   `systemctl daemon-reload && systemctl enable --now potion-perps-bot`.
+6. **Lock down the ports.** In `config/config.yaml` set `health.port` and
+   the admin API to bind on `127.0.0.1` (requires a small change to
+   `src/api/admin.py` and `src/health.py` to honour a bind-address from
+   config — currently hard-coded to `0.0.0.0`).
+7. **Add an offsite backup step.** Example cron entry:
+   ```cron
+   30 6 * * *  rsync -az --delete /home/potion/signals-pipeline/backups/ remote-host:potion-backups/
+   ```
+   06:30 UTC = 30 minutes after the bot's daily snapshot.
+8. **Smoke-test on testnet first** (D7). Switch to mainnet per user only
+   after a clean testnet run.
+
+---
+
+## Telegram bot
+
+DM-only. Group messages are rejected by the `dm_only_filter` middleware.
+Credential-collection messages are deleted on receipt.
+
+### User commands
+
+| Command | What it does |
+|---|---|
+| `/start` | First-touch greeting + link to register |
+| `/register` | Walk through HL creds + testnet/mainnet choice (multi-step conversation) |
+| `/menu` | Dashboard — open trades, recent activity, port status |
+| `/help` | Command list |
+| `/cancel` | Cancel an in-progress conversation (e.g., abort `/register` mid-flow) |
+| `/balance` | Hyperliquid balance |
+| `/positions` | Open positions |
+| `/port` | Port/wallet status: configured `port_usd`, mode (withdraw / compound / watermark), live wallet, guardrail status |
+| `/trades` | Open trades (paginated) |
+| `/history` | Closed trades (paginated) |
+| `/stats` | Win-rate, PnL, average R, by-preset breakdown |
+| `/config` | View / edit per-user config (preset, port settings, auto-execute) |
+| `/preset` | Change active preset (shortcut to `/config`) |
+| `/auto` | Toggle auto-execute on/off |
+| `/activate`, `/deactivate` | Resume or pause CP signal dispatch to this user |
+
+### Admin-only commands
+
+Only users in the admin list (set via env / admin API) can run these.
+
+| Command | What it does |
+|---|---|
+| `/admin` | List admin commands |
+| `/kill` | Halt all trading across all users (sets a global flag; existing positions are not touched) |
+| `/resume` | Lift the kill switch |
+| `/add_admin`, `/remove_admin`, `/list_admins` | Manage the admin list |
+| `/inject` | Manually inject a signal text (useful for testing — uses the full pipeline) |
+
+### Admin REST API (`:8081`)
+
+`X-API-Key` header required (set `ADMIN_API_KEY` in `.env`).
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/users` | Create a user |
+| `GET` | `/api/users` | List users |
+| `GET` | `/api/users/{user_id}` | Get one user |
+| `PUT` | `/api/users/{user_id}` | Update one user |
+| `POST` | `/api/users/{user_id}/activate` | Start dispatching signals to this user |
+| `POST` | `/api/users/{user_id}/deactivate` | Stop dispatching signals to this user |
+| `POST` | `/api/kill` | Kill switch across all users |
+| `POST` | `/api/resume` | Lift the kill switch |
+
+---
+
+## Testnet → mainnet promotion
+
+This is a serious moment. The promotion checklist:
+
+1. **Mandatory testnet soak.** Run on testnet for at least one full CP signal
+   day (multiple opens, at least one TP hit, at least one SL hit). Audit:
+   ```bash
+   sqlite3 data/trades.db \
+     "SELECT trade_id, coin, side, status, close_reason, pnl_pct
+      FROM trades WHERE user_id = '<uid>' ORDER BY trade_id DESC LIMIT 20;"
+   ```
+   Look for: any `parse_error` rows in `trade_events`, any orders rejected
+   by Hyperliquid, any decision_snapshots whose sizing doesn't match what
+   the preset says.
+2. **Port size dry-run.** With the user's intended mainnet `port_usd`, run
+   `/port` on testnet and confirm:
+   - `port_usd` ≤ wallet × 0.95 (guardrail warning threshold).
+   - Daily-loss circuit breaker (`risk.max_daily_loss_pct`) matches your
+     real tolerance.
+   - Per-position cap (`risk.max_position_size_usd`) matches your real cap.
+3. **Mainnet promotion gate** (Phase 3.5 — pending). When shipped, this will
+   require an explicit Telegram confirmation dialog for the first mainnet
+   trade above a threshold.
+4. **Flip network.** From `/register` on Telegram, or by editing the user's
+   row via the admin API. Each user flips independently — there is no
+   global mainnet switch.
+5. **Watch the first trade.** Stay at the terminal, tail `logs/bot.log`,
+   keep `/positions` open in Telegram. The first mainnet trade is the one
+   most likely to surface a network-specific bug (different symbol
+   alias, different min-order rounding, different precision).
+6. **Backup the DB before promotion.** Manual snapshot in addition to the
+   daily:
+   ```bash
+   cp data/trades.db "backups/pre-mainnet-$(date -u +%Y%m%d-%H%M%S).db"
+   ```
+
+---
+
+## Development
+
+```bash
+python3 -m pytest tests/                  # full suite, ~6s
+python3 -m pytest tests/test_logger.py -v # one file
+
+git checkout -b feature/<name>            # branch from rework/scope-v1 during the rework
+```
+
+Project structure: see [`CLAUDE.md`](CLAUDE.md) (kept current, indexed for
+future sessions). The rework spine: [`docs/REWORK_BRIEF.md`](docs/REWORK_BRIEF.md).
+
+Conventions enforced across the codebase:
+
+- **Audit everything.** Every trade open writes a `decision_snapshot`. Every lifecycle event writes a `trade_events` row.
+- **Never crash on bad input.** Parse errors become `trade_events.event_type='error'` rows; the pipeline keeps running.
+- **No bot-imposed exit logic.** The active preset is the only authority on exits.
+- **Per-user isolation.** Composite PK `(user_id, trade_id)`. All queries filter by user.
+- **Tests close behind code.** ~580 tests across `tests/`. New features land with tests, not after.
+
+---
+
+## Phase status
+
+| Phase | What | Status |
+|---|---|---|
+| 1 | Audit, parsing, sizing, strategy presets | ✅ shipped |
+| 2 | Telegram menu / dashboard / port screen / audit trail | ✅ shipped |
+| 3.1 | Daily SQLite backups (D9) | ✅ shipped |
+| 3.2 | launchd agent for 24/7 local deployment | ✅ shipped |
+| 3.3 | Log rotation polish | ✅ shipped |
+| 3.4 | README rewrite (this file) | ✅ shipped |
+| 3.5 | Mainnet promotion gate (confirmation dialog) | ⏳ pending |
+| 4   | Go live — wire CP's real Discord, onboard on testnet, then mainnet | ⏳ pending |
+| 5   | Parking lot — weekly perf report, VPS, CI/CD, backtest tooling | ⏳ later |
+
+Full phase breakdown: [`docs/REWORK_BRIEF.md`](docs/REWORK_BRIEF.md).
