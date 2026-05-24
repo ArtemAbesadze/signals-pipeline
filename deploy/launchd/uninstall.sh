@@ -1,18 +1,20 @@
 #!/bin/sh
-# Tear down the potion-perps-bot launchd agent (Phase 3.2).
+# Uninstall launchd agent(s).
 #
-# Idempotent: safe to run when the agent is not installed.
+# Usage:
+#   uninstall.sh             # uninstall main bot (default)
+#   uninstall.sh bot         # uninstall main bot
+#   uninstall.sh forwarder   # uninstall Telethon forwarder
+#   uninstall.sh all         # uninstall both
 #
-# What it does:
-#   1. `launchctl bootout` the running service (ignore "not loaded").
-#   2. Remove ~/Library/LaunchAgents/local.potion-perps-bot.plist.
+# Idempotent — safe to run when an agent is not installed.
 
 set -eu
 
-LABEL="local.potion-perps-bot"
-TARGET="${HOME}/Library/LaunchAgents/${LABEL}.plist"
+MODE="${1:-bot}"
+TARGET_DIR="${HOME}/Library/LaunchAgents"
 UID_NUM="$(id -u)"
-SERVICE="gui/${UID_NUM}/${LABEL}"
+DOMAIN="gui/${UID_NUM}"
 
 case "$(uname -s)" in
     Darwin) ;;
@@ -22,13 +24,36 @@ case "$(uname -s)" in
         ;;
 esac
 
-launchctl bootout "${SERVICE}" 2>/dev/null || true
-launchctl unload "${TARGET}" 2>/dev/null || true
+_uninstall_agent() {
+    label="$1"
+    target="${TARGET_DIR}/${label}.plist"
+    service="${DOMAIN}/${label}"
 
-if [ -f "${TARGET}" ]; then
-    rm -f "${TARGET}"
-    echo "Removed ${TARGET}"
-else
-    echo "No plist at ${TARGET}, nothing to remove"
-fi
-echo "Uninstalled ${LABEL}"
+    launchctl bootout "${service}" 2>/dev/null || true
+    launchctl unload "${target}" 2>/dev/null || true
+
+    if [ -f "${target}" ]; then
+        rm -f "${target}"
+        echo "Removed ${target}"
+    else
+        echo "No plist at ${target}, nothing to remove"
+    fi
+    echo "Uninstalled ${label}"
+}
+
+case "${MODE}" in
+    bot)
+        _uninstall_agent "local.potion-perps-bot"
+        ;;
+    forwarder)
+        _uninstall_agent "local.potion-perps-forwarder"
+        ;;
+    all)
+        _uninstall_agent "local.potion-perps-bot"
+        _uninstall_agent "local.potion-perps-forwarder"
+        ;;
+    *)
+        echo "Usage: $0 [bot|forwarder|all]" >&2
+        exit 1
+        ;;
+esac

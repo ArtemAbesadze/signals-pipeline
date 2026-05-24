@@ -1,27 +1,30 @@
 #!/bin/sh
-# Install the launchd agent that runs potion-perps-bot 24/7 (Phase 3.2).
+# Install launchd agent(s) for potion-perps-bot (Phase 3.2 + 4.1).
 #
-# Idempotent: re-running this script tears down any previous instance and
-# installs the current one. Safe to run after a `git pull`.
+# Usage:
+#   install.sh              # install main bot (default — same as Phase 3.2)
+#   install.sh bot          # install main bot
+#   install.sh forwarder    # install Telethon forwarder (Phase 4.1)
+#   install.sh all          # install both
 #
-# What it does:
-#   1. Resolve PROJECT_DIR from this script's location (no hard-coding).
-#   2. Resolve PYTHON via `command -v python3`, refuse if < 3.10.
-#   3. Render the plist template into ~/Library/LaunchAgents/.
-#   4. `launchctl bootout` any previous agent (ignore "not loaded" errors).
-#   5. `launchctl bootstrap` the new plist into the user's GUI session.
-#   6. Print the status/log/uninstall commands.
+# Idempotent: re-running tears down any previous instance and reinstalls.
+# Safe to run after a `git pull`.
+#
+# Two agents:
+#   - local.potion-perps-bot       — main trading bot (main.py)
+#   - local.potion-perps-forwarder — Telethon @PotionScannerBot DM relay
+#                                    (scripts/telethon_forwarder.py)
 
 set -eu
 
-LABEL="local.potion-perps-bot"
+MODE="${1:-bot}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-TEMPLATE="${SCRIPT_DIR}/${LABEL}.plist.template"
 TARGET_DIR="${HOME}/Library/LaunchAgents"
-TARGET="${TARGET_DIR}/${LABEL}.plist"
+UID_NUM="$(id -u)"
+DOMAIN="gui/${UID_NUM}"
 
-# --- 1. macOS check ------------------------------------------------
+# --- macOS check ---
 case "$(uname -s)" in
     Darwin) ;;
     *)
@@ -30,7 +33,7 @@ case "$(uname -s)" in
         ;;
 esac
 
-# --- 2. Resolve & version-check python3 ----------------------------
+# --- Resolve & version-check python3 ---
 PYTHON="$(command -v python3 || true)"
 if [ -z "${PYTHON}" ]; then
     echo "error: python3 not found on PATH" >&2
@@ -47,50 +50,105 @@ if [ "${PYMAJOR}" -lt 3 ] || { [ "${PYMAJOR}" -eq 3 ] && [ "${PYMINOR}" -lt 10 ]
     exit 1
 fi
 
-# --- 3. Sanity-check repo layout -----------------------------------
-if [ ! -f "${PROJECT_DIR}/main.py" ]; then
-    echo "error: main.py not found at ${PROJECT_DIR}/main.py" >&2
-    exit 1
-fi
-if [ ! -f "${TEMPLATE}" ]; then
-    echo "error: plist template missing: ${TEMPLATE}" >&2
-    exit 1
-fi
-if [ ! -x "${SCRIPT_DIR}/run.sh" ]; then
-    echo "error: deploy/launchd/run.sh is missing or not executable" >&2
-    exit 1
-fi
 mkdir -p "${PROJECT_DIR}/logs"
 mkdir -p "${TARGET_DIR}"
 
-# --- 4. Render the plist -------------------------------------------
-# sed delimiter is '|' to avoid escaping '/' in paths.
-sed \
-    -e "s|{{PROJECT_DIR}}|${PROJECT_DIR}|g" \
-    -e "s|{{PYTHON}}|${PYTHON}|g" \
-    "${TEMPLATE}" > "${TARGET}.tmp"
-mv "${TARGET}.tmp" "${TARGET}"
+_install_agent() {
+    label="$1"
+    template_name="$2"
+    wrapper="$3"
+    entrypoint="$4"
 
-# --- 5. (Re)load via launchctl -------------------------------------
-UID_NUM="$(id -u)"
-DOMAIN="gui/${UID_NUM}"
-SERVICE="${DOMAIN}/${LABEL}"
+    template="${SCRIPT_DIR}/${template_name}"
+    target="${TARGET_DIR}/${label}.plist"
 
-# Best-effort teardown of any previous instance. Both `bootout` and the
-# legacy `unload` are tried; failures are expected and ignored.
-launchctl bootout "${SERVICE}" 2>/dev/null || true
-launchctl unload "${TARGET}" 2>/dev/null || true
+    if [ ! -f "${template}" ]; then
+        echo "error: plist template missing: ${template}" >&2
+        return 1
+    fi
+    if [ ! -f "${PROJECT_DIR}/${entrypoint}" ]; then
+        echo "error: entrypoint missing: ${PROJECT_DIR}/${entrypoint}" >&2
+        return 1
+    fi
+    if [ ! -x "${SCRIPT_DIR}/${wrapper}" ]; then
+        echo "error: ${wrapper} is missing or not executable" >&2
+        return 1
+    fi
 
-launchctl bootstrap "${DOMAIN}" "${TARGET}"
+    # Render the plist
+    sed \
+        -e "s|{{PROJECT_DIR}}|${PROJECT_DIR}|g" \
+        -e "s|{{PYTHON}}|${PYTHON}|g" \
+        "${template}" > "${target}.tmp"
+    mv "${target}.tmp" "${target}"
+
+    # Reload — bootout any prior instance, ignore "not loaded" errors
+    service="${DOMAIN}/${label}"
+    launchctl bootout "${service}" 2>/dev/null || true
+    launchctl unload "${target}" 2>/dev/null || true
+
+    launchctl bootstrap "${DOMAIN}" "${target}"
+    echo "Installed ${label} at ${target}"
+}
+
+_check_session_file() {
+    # The forwarder needs an interactive first-run sign-in to create the
+    # Telethon session. Without it the agent will crash and respawn forever
+    # at ThrottleInterval=30. Warn but don't refuse — the user might be
+    # about to do the sign-in immediately.
+    session_file="${PROJECT_DIR}/data/.telethon_session"
+    if [ ! -f "${session_file}" ] && [ ! -f "${session_file}.session" ]; then
+        cat >&2 <<EOF
+warning: no Telethon session file at ${session_file}
+   The forwarder needs an interactive first-run sign-in:
+       cd ${PROJECT_DIR} && python3 scripts/telethon_forwarder.py
+   Telegram sends an SMS code; entering it saves the session. Once the
+   session exists, the launchd agent runs non-interactively.
+EOF
+    fi
+}
+
+case "${MODE}" in
+    bot)
+        _install_agent \
+            "local.potion-perps-bot" \
+            "local.potion-perps-bot.plist.template" \
+            "run.sh" "main.py"
+        ;;
+    forwarder)
+        _check_session_file
+        _install_agent \
+            "local.potion-perps-forwarder" \
+            "local.potion-perps-forwarder.plist.template" \
+            "forwarder_run.sh" "scripts/telethon_forwarder.py"
+        ;;
+    all)
+        _install_agent \
+            "local.potion-perps-bot" \
+            "local.potion-perps-bot.plist.template" \
+            "run.sh" "main.py"
+        _check_session_file
+        _install_agent \
+            "local.potion-perps-forwarder" \
+            "local.potion-perps-forwarder.plist.template" \
+            "forwarder_run.sh" "scripts/telethon_forwarder.py"
+        ;;
+    *)
+        echo "Usage: $0 [bot|forwarder|all]" >&2
+        exit 1
+        ;;
+esac
 
 cat <<EOF
-Installed ${LABEL} at ${TARGET}
 
 Useful commands:
-    Status:    launchctl print ${SERVICE} | head -20
-    Tail logs: tail -f ${PROJECT_DIR}/logs/bot.log
-    Restart:   launchctl kickstart -k ${SERVICE}
-    Uninstall: ${SCRIPT_DIR}/uninstall.sh
+    Status (bot):       launchctl print ${DOMAIN}/local.potion-perps-bot | head -20
+    Status (forwarder): launchctl print ${DOMAIN}/local.potion-perps-forwarder | head -20
+    Tail bot log:       tail -f ${PROJECT_DIR}/logs/bot.log
+    Tail forwarder:     tail -f ${PROJECT_DIR}/logs/forwarder.err
+    Restart bot:        launchctl kickstart -k ${DOMAIN}/local.potion-perps-bot
+    Restart forwarder:  launchctl kickstart -k ${DOMAIN}/local.potion-perps-forwarder
+    Uninstall:          ${SCRIPT_DIR}/uninstall.sh all
 
 Sleep note: caffeinate -i prevents idle sleep, but lid-closed-on-battery
 can still sleep the machine. See deploy/launchd/README.md.

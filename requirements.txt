@@ -9,6 +9,11 @@ cryptography
 aiohttp
 discord.py
 python-telegram-bot>=20.7
+# Telethon: user-account client for the @PotionScannerBot DM forwarder
+# (scripts/telethon_forwarder.py). Bot API can't observe other bots'
+# outbound DMs — only a recipient can — so the forwarder runs on a
+# personal account.
+telethon
 
 # File watching
 watchdog

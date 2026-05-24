@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    launchd agent for the Telethon forwarder (Phase 4.1).
+
+    Runs scripts/telethon_forwarder.py as the user, alongside the main
+    trading-bot agent. Subscribes to @PotionScannerBot DMs and relays them
+    into the private channel where the trading bot is admin.
+
+    Same restart policy as the main bot: respawn on crash, respect clean
+    exits, throttle to keep crash loops from hammering Telegram.
+
+    Tokens substituted by deploy/launchd/install.sh at install time:
+        {{PROJECT_DIR}} — absolute path to the repo root
+        {{PYTHON}}      — absolute path to python3 (resolved at install)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.potion-perps-forwarder</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{PROJECT_DIR}}/deploy/launchd/forwarder_run.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>{{PROJECT_DIR}}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONBIN</key>
+        <string>{{PYTHON}}</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>{{PROJECT_DIR}}/logs/forwarder.out</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{PROJECT_DIR}}/logs/forwarder.err</string>
+</dict>
+</plist>

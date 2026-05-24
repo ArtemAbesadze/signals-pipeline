@@ -183,6 +183,10 @@ data/
 # Encryption key
 data/.encryption_key
 
+# Telethon session — user-account credentials for the @PotionScannerBot
+# forwarder. Treat as if it were a password (full account access).
+data/.telethon_session*
+
 # Logs
 logs/
 

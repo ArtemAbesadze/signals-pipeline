@@ -1,49 +1,83 @@
-# launchd deployment (Phase 3.2)
+# launchd deployment (Phase 3.2 + Phase 4.1)
 
-Runs `potion-perps-bot` 24/7 on macOS as a user-level launchd agent. Survives
-crashes (auto-respawn) and reboots (auto-start on login).
+Runs `potion-perps-bot` 24/7 on macOS as user-level launchd agents. Survives
+crashes (auto-respawn) and reboots (auto-start on login). Two agents:
 
-> The project's main `README.md` is frozen during the rework and gets a full
-> rewrite in Phase 3.4. The operational notes below will migrate there at that
-> point; for now this file is the source of truth.
+| Label | Purpose |
+|---|---|
+| `local.potion-perps-bot` | Main trading bot — `python3 main.py` |
+| `local.potion-perps-forwarder` | Telethon @PotionScannerBot DM relay — `python3 scripts/telethon_forwarder.py` (Phase 4.1) |
+
+The forwarder exists because Telegram's Bot API can't observe another bot's
+outbound DMs. To capture @PotionScannerBot's signals we have to BE a
+recipient — a personal Telegram account (Telethon) subscribes to the bot and
+relays each DM into a private channel the trading bot reads.
 
 ## Install
 
 ```sh
-deploy/launchd/install.sh
+deploy/launchd/install.sh             # bot only (default — Phase 3 behavior)
+deploy/launchd/install.sh forwarder   # forwarder only
+deploy/launchd/install.sh all         # both
 ```
 
 The script:
 - Resolves the absolute path to `python3` (refuses if < 3.10).
-- Renders `local.potion-perps-bot.plist.template` into
-  `~/Library/LaunchAgents/local.potion-perps-bot.plist`.
-- Loads the agent into your GUI session via `launchctl bootstrap`.
+- Renders the appropriate plist template(s) into
+  `~/Library/LaunchAgents/`.
+- Loads the agent(s) via `launchctl bootstrap`.
 
-It's idempotent — re-run it after a `git pull` or a Python upgrade to
-re-render and re-bootstrap.
+Idempotent — re-run after a `git pull` or Python upgrade.
+
+### One-time Telethon setup (before installing the forwarder)
+
+The forwarder needs an interactive sign-in to produce a session file
+(`data/.telethon_session`). Without it the launchd agent will crash-respawn
+forever. From the repo root:
+
+```sh
+python3 scripts/telethon_forwarder.py
+```
+
+Telegram sends an SMS / app code; enter it at the prompt. The session file is
+written with `0600` permissions and `.gitignore`'d. Subsequent runs (and the
+launchd agent) are non-interactive.
+
+`install.sh forwarder` warns and continues if the session file is missing —
+the agent will keep crashing until you run the interactive sign-in, but
+nothing else breaks.
 
 ## Uninstall
 
 ```sh
-deploy/launchd/uninstall.sh
+deploy/launchd/uninstall.sh             # bot only
+deploy/launchd/uninstall.sh forwarder   # forwarder only
+deploy/launchd/uninstall.sh all         # both
 ```
 
-Tears down the agent and removes the installed plist. Idempotent.
+Tears down the agent(s) and removes the installed plist(s). Idempotent.
 
 ## Status, logs, restart
 
 ```sh
-# Is it running? (PID, last exit code, restart count)
+# Is the bot running?
 launchctl print gui/$(id -u)/local.potion-perps-bot | head -20
+# Is the forwarder running?
+launchctl print gui/$(id -u)/local.potion-perps-forwarder | head -20
 
 # Live application logs (structlog rotating files)
 tail -f logs/bot.log
 
-# Early-startup crashes (before structlog initialises — config / import errors)
+# Forwarder logs — Telethon writes via the default stdlib logger to launchd's
+# stdout/err, so the wrapper-rotated files are where to look
+tail -f logs/forwarder.err
+
+# Pre-structlog crashes (config / import errors) for the bot
 tail -f logs/launchd.err
 
 # Manual restart without uninstalling
 launchctl kickstart -k gui/$(id -u)/local.potion-perps-bot
+launchctl kickstart -k gui/$(id -u)/local.potion-perps-forwarder
 ```
 
 ## Log files & rotation
@@ -112,10 +146,12 @@ source DB. Real DR — an offsite copy step — is parked for Phase 5.
 
 | File | Purpose |
 |---|---|
-| `local.potion-perps-bot.plist.template` | Plist with `{{PROJECT_DIR}}` / `{{PYTHON}}` placeholders |
-| `run.sh` | Wrapper invoked by launchd — execs `caffeinate -i $PYTHONBIN main.py` |
-| `install.sh` | Renders the plist, bootstraps the service |
-| `uninstall.sh` | Bootouts the service, removes the installed plist |
+| `local.potion-perps-bot.plist.template` | Bot agent plist (token-substituted at install) |
+| `local.potion-perps-forwarder.plist.template` | Forwarder agent plist |
+| `run.sh` | Bot wrapper — `exec caffeinate -i $PYTHONBIN main.py` |
+| `forwarder_run.sh` | Forwarder wrapper — `exec caffeinate -i $PYTHONBIN scripts/telethon_forwarder.py` |
+| `install.sh` | Renders plist(s), bootstraps service(s). Mode: `bot` / `forwarder` / `all` |
+| `uninstall.sh` | Bootouts service(s), removes installed plist(s). Same modes |
 | `README.md` | This file |
 
 ## What lives outside the repo after install
