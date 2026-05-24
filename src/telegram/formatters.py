@@ -16,6 +16,21 @@ def _format_time_et(dt: datetime | None) -> str:
     return ny_dt.strftime("%b %d, %-I:%M %p ET")
 
 
+# Telegram legacy-Markdown specials. Data-controlled strings (display
+# names, preset names, anything from user_db/decision_snapshot) must be
+# escaped or wrapped in a code span before interpolation — otherwise a
+# stray `_` or `*` opens an entity that never closes and Telegram rejects
+# the whole message with `Can't parse entities`.
+_MD_ESCAPE_CHARS = frozenset("_*`[")
+
+
+def _md_escape(s: str) -> str:
+    """Escape Telegram legacy-Markdown specials in data-controlled text."""
+    if not s:
+        return s
+    return "".join(f"\\{ch}" if ch in _MD_ESCAPE_CHARS else ch for ch in str(s))
+
+
 def mask_address(address: str) -> str:
     """Show first 6 and last 4 chars of an address: 0x1234...abcd."""
     if len(address) <= 10:
@@ -265,7 +280,7 @@ def format_audit_trail(trade: Any, events: list[Any], tz: ZoneInfo = _NY) -> str
 
         snap_lines = [
             f"\n🧠 *Decision at open{opened_str}*",
-            f"  Preset: {snap.get('preset', '—')}",
+            f"  Preset: `{snap.get('preset', '—')}`",
             f"  Risk: {snap.get('risk_level', '—')} → size_pct = {snap.get('size_pct_applied', '—')}%",
             f"  Port: {format_usd(snap.get('port_usd_at_open', 0))} ({snap.get('port_mode', '—')})"
             f" | Wallet: {format_usd(snap.get('wallet_usd_at_open', 0))}",
@@ -383,9 +398,9 @@ def format_main_menu(
         cp_section = "📡 *Recent CP:* nothing yet"
 
     return (
-        f"🧪 *Potion Perps* — Hey {display_name}!\n\n"
+        f"🧪 *Potion Perps* — Hey {_md_escape(display_name)}!\n\n"
         f"{port_line}\n"
-        f"{pipeline_text}  |  ⚡ Auto: {auto_text}  |  🎯 {preset_name}\n\n"
+        f"{pipeline_text}  |  ⚡ Auto: {auto_text}  |  🎯 `{preset_name}`\n\n"
         f"{open_section}\n\n"
         f"{today_section}\n\n"
         f"{cp_section}"

@@ -327,7 +327,7 @@ def _build_config_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> str:
 
     return (
         "⚙️ *Configuration*\n\n"
-        f"🎯 Strategy: {preset}{tp_desc}\n"
+        f"🎯 Strategy: `{preset}`{tp_desc}\n"
         f"⚡ Auto-execute: {auto}\n"
         f"📊 Max Leverage: {lev}x\n\n"
         "🔒 *Risk Limits*\n"

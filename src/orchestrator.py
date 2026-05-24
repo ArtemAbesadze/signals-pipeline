@@ -73,8 +73,8 @@ class Orchestrator:
             for user in active_users:
                 try:
                     self.activate_user(user.user_id)
-                except Exception as e:
-                    logger.error("Failed to activate user %s on startup: %s", user.user_id, e)
+                except Exception:
+                    logger.exception("Failed to activate user %s on startup", user.user_id)
             logger.info("Orchestrator started with %d user(s)", len(self._pipelines))
         elif os.getenv("HL_ACCOUNT_ADDRESS"):
             # Backward compatibility: single-user mode from .env

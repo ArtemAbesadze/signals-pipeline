@@ -127,6 +127,34 @@ class TestFormatMainMenu:
         assert "+45.00%" in text
         assert "3 closed" in text
 
+    def test_preset_with_underscore_safe_markdown(self):
+        """Built-in preset names like `even_split` contain underscores. They
+        must render as a backtick code span — otherwise the `_` opens an
+        italic entity that never closes and Telegram rejects the whole
+        message with `Can't parse entities`."""
+        text = format_main_menu(
+            display_name="Artem",
+            port_state={"port_usd": None, "port_mode": "withdraw", "port_watermark": None},
+            wallet_usd=1000.0, pipeline_active=True, auto_execute=False,
+            preset_name="even_split",
+            open_trades=[], today_count_closed=0, today_total_pnl_pct=0.0,
+            today_wins=0, today_losses=0, recent_events=[],
+        )
+        assert "`even_split`" in text
+
+    def test_display_name_with_underscore_escaped(self):
+        """A `_` in the display name would open an italic entity — must be
+        backslash-escaped to render literally."""
+        text = format_main_menu(
+            display_name="Test_User",
+            port_state={"port_usd": None, "port_mode": "withdraw", "port_watermark": None},
+            wallet_usd=1000.0, pipeline_active=True, auto_execute=False,
+            preset_name="hybrid",
+            open_trades=[], today_count_closed=0, today_total_pnl_pct=0.0,
+            today_wins=0, today_losses=0, recent_events=[],
+        )
+        assert "Test\\_User" in text
+
     def test_recent_cp_events(self):
         events = [
             _ev(EventType.TP_HIT, "TP1 +13.93%; SL moved to entry", hour=16),
@@ -258,6 +286,21 @@ class TestFormatAuditTrail:
         assert "Events" in text
         assert "opened size=$40 lev=14x" in text
         assert "TP1 +13.93%" in text
+
+    def test_preset_with_underscore_safe_markdown(self):
+        """Audit trail renders preset name from decision_snapshot; same
+        underscore-vs-italic hazard as the main menu — wrap in backticks."""
+        snap = {
+            "preset": "even_split", "size_pct_applied": 4.0,
+            "port_usd_at_open": 1000.0, "port_mode": "compound",
+            "risk_level": "LOW", "leverage_applied": 14, "leverage_signal": 14,
+            "position_size_usd": 40.0, "exposure_used_pct": 4.0,
+            "wallet_usd_at_open": 1100.0,
+            "why": "test",
+        }
+        trade = self._make_trade(snapshot=snap)
+        text = format_audit_trail(trade, events=[])
+        assert "`even_split`" in text
 
     def test_no_snapshot_falls_back(self):
         trade = self._make_trade(snapshot=None)

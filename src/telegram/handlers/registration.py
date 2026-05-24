@@ -304,7 +304,7 @@ async def _complete_registration(
     await progress(
         "🎉 *Registration Complete!*\n\n"
         f"Network: {network_label}\n"
-        f"🎯 Strategy: even_split (33/33/34)\n"
+        f"🎯 Strategy: `even_split` (33/33/34)\n"
         f"⚡ Auto-execute: OFF\n"
         f"📊 Max leverage: 20x\n"
         f"💰 Position cap: ${cap:.0f}\n\n"

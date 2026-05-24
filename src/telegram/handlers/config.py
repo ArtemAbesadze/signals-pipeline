@@ -33,7 +33,7 @@ def _format_config(cfg: dict, account_block: str | None = None) -> str:
 
     text = (
         "⚙️ *Configuration*\n\n"
-        f"🎯 Strategy: {preset}{tp_desc}\n"
+        f"🎯 Strategy: `{preset}`{tp_desc}\n"
         f"⚡ Auto-execute: {auto}\n"
         f"📊 Max Leverage: {lev}x\n\n"
         "🔒 *Risk Limits*\n"
@@ -95,7 +95,7 @@ async def preset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     p = BUILTIN_PRESETS[name]
     tp_pcts = [int(x * 100) for x in p.tp_split]
     await update.message.reply_text(
-        f"🎯 Preset changed to *{name}* ({tp_pcts[0]}/{tp_pcts[1]}/{tp_pcts[2]})",
+        f"🎯 Preset changed to `{name}` ({tp_pcts[0]}/{tp_pcts[1]}/{tp_pcts[2]})",
         parse_mode="Markdown",
     )
 
@@ -147,7 +147,7 @@ async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         cfg = user_db.get_user_config(user_id)
         account_block = _build_account_block(user_db, user_id)
         text = _format_config(cfg, account_block)
-        text += f"\n\n_🎯 Changed to {name} ({tp_pcts[0]}/{tp_pcts[1]}/{tp_pcts[2]})_"
+        text += f"\n\n_🎯 Changed to_ `{name}` _({tp_pcts[0]}/{tp_pcts[1]}/{tp_pcts[2]})_"
         await query.edit_message_text(
             text, parse_mode="Markdown", reply_markup=config_menu_keyboard(),
         )
