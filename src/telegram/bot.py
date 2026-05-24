@@ -102,7 +102,17 @@ class TelegramBot:
 
         await self._app.initialize()
         await self._app.start()
-        await self._app.updater.start_polling(drop_pending_updates=True)
+        # ``allowed_updates=Update.ALL_TYPES`` is non-default. Without it,
+        # Telegram does NOT push ``channel_post`` / ``edited_channel_post``
+        # events to ``getUpdates`` — they're excluded from the default
+        # subscription. The TelegramChannelAdapter (Phase 4.1) depends on
+        # channel_post, so we have to opt in explicitly. Asking for the
+        # full set also future-proofs us against new update types — the
+        # bot's own handlers ignore anything they don't have a matcher for.
+        await self._app.updater.start_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )
 
         # Register command menu (autocomplete suggestions when typing /)
         await self._app.bot.set_my_commands([

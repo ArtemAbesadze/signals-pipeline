@@ -39,8 +39,16 @@ def forwarder():
 
 
 @pytest.fixture
-def valid_env(monkeypatch):
-    """Set all required env vars to plausible values."""
+def valid_env(monkeypatch, forwarder):
+    """Set all required env vars to plausible values.
+
+    Also disables ``load_dotenv()`` inside the forwarder module — otherwise
+    ``read_config()`` reloads the real ``.env`` from disk and re-introduces
+    any vars we just ``monkeypatch.delenv``'d, defeating the missing-var
+    test cases on machines where the operator has already configured the
+    forwarder.
+    """
+    monkeypatch.setattr(forwarder, "load_dotenv", lambda: None)
     monkeypatch.setenv("TG_API_ID", "12345678")
     monkeypatch.setenv("TG_API_HASH", "0123456789abcdef0123456789abcdef")
     monkeypatch.setenv("TG_PHONE", "+15551234567")
