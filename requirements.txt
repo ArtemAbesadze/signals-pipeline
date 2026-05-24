@@ -1,5 +1,5 @@
 # Core
-hyperliquid-python-sdk
+hyperliquid-python-sdk>=0.23.0
 pydantic
 pyyaml
 python-dotenv
