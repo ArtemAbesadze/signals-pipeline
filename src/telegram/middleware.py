@@ -78,7 +78,15 @@ def check_rate_limit(user_id: int) -> bool:
 
 
 async def dm_only_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Pre-handler check: ignore messages from group chats."""
+    """Pre-handler check: ignore messages from group chats.
+
+    Channel posts and edited channel posts are passed through — they're a
+    legitimate signal source when ``input.adapter: telegram_channel`` is
+    in use (the bot listens to a private channel that mirrors CP signals).
+    """
+    # Channel posts: pass through. Not a user typing in a group chat.
+    if update.channel_post is not None or update.edited_channel_post is not None:
+        return
     if not update.effective_chat or update.effective_chat.type == "private":
         return
     # Non-private chat — block

@@ -160,8 +160,30 @@ async def run(config: Config) -> None:
             channel_id=config.discord.channel_id,
             source_bot_name=config.discord.source_bot_name,
         )
+    elif adapter_name == "telegram_channel":
+        # Listen for channel_post updates from the configured channel via
+        # the existing TelegramBot.Application (shared polling — we can't
+        # run a second getUpdates loop on the same token).
+        from src.input.telegram_channel_adapter import TelegramChannelAdapter
+        if telegram_bot is None:
+            logger.error(
+                "adapter='telegram_channel' requires TELEGRAM_BOT_TOKEN in .env "
+                "(the bot drives the gateway polling)",
+            )
+            return
+        if config.telegram.signals_channel_id is None:
+            logger.error(
+                "adapter='telegram_channel' requires telegram.signals_channel_id "
+                "in config.yaml (the channel the bot listens to)",
+            )
+            return
+        adapter = TelegramChannelAdapter(channel_id=config.telegram.signals_channel_id)
+        adapter.attach(telegram_bot._app)
     else:
-        logger.error("Unknown adapter: %s (use 'cli', 'simulation', or 'discord')", adapter_name)
+        logger.error(
+            "Unknown adapter: %s (use 'cli', 'simulation', 'discord', or 'telegram_channel')",
+            adapter_name,
+        )
         return
 
     logger.info(

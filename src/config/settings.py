@@ -229,6 +229,11 @@ class TelegramConfig:
 
     bot_token: str = ""
     admin_ids: list[int] = field(default_factory=list)
+    # When ``input.adapter: telegram_channel`` is set, the bot listens for
+    # ``channel_post`` updates from this channel and dispatches them through
+    # the pipeline. Numeric ID (e.g. ``-1001234567890``). The bot must be
+    # added as admin of the channel before this works.
+    signals_channel_id: int | None = None
 
 
 @dataclass
@@ -366,6 +371,7 @@ def load_config(
         telegram=TelegramConfig(
             bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
             admin_ids=_parse_admin_ids(os.getenv("TELEGRAM_ADMIN_IDS", "")),
+            signals_channel_id=yaml_data.get("telegram", {}).get("signals_channel_id"),
         ),
         backups=_build_dataclass(BackupConfig, yaml_data.get("backups", {})),
     )

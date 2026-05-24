@@ -3,7 +3,7 @@
 
 # --- Signal input ---
 input:
-  adapter: simulation              # simulation | cli | file | discord
+  adapter: simulation              # simulation | cli | file | discord | telegram_channel
   signals_dir: signals/incoming/   # file adapter drop zone
   simulation_dir: signals/samples/ # replay directory for simulation adapter
   simulation_delay_sec: 5          # seconds between replayed signals
@@ -103,3 +103,15 @@ logging:
 discord:
   channel_id: ""                   # Discord channel to monitor
   source_bot_name: "Potion Perps"  # name of the signal bot to listen to
+
+# --- Telegram bot ---
+# Bot token + admin IDs come from .env (TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_IDS).
+# signals_channel_id is non-secret config: when ``input.adapter: telegram_channel``,
+# the bot listens for posts in this private channel and dispatches them through
+# the pipeline. One-time setup:
+#   1. Create a private Telegram channel
+#   2. Add the bot as admin with "Post Messages" + read permissions
+#   3. Post any message in the channel, forward to @userinfobot, copy the
+#      numeric chat_id (typically of the form -100xxxxxxxxxx)
+telegram:
+  signals_channel_id:              # e.g. -1001234567890

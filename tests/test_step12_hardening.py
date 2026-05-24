@@ -33,6 +33,12 @@ def _make_update(chat_type="private", has_message=True):
     update = MagicMock()
     update.effective_chat.type = chat_type
     update.effective_user.id = 12345
+    # Mirror real PTB Update defaults — these attrs are None unless we're
+    # specifically testing channel-post behavior. Without this, MagicMock
+    # auto-creates truthy children and dm_only_filter's channel-post
+    # pass-through skips the group check.
+    update.channel_post = None
+    update.edited_channel_post = None
     if has_message:
         update.message = AsyncMock()
         update.message.reply_text = AsyncMock()
@@ -145,6 +151,34 @@ class TestDmOnlyFilter:
 
         with pytest.raises(ApplicationHandlerStop):
             await dm_only_filter(update, context)
+
+    @pytest.mark.asyncio
+    async def test_channel_post_passes_through(self):
+        """Channel posts are a legitimate signal source when
+        ``input.adapter: telegram_channel`` is on — must NOT be blocked
+        by the DM-only filter even though the source isn't a private chat."""
+        update = MagicMock()
+        update.effective_chat.type = "channel"
+        update.channel_post = MagicMock()
+        update.edited_channel_post = None
+        update.message = None
+        context = _make_context()
+
+        # Must not raise ApplicationHandlerStop
+        await dm_only_filter(update, context)
+
+    @pytest.mark.asyncio
+    async def test_edited_channel_post_passes_through(self):
+        """Same passthrough applies to edited_channel_post — we don't act
+        on edits (D5), but the filter shouldn't reject them either."""
+        update = MagicMock()
+        update.effective_chat.type = "channel"
+        update.channel_post = None
+        update.edited_channel_post = MagicMock()
+        update.message = None
+        context = _make_context()
+
+        await dm_only_filter(update, context)
 
 
 # ------------------------------------------------------------------
