@@ -33,6 +33,7 @@ def calculate_position_size(
     preset: StrategyPreset,
     strategy_config: StrategyConfig,
     risk_config: RiskConfig,
+    network: str = "mainnet",
 ) -> float:
     """Calculate the USD position size for a trade.
 
@@ -43,20 +44,29 @@ def calculate_position_size(
       1. size_by_risk[risk_level] if the risk level exists in the map
       2. preset.size_pct (the preset's default)
 
-    The result is then clamped to risk limits.
+    The result is then clamped to risk limits. On testnet, if the
+    calculated size would fall below the exchange minimum, the position
+    is bumped UP to ``risk_config.testnet_position_floor_usd`` (Phase
+    4.1) rather than skipped — lets us exercise the full pipeline
+    without funding the wallet to the level the risk-level math would
+    demand. Mainnet path is unchanged.
 
     Args:
         port_usd: User's currently allocated trading capital in USD.
         risk_level: Signal risk level ("LOW", "MEDIUM", "HIGH").
         preset: The active strategy preset.
         strategy_config: Strategy config (contains size_by_risk overrides).
-        risk_config: Risk limits (max/min position sizes).
+        risk_config: Risk limits (max/min position sizes + testnet floor).
+        network: Exchange network ("testnet" or "mainnet"). Default
+            mainnet so callers who don't specify get the conservative
+            "raise on below-min" behaviour.
 
     Returns:
         Position size in USD, ready to pass to build_orders().
 
     Raises:
-        PositionSizeError: If the calculated size is below the exchange minimum.
+        PositionSizeError: On mainnet only, if the calculated size is
+            below the exchange minimum.
     """
     # Resolve size percentage
     size_pct = strategy_config.size_by_risk.get(risk_level, preset.size_pct)
@@ -67,8 +77,20 @@ def calculate_position_size(
     # Clamp to max position size
     clamped_size = min(raw_size, risk_config.max_position_size_usd)
 
-    # Check minimum
+    # Below the exchange minimum: testnet bumps up to the floor, mainnet
+    # raises so we don't silently trade larger than the user configured.
     if clamped_size < risk_config.min_order_usd:
+        if network == "testnet" and risk_config.testnet_position_floor_usd > 0:
+            floored = min(
+                risk_config.testnet_position_floor_usd,
+                risk_config.max_position_size_usd,
+            )
+            logger.info(
+                "Position size: $%.2f (%.1f%% of port $%.2f, risk=%s) bumped "
+                "to testnet floor $%.2f",
+                clamped_size, size_pct, port_usd, risk_level, floored,
+            )
+            return floored
         raise PositionSizeError(
             f"Position size ${clamped_size:.2f} ({size_pct}% of port ${port_usd:.2f}) "
             f"is below minimum ${risk_config.min_order_usd:.2f}"

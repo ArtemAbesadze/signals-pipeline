@@ -241,11 +241,15 @@ class Pipeline:
                 ))
 
         # --- Calculate position size from port (not wallet — D1) ---
+        # Pass network so the testnet floor (Phase 4.1) can bump sub-min
+        # sizes UP to ``testnet_position_floor_usd`` instead of skipping
+        # the trade. Mainnet behaviour is unchanged — raises on below-min.
         size_warning: str | None = None
         try:
             position_size_usd = calculate_position_size(
                 port_usd, signal.risk_level.value, preset,
                 self._config.strategy, self._config.risk,
+                network=self._config.exchange.network,
             )
         except PositionSizeError as e:
             if auto_execute:

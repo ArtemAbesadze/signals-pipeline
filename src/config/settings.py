@@ -143,6 +143,21 @@ class RiskConfig:
     # purpose — perp price action makes signals go stale fast. See
     # CLAUDE.md memory for the rationale on the 5-minute default.
     mainnet_confirm_timeout_min: int = 5
+    # Phase 4.1 — testnet-only floor. When the sizing math comes out
+    # below ``min_order_usd`` on testnet, bump the position UP to this
+    # floor rather than skipping the trade. Lets us exercise the full
+    # pipeline on testnet without having to fund the wallet to the level
+    # the risk-level math would normally demand. Set to 0 to disable.
+    #
+    # Default $15 is chosen so that after Hyperliquid's per-asset
+    # ``szDecimals`` flooring, the notional comfortably clears the $10
+    # exchange minimum on every CP-listed coin (worst case is BTC at
+    # ~$100K with szDecimals=5 → $15 still notionalises to ~$14.65).
+    #
+    # **Mainnet path is unchanged** — sizing below min still raises
+    # ``PositionSizeError`` so we never silently trade larger than the
+    # user's risk math intended on real money.
+    testnet_position_floor_usd: float = 15.0
 
 
 @dataclass

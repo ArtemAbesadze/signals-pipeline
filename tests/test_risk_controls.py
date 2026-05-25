@@ -69,6 +69,94 @@ class TestPositionSizing:
 
 
 # ------------------------------------------------------------------
+# Testnet position floor (Phase 4.1)
+# ------------------------------------------------------------------
+
+class TestTestnetPositionFloor:
+    """Testnet-only: bump sub-minimum sizes UP to ``testnet_position_floor_usd``
+    rather than skipping the trade. Mainnet path stays the same — small
+    sizes raise so we don't silently trade larger than the user configured."""
+
+    def _preset(self):
+        return StrategyPreset(size_pct=2.0)
+
+    def _strategy(self):
+        return StrategyConfig(size_by_risk={"LOW": 4.0, "MEDIUM": 2.0, "HIGH": 1.0})
+
+    def _risk(self, **overrides):
+        kwargs = {
+            "max_position_size_usd": 500.0,
+            "min_order_usd": 10.0,
+            "testnet_position_floor_usd": 15.0,
+        }
+        kwargs.update(overrides)
+        return RiskConfig(**kwargs)
+
+    def test_testnet_bumps_below_min_up_to_floor(self):
+        """1% of $500 = $5, below $10 min — bumps to floor $15."""
+        size = calculate_position_size(
+            500.0, "HIGH", self._preset(), self._strategy(), self._risk(),
+            network="testnet",
+        )
+        assert size == 15.0
+
+    def test_testnet_no_bump_when_above_min(self):
+        """If math already clears the min, floor is NOT applied — user's
+        sizing intent is respected when it works on its own."""
+        size = calculate_position_size(
+            1000.0, "LOW", self._preset(), self._strategy(), self._risk(),
+            network="testnet",
+        )
+        assert size == 40.0
+
+    def test_mainnet_still_raises_below_min(self):
+        """Mainnet contract unchanged — never silently trade larger than
+        the user's risk-level math intended."""
+        with pytest.raises(PositionSizeError, match="below minimum"):
+            calculate_position_size(
+                500.0, "HIGH", self._preset(), self._strategy(), self._risk(),
+                network="mainnet",
+            )
+
+    def test_default_network_is_mainnet(self):
+        """If a caller forgets to pass network, default to mainnet
+        (conservative). The bug-prone direction would be defaulting to
+        testnet and silently up-bumping in prod."""
+        with pytest.raises(PositionSizeError, match="below minimum"):
+            calculate_position_size(
+                500.0, "HIGH", self._preset(), self._strategy(), self._risk(),
+            )
+
+    def test_testnet_floor_clamped_by_max_position(self):
+        """Floor can't exceed the user's per-position cap. Edge case: if
+        max < HL min, trade fires at the cap and fails downstream — but
+        that's a user-config inconsistency surfacing where it should."""
+        size = calculate_position_size(
+            500.0, "HIGH", self._preset(), self._strategy(),
+            self._risk(max_position_size_usd=12.0, testnet_position_floor_usd=15.0),
+            network="testnet",
+        )
+        assert size == 12.0
+
+    def test_testnet_floor_disabled_raises(self):
+        """Setting floor to 0 disables the feature even on testnet — gives
+        operators a way to opt out without changing network."""
+        with pytest.raises(PositionSizeError, match="below minimum"):
+            calculate_position_size(
+                500.0, "HIGH", self._preset(), self._strategy(),
+                self._risk(testnet_position_floor_usd=0.0),
+                network="testnet",
+            )
+
+    def test_testnet_floor_default_value(self):
+        """Default floor is $15 — chosen to clear HL's $10 min after
+        szDecimals flooring for every CP-listed coin. If anyone bumps the
+        default down, this test fails and they have to revisit the
+        szDecimals analysis in the field docstring."""
+        assert RiskConfig().testnet_position_floor_usd == 15.0
+
+
+# ------------------------------------------------------------------
 # Risk gate (check_risk_limits)
 # ------------------------------------------------------------------
 
