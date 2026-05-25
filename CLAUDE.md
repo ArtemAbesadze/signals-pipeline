@@ -105,11 +105,15 @@ Key files when something breaks:
 
 ## Current phase
 
-**Phase 4.1 is wired and partially validated.** Branch `rework/scope-v1`,
-HEAD is the CLAUDE.md commit immediately following `381bbc2`. The architecture
-pivot from direct Discord to a Telegram channel + Telethon forwarder is
-complete; end-to-end on a real CP signal is the last validation step before
-moving to Phase 4.2.
+**Phase 4.1 is validated end-to-end via `/inject` synthetic trades.**
+Branch `rework/scope-v1`, HEAD is the CLAUDE.md commit immediately
+following `016d57e`. The architecture pivot (Telegram channel + Telethon
+forwarder) is shipped; both launchd agents are running; one user (Artem)
+is onboarded on testnet with auto_execute=ON; the full chain
+(`/inject → orchestrator → pipeline → HL testnet → manual close`) has
+been exercised cleanly. The last piece — verifying the chain against a
+*real* CP signal flowing through @PotionScannerBot → forwarder → channel
+→ bot → trade — is just patience.
 
 Shipped (Phase 1–3.5):
 
@@ -129,7 +133,7 @@ Shipped (Phase 1–3.5):
 | 3.4 | `747eaeb` | README rewrite — operator's manual for the private-tool scope; full inventory of what's on disk, DB inspection recipes, cleanup commands, VPS migration playbook |
 | 3.5 | `0ee481f` | Mainnet promotion gate — typed `MAINNET` confirmation in `/register` + `/promote_to_mainnet`, big-trade Telegram confirmation dialog ($100 / 5-min defaults), ConfirmationSweeper background task |
 
-Phase 4.1 (this session, 2026-05-24):
+Phase 4.1 (sessions 2026-05-24 → 2026-05-25):
 
 | # | Commit | What |
 |---|---|---|
@@ -138,6 +142,8 @@ Phase 4.1 (this session, 2026-05-24):
 | 4.1c | `60deedc` | `TelegramChannelAdapter` — listens for `channel_post` via the existing bot's Application; dm_only_filter passthrough for channel posts |
 | 4.1d | `e68122a` | Telethon forwarder + second launchd agent; install.sh / uninstall.sh accept `bot \| forwarder \| all` modes |
 | 4.1e | `381bbc2` | `start_polling(allowed_updates=Update.ALL_TYPES)` — Telegram doesn't push `channel_post` by default; bug discovered during end-to-end testing |
+| 4.1f | `18d475e` | Hot-reload pipeline Config after Telegram setting edits — without this, `update_user_config(...)` updated the DB but the running pipeline kept its stale cached Config (`Pipeline.refresh_config` + `Orchestrator.refresh_user_config` + handler hooks) |
+| 4.1g | `d4d427e` + `016d57e` | Testnet position floor — on testnet, sub-min calculated sizes bump UP to `RiskConfig.testnet_position_floor_usd` (default $15) instead of skipping. Lets you exercise the full pipeline on testnet without funding the wallet to the level size-by-risk math demands. Broadened in `016d57e` to cover the gap where calc clears HL min but loses notional to `szDecimals` flooring downstream (MEDIUM at $500 port → $10 → $9.25 BTC notional → rejected). Mainnet path unchanged — still raises. |
 
 ### Phase 4.1 architecture pivot — why we're not on Discord
 
@@ -181,18 +187,19 @@ classify; ..."` on a real forwarded breakeven message in 2026-05-24
 session — `classify` returns `breakeven`, `parse_breakeven` returns the
 expected `Breakeven(pair='ETH/USDT', trade_id=2096, tp_secured=2)`.
 
-### Phase 4.1 — where we left off (end of 2026-05-24 session)
+### Phase 4.1 — where we left off (end of 2026-05-25 session)
 
-**Status: wiring is live; channel-side validated; forwarder→channel waiting on a real CP signal.**
+**Status: synthetic end-to-end validated; awaiting real CP signal to officially close 4.1.**
 
-Validated this session:
-- ✅ Telethon forwarder signed in as Artem (id `7441245554`), listening for DMs from `@PotionScannerBot` (id `8735069918`), forwarding to channel `-1003954991193`.
-- ✅ Main bot running with `adapter=telegram_channel`, 1 active pipeline (swaag). `TelegramChannelAdapter attached: channel_id=-1003954991193` appears in startup logs.
-- ✅ Channel → bot link verified: manual test post in "Potion Signals Mirror" produced `Classified message as: noise` in `logs/bot.log`.
+State of the world at session end:
 
-Pending verification (Step 2 below):
-- ⏳ Real CP signal flowing all the way through `forwarder → channel → bot → pipeline → trade_events`.
-- ⏳ Launchd installation of both agents (currently running foreground in two terminals).
+- ✅ Both launchd agents installed and `state=running`: `local.potion-perps-bot` + `local.potion-perps-forwarder`.
+- ✅ Telethon forwarder signed in as Artem (id `7441245554`), forwarding @PotionScannerBot DMs to channel `-1003954991193`.
+- ✅ Main bot running with `adapter=telegram_channel`, **2 active pipelines** (swaag + Artem).
+- ✅ Channel → bot link validated: manual channel posts classify as `noise` in `logs/bot.log`.
+- ✅ Full pipeline validated via `/inject`: signal classify → port check → size (with testnet floor) → build orders → HL testnet submission → manual close. Most recent successful trade IDs (synthetic, `80000-89999` range): **#80842 ETH LONG HIGH $15** (proves testnet floor works — HIGH=1%=$5 calc bumped to floor $15), **#88271 SOL SHORT LOW $20** (no floor needed).
+- ✅ Artem registered on testnet with master `0x274d87Ba5a72C322B8233a9dD30Aaba6500716DF`, api_wallet `0x9cbF9865652Aec91031cB339dc2de72a226dEdA7`, port $500 / withdraw, **auto_execute=ON** (user chose; mainnet gate doesn't apply).
+- ⏳ Real @PotionScannerBot CP signal flowing through end-to-end — still waiting on CP's cadence. Real CP trade_ids are < 80000 (CP is currently in the ~2000-3000 range).
 
 ### Picking up next session — concrete steps
 
@@ -200,96 +207,73 @@ Pending verification (Step 2 below):
 
 ```bash
 git branch --show-current                  # rework/scope-v1
-git log --oneline -6                       # HEAD = this CLAUDE.md commit, then 381bbc2 / e68122a / 60deedc / 1d1a196 / 82be37f
+git log --oneline -8                       # HEAD = this CLAUDE.md commit, then 016d57e / d4d427e / 18d475e / 381bbc2 / e68122a / 60deedc / 1d1a196 / 82be37f
 git status                                 # clean
-python3 -m pytest tests/ 2>&1 | tail -2    # 638 passed
+python3 -m pytest tests/ 2>&1 | tail -2    # 650 passed
 ```
 
-If any of these are off, stop and investigate before doing anything else.
+If any of these are off, stop and investigate.
 
-#### Step 1 — Are the two processes still alive?
+#### Step 1 — Are both launchd agents still running?
 
 ```bash
-ps aux | grep -E 'main\.py|telethon_forwarder' | grep -v grep
+launchctl print gui/$(id -u)/local.potion-perps-bot 2>&1 | grep -E 'state|last exit|pid' | head -3
+launchctl print gui/$(id -u)/local.potion-perps-forwarder 2>&1 | grep -E 'state|last exit|pid' | head -3
+ps aux | grep -E 'main\.py|telethon_forwarder' | grep -v grep | wc -l   # expect 4 (2 procs + 2 caffeinate wrappers)
 ```
 
-The laptop sleep gap is still real and a closed lid likely killed both processes overnight. Expected: zero or two processes. If zero, relaunch:
+If `state=running` for both → good. If anything else, `deploy/launchd/install.sh all` re-bootstraps.
+
+If the forwarder is in respawn-loop, it probably can't open `data/.telethon_session.session` — re-run interactively (`python3 scripts/telethon_forwarder.py`) to refresh the session, then reinstall.
+
+#### Step 2 — Did any real CP signals fire while you were away?
 
 ```bash
-# Terminal 1
-python3 main.py
-# Terminal 2 (in repo root)
-python3 scripts/telethon_forwarder.py
-```
-
-The forwarder should NOT prompt for a code — the session at `data/.telethon_session.session` is valid from last session. If it does prompt, the session was lost; re-do the interactive sign-in.
-
-#### Step 2 — Check for any CP signals that fired since last session
-
-```bash
+# CP trade_ids are < 80000; synthetic /inject IDs are 80000-89999.
 sqlite3 -header -column data/trades.db \
-  "SELECT occurred_at, event_type, substr(action_taken, 1, 70) AS action
-   FROM trade_events ORDER BY id DESC LIMIT 10;"
+  "SELECT trade_id, coin, side, status, close_reason, pnl_pct, created_at
+   FROM trades WHERE user_id='7441245554' AND trade_id < 80000
+   ORDER BY trade_id DESC LIMIT 10;"
 ```
 
-Any rows with `event_type` of `signal_alert`, `tp_hit`, `breakeven`, `stop_hit`, `cancel`, `trade_closed` etc. = Phase 4.1 is fully validated end-to-end. If only the manual `noise` event from last session is there, keep both processes running and wait — or trigger another channel→bot test by posting in the channel manually.
+Any rows here = **Phase 4.1 is officially closed** (real CP → live trade chain validated). Audit one of them end-to-end per the README's recipe to be thorough, then move to step 4.
 
-When a real signal arrives, expected log chain:
-- `logs/forwarder.err` (or terminal): `Forwarded N-char message to channel -1003954991193`
-- `logs/bot.log`: `--- Incoming message (N chars) ---` → `Classified message as: <type>`
-- For `signal_alert`: a `trade_events` row with `action_taken='skipped: port not configured'` (because swaag has no port set — see Step 4 notes).
+No rows = keep waiting. While you wait, optionally do step 3 (polish backlog).
 
-#### Step 3 — Move both processes to launchd
+#### Step 3 — Polish backlog (do anytime; not blocking)
 
-Once Step 2 confirms a real CP signal flowed end-to-end:
+These came up during 4.1 but aren't worth interrupting flow for. Pick when you've got 15 minutes between signals:
 
-```bash
-# Stop foreground processes first (Ctrl+C in both terminals).
-deploy/launchd/install.sh all
-# Verify
-launchctl print gui/$(id -u)/local.potion-perps-bot | head -10
-launchctl print gui/$(id -u)/local.potion-perps-forwarder | head -10
-tail -f logs/bot.log logs/forwarder.err
-```
+- **Drop XRP from `_INJECT_COINS`** in `src/telegram/handlers/admin.py` (or filter against `client.get_asset_meta()` at startup) — `/inject` shouldn't pick coins that aren't on the user's network. Bit us once on 2026-05-25; harmless skip but ugly.
+- **Add an HL-side wallet-authorization check to `/register`.** `client.get_account_state()` (the current validation) is a read op that passes even if the API wallet isn't authorized for trading. A no-op write attempt (e.g. `cancel_all_orders` on a coin that has no orders) would surface "API Wallet does not exist" at registration time instead of first-trade time. Bit us on 2026-05-25.
+- **Update `.env`** to match the in-DB Artem credentials so single-user fallback isn't stale. Doesn't affect normal operation (multi-user mode reads from DB), but worth keeping in sync.
+- **Memory-only:** could add a test that exercises the `start_polling(allowed_updates=Update.ALL_TYPES)` choice. The existing channel adapter test passes even if updates aren't subscribed, because PTB handler dispatch is mocked. The bug at `381bbc2` would not have been caught by tests.
 
-Wait for one more CP signal under launchd-managed processes. If it flows the same way, **Phase 4.1 is shipped**. Update this CLAUDE.md and move on.
+#### Step 4 — Phase 4.2 proper (real signal soak day)
 
-#### Step 4 — Begin Phase 4.2 (Artem onboards on testnet)
+Once Step 2 has even one real CP trade, you're in 4.2. The mechanics are identical to what `/inject` produced — same pipeline, same auto_execute, same manual-close flow. Goal of 4.2 = **observe** rather than build.
 
-There's an inactive `Artem A` (`user_id=7441245554`) row in the DB from earlier testing. Clean it up first before re-registering — the user_id collides with Artem's Telegram chat_id and `/register` will refuse to create a new row over an existing one.
+Soak target: at least one full CP signal day. Specifically want to see:
+- Multiple `signal_alert` opens that fire as auto-execute on Artem
+- At least one `tp_hit` event (CP hits a TP)
+- At least one `breakeven` event (CP moves SL to BE after TP1)
+- At least one closure — either `all_tp_hit` (profit), `stop_hit` (loss), or `cancel`
 
-```bash
-# Confirm there's nothing to lose first
-sqlite3 data/trades.db \
-  "SELECT (SELECT COUNT(*) FROM trades WHERE user_id='7441245554') AS trades,
-          (SELECT COUNT(*) FROM orders WHERE user_id='7441245554') AS orders,
-          (SELECT COUNT(*) FROM trade_events WHERE user_id='7441245554') AS events;"
-# Should be 0/0/0. If non-zero, stop and re-evaluate before deleting.
+Audit every closed trade with the README's "Inspecting a single trade end-to-end" recipe. Look for:
+- `decision_snapshot` reflects current Config (preset, size_pct_applied, port at open)
+- Chronological `trade_events` cleanly tells the story
+- `orders` table shows the expected 5 orders (entry + SL + TP1/2/3) with the right statuses
 
-# Stop the bot, delete the row, restart
-launchctl bootout gui/$(id -u)/local.potion-perps-bot
-sqlite3 data/trades.db \
-  "DELETE FROM user_credentials WHERE user_id='7441245554';
-   DELETE FROM user_config WHERE user_id='7441245554';
-   DELETE FROM users WHERE user_id='7441245554';"
-deploy/launchd/install.sh bot
-```
+#### Operational notes — what we learned
 
-Then from Artem's Telegram:
-1. `/register` → testnet → enter HL testnet credentials (must work on testnet; the SDK bump validates them at registration).
-2. `/port` → Set Amount → e.g. `$200` testnet → mode `withdraw`.
-3. `/config` → confirm `auto_execute: OFF`, `max_leverage: 20`, `max_position_size_usd: 500`. **Don't change auto_execute** for first signal day.
-4. `/menu` → 📡 Calls → stay parked here so Approve/Reject buttons appear inline when signals arrive.
-5. Wait for next CP signal. Approve consciously. Watch the orders go out to HL testnet in `logs/bot.log`.
-6. Audit the trade end-to-end per the README's recipe (`raw_signal_text`, `decision_snapshot`, `trade_events`, `orders`).
-
-Soak for at least one full CP signal day: multiple opens, at least one TP hit, at least one full close.
-
-#### Operational notes — things that bit us during 4.1
-
-- **swaag (`7375268438`) is a real user (one of the two friends), active in DB, no port set.** Every CP signal flowing through the pipeline produces a `skipped: port not configured` trade_events row AND a Telegram DM to her. Acceptable for testing but noisy. To silence during testing: `curl -X POST -H "X-API-Key: $ADMIN_API_KEY" http://127.0.0.1:8081/api/users/7375268438/deactivate` (reversible — `/activate` puts her back).
-- **`config/config.yaml` ended this session with `auto_execute: false`.** Phase 3 had it `true`. Keep it `false` until Phase 4.2 has soaked through a full signal day cleanly.
-- **`Update.ALL_TYPES` in `start_polling` is load-bearing.** Telegram's default subscription excludes `channel_post`. Without the explicit opt-in, the channel adapter silently never receives anything. Test: `test_telegram_channel_adapter.py` covers the adapter; no test currently covers the `start_polling` allowed_updates choice (could add one).
+- **swaag (`7375268438`) is a real user on a SEPARATE testnet account** (master `0x8fd9888fB9ad93A968aB9C2e4eA12036C286BC98`). Not just a test fixture. She's active, has credentials, no port set. Every CP signal flowing through the pipeline currently produces a `skipped: port not configured` event + Telegram DM to her. Either ask her to set a port, or temporarily deactivate via admin API if she'd be annoyed.
+- **Artem's `auto_execute=ON` is a deliberate choice for 4.2 testnet testing.** CLAUDE.md historically recommended OFF for first signal day; user overrode. On testnet this is fine (no real-money risk); on mainnet the gate at $100 would catch big trades anyway. **Don't quietly toggle back to OFF without asking.**
+- **`config/config.yaml` has `adapter: telegram_channel` and `auto_execute: false`.** The YAML `auto_execute: false` is the default for new users; Artem's per-user override (auto_execute=true in DB) wins for his pipeline.
+- **Per-user Config changes via Telegram hot-reload now** (commit `18d475e`). The DB is the source of truth; `Orchestrator.refresh_user_config(user_id)` reloads from DB after any `/config` / `/preset` / `/auto` / `/port` edit. Credential changes still need full `deactivate + activate` — that's what `/promote_to_mainnet` does.
+- **Updating credentials when you don't have ADMIN_API_KEY set:** direct DB call works fine (see 2026-05-25 session, where the API wallet rotated). `python3 -c "from src.state.user_db import UserDatabase; db = UserDatabase(); db.update_user_credentials('USER_ID', api_wallet='0x...', api_secret='0x...'); db.close()"`. After update, `launchctl kickstart -k gui/$(id -u)/local.potion-perps-bot` to rebuild the HyperliquidClient with new creds.
+- **The testnet position floor (default $15) is in `RiskConfig` as a dataclass field, not in the `user_config` SQL table.** All users get the dataclass default. To change per-user, would need a schema migration. For now: edit the default in `src/config/settings.py` if you ever need to.
+- **HL testnet API wallet authorization is separate from creation.** Generating an API key locally is one operation; getting the master account to authorize it on HL testnet is another, done via https://app.hyperliquid-testnet.xyz/. The `/register` flow only validates the master account exists (`get_account_state`, a read op); the API wallet's authorization gets discovered at first-trade time. See polish item above.
+- **`Update.ALL_TYPES` in `start_polling` is load-bearing.** Telegram's default subscription excludes `channel_post`. Without the explicit opt-in, the channel adapter silently never receives anything (no error, no log line). If channel adapter ever stops working: this is the first thing to check.
 - **Don't suggest Discord-direct again.** See "Phase 4.1 architecture pivot" above. The constraint is documented; the workaround is built. If Railway ever loses CP access, we revisit then.
 - **Discord adapter is still in the codebase** and tested; we just don't use it as the live source. Keep it — it costs nothing and is the fallback if the Railway/Telethon chain breaks.
 - **Mainnet gate defaults: $100 USD threshold, 5-minute timeout.** Both in `config.example.yaml` under `risk.mainnet_confirm_above_usd` / `mainnet_confirm_timeout_min`. The 5-minute timeout is deliberate — perp signals go stale fast, see `feedback_mainnet_confirm_timeout` memory.
@@ -310,7 +294,7 @@ Phase 5 = parking lot (weekly performance report, VPS, CI/CD, backtest tooling).
 
 ## Tests
 
-**638/638 passing** as of `381bbc2` (up from 594 at end of Phase 3.5; +44 tests in Phase 4.1 across the channel adapter, the Telethon forwarder, the second launchd agent, and the channel-post passthrough in dm_only_filter).
+**650/650 passing** as of `016d57e` (up from 594 at end of Phase 3.5; +56 tests in Phase 4.1 across the channel adapter, the Telethon forwarder, the second launchd agent, the channel-post passthrough in dm_only_filter, `Orchestrator.refresh_user_config`, and the testnet position floor).
 
 ---
 
