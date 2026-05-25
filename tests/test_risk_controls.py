@@ -100,9 +100,20 @@ class TestTestnetPositionFloor:
         )
         assert size == 15.0
 
-    def test_testnet_no_bump_when_above_min(self):
-        """If math already clears the min, floor is NOT applied — user's
-        sizing intent is respected when it works on its own."""
+    def test_testnet_bumps_above_min_but_below_floor(self):
+        """The gap case: 2% of $500 = $10 clears HL's min on its own, but
+        after ``szDecimals`` flooring in order_builder, a BTC trade at this
+        size produces a $9.25 notional and gets rejected. Floor must apply
+        whenever calc is below the floor, not just below the HL min."""
+        size = calculate_position_size(
+            500.0, "MEDIUM", self._preset(), self._strategy(), self._risk(),
+            network="testnet",
+        )
+        assert size == 15.0
+
+    def test_testnet_no_bump_when_above_floor(self):
+        """If math already clears the floor, leave the size alone — the
+        user's sizing intent is respected once it's safe to fire as-is."""
         size = calculate_position_size(
             1000.0, "LOW", self._preset(), self._strategy(), self._risk(),
             network="testnet",

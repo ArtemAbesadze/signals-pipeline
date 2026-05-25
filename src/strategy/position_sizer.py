@@ -77,10 +77,18 @@ def calculate_position_size(
     # Clamp to max position size
     clamped_size = min(raw_size, risk_config.max_position_size_usd)
 
-    # Below the exchange minimum: testnet bumps up to the floor, mainnet
-    # raises so we don't silently trade larger than the user configured.
-    if clamped_size < risk_config.min_order_usd:
-        if network == "testnet" and risk_config.testnet_position_floor_usd > 0:
+    # Testnet floor: bump up to ``testnet_position_floor_usd`` whenever the
+    # calculated size is below that floor — not just below ``min_order_usd``.
+    # That covers two cases at once:
+    #   1. ``calc < min_order_usd`` — HL would reject outright (e.g. HIGH risk
+    #      at small port).
+    #   2. ``min_order_usd <= calc < floor`` — sizer passes, but after
+    #      ``szDecimals`` flooring in order_builder the notional can drop
+    #      back below HL's $10 min (e.g. MEDIUM risk on BTC: $10 → 0.00012
+    #      BTC at $77K → notional $9.25 → rejected). The floor of $15 leaves
+    #      enough headroom that szDecimals losses don't cross the boundary.
+    if network == "testnet" and risk_config.testnet_position_floor_usd > 0:
+        if clamped_size < risk_config.testnet_position_floor_usd:
             floored = min(
                 risk_config.testnet_position_floor_usd,
                 risk_config.max_position_size_usd,
@@ -91,6 +99,11 @@ def calculate_position_size(
                 clamped_size, size_pct, port_usd, risk_level, floored,
             )
             return floored
+        # calc already clears the floor — fall through, no bump, no mainnet
+        # check. On testnet ``min_order_usd`` is never the controlling rule.
+    elif clamped_size < risk_config.min_order_usd:
+        # Mainnet (or testnet with floor disabled): raise so we never
+        # silently trade larger than the user's risk math intended.
         raise PositionSizeError(
             f"Position size ${clamped_size:.2f} ({size_pct}% of port ${port_usd:.2f}) "
             f"is below minimum ${risk_config.min_order_usd:.2f}"
