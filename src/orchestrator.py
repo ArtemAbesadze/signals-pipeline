@@ -130,6 +130,34 @@ class Orchestrator:
         )
         logger.info("Activated pipeline for user %s", user_id)
 
+    def refresh_user_config(self, user_id: str) -> bool:
+        """Reload a user's Config from the DB into their running pipeline.
+
+        For per-user setting changes via Telegram (preset, auto_execute,
+        risk limits, port). Without this, the pipeline holds a stale
+        Config from activation time and Telegram-driven edits don't take
+        effect until the bot is restarted — the bug behind 'auto_execute
+        toggled ON but signals still landed as PENDING'.
+
+        Lighter than ``deactivate_user`` + ``activate_user`` — preserves
+        the HyperliquidClient and position-sync state. Use the
+        deactivate/activate pair when credentials or network change
+        (see ``/promote_to_mainnet``).
+
+        Returns True if refresh happened, False if the user has no active
+        pipeline.
+        """
+        ctx = self._pipelines.get(user_id)
+        if not ctx:
+            return False
+        new_config = self._user_db.get_user_config_as_config(
+            user_id, self._global_config,
+        )
+        ctx.pipeline.refresh_config(new_config)
+        ctx.config = new_config
+        logger.info("Refreshed pipeline config for user %s", user_id)
+        return True
+
     def deactivate_user(self, user_id: str) -> None:
         """Remove and clean up a user's pipeline."""
         ctx = self._pipelines.pop(user_id, None)

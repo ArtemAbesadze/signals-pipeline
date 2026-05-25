@@ -107,6 +107,21 @@ class Pipeline:
         self._asset_meta = client.get_asset_meta()
         self._notifier = notifier
 
+    def refresh_config(self, new_config: Config) -> None:
+        """Swap the cached per-user Config with a fresh one from the DB.
+
+        For per-user setting changes via Telegram (preset, auto_execute,
+        risk limits, port) that don't touch credentials or network. The
+        HyperliquidClient + position state are preserved; only the
+        strategy/risk/port view of the pipeline changes.
+
+        Credential or network changes still need full
+        ``deactivate_user`` + ``activate_user`` (see
+        ``/promote_to_mainnet``) — the client is built once at activation
+        and isn't recreated here.
+        """
+        self._config = new_config
+
     def process_message(self, raw_message: str) -> None:
         """Classify and process a single raw message.
 

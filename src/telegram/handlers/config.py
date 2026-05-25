@@ -18,6 +18,25 @@ def _get_user_db(context: ContextTypes.DEFAULT_TYPE) -> UserDatabase:
     return context.bot_data["user_db"]
 
 
+def _refresh_pipeline(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> None:
+    """Force the running pipeline to reload its Config from DB.
+
+    Must be called after any ``update_user_config`` / ``set_port`` —
+    otherwise the pipeline keeps the Config it cached at activation time
+    and the Telegram-driven edit doesn't take effect until restart.
+    Silent no-op when the orchestrator or user pipeline isn't there.
+    """
+    orchestrator = context.bot_data.get("orchestrator")
+    if orchestrator is None:
+        return
+    try:
+        orchestrator.refresh_user_config(user_id)
+    except Exception:
+        logger.exception(
+            "Failed to refresh pipeline config for user %s", user_id,
+        )
+
+
 def _format_config(cfg: dict, account_block: str | None = None) -> str:
     """Format current config for display, with optional inline Account block."""
     preset = cfg.get("active_preset", "even_split")
@@ -92,6 +111,7 @@ async def preset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     user_db.update_user_config(user_id, active_preset=name)
+    _refresh_pipeline(context, user_id)
     p = BUILTIN_PRESETS[name]
     tp_pcts = [int(x * 100) for x in p.tp_split]
     await update.message.reply_text(
@@ -109,6 +129,7 @@ async def auto_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     new_value = not cfg.get("auto_execute", False)
     user_db.update_user_config(user_id, auto_execute=new_value)
+    _refresh_pipeline(context, user_id)
     state = "✅ ON" if new_value else "❌ OFF"
     await update.message.reply_text(f"⚡ Auto-execute: *{state}*", parse_mode="Markdown")
 
@@ -141,6 +162,7 @@ async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         user_db.update_user_config(user_id, active_preset=name)
+        _refresh_pipeline(context, user_id)
         p = BUILTIN_PRESETS[name]
         tp_pcts = [int(x * 100) for x in p.tp_split]
 
@@ -156,6 +178,7 @@ async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         cfg = user_db.get_user_config(user_id)
         new_value = not cfg.get("auto_execute", False)
         user_db.update_user_config(user_id, auto_execute=new_value)
+        _refresh_pipeline(context, user_id)
 
         cfg = user_db.get_user_config(user_id)
         account_block = _build_account_block(user_db, user_id)
@@ -274,8 +297,10 @@ async def config_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("⚠️ Invalid number. Try again:")
         return
 
-    # Success — clear state and show updated config with menu
+    # Success — clear state, refresh pipeline so the new setting takes
+    # effect, and show updated config with menu
     context.user_data.pop("awaiting_config", None)
+    _refresh_pipeline(context, user_id)
     cfg = user_db.get_user_config(user_id)
     account_block = _build_account_block(user_db, user_id)
     config_text = _format_config(cfg, account_block)

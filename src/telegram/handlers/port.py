@@ -37,6 +37,24 @@ def _get_orchestrator(context: ContextTypes.DEFAULT_TYPE) -> Orchestrator | None
     return context.bot_data.get("orchestrator")
 
 
+def _refresh_pipeline(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> None:
+    """Force the running pipeline to reload its Config from DB.
+
+    Called after every ``set_port`` / ``update_user_config`` here so port
+    edits don't get stranded in the DB while the pipeline runs on a stale
+    Config. See same helper in ``handlers/config.py``.
+    """
+    orchestrator = _get_orchestrator(context)
+    if orchestrator is None:
+        return
+    try:
+        orchestrator.refresh_user_config(user_id)
+    except Exception:
+        logger.exception(
+            "Failed to refresh pipeline config for user %s", user_id,
+        )
+
+
 def _get_client(context: ContextTypes.DEFAULT_TYPE, user_id: str):
     orchestrator = _get_orchestrator(context)
     if not orchestrator:
@@ -167,6 +185,7 @@ async def port_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         except ValueError as e:
             await query.edit_message_text(f"⚠️ {e}")
             return
+        _refresh_pipeline(context, user_id)
         text = build_port_text(context, user_id) + f"\n\n_🔄 Mode set to {mode}._"
         await query.edit_message_text(
             text, parse_mode="Markdown", reply_markup=port_keyboard(),
@@ -218,6 +237,7 @@ async def port_amount_text_handler(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(f"⚠️ {e}\n\nTry again or /cancel.")
         return
 
+    _refresh_pipeline(context, user_id)
     context.user_data.pop("awaiting_port", None)
     text = build_port_text(context, user_id) + f"\n\n_✏️ Port set to ${amount:,.2f}._"
     await update.message.reply_text(

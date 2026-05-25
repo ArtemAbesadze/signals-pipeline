@@ -333,6 +333,102 @@ class TestKillSwitch:
         pipeline.process_message.assert_called_once_with("allowed")
 
 
+class TestRefreshUserConfig:
+    """``refresh_user_config`` is the surgical-fix path for Telegram edits.
+
+    Without it, a ``user_db.update_user_config(...)`` from a /config or
+    /port handler doesn't propagate to the running pipeline — the
+    Pipeline keeps the Config it cached at activation time and the user's
+    Telegram toggle silently has no effect until the bot is restarted.
+    """
+
+    def test_returns_false_when_user_inactive(self, global_config, user_db):
+        orch = Orchestrator(global_config, user_db)
+        assert orch.refresh_user_config("nobody") is False
+
+    @patch("src.orchestrator.HyperliquidClient")
+    @patch("src.orchestrator.PositionManager")
+    @patch("src.orchestrator.Pipeline")
+    def test_refresh_updates_pipeline_and_ctx(
+        self, MockPipeline, MockPM, MockClient, global_config, user_db,
+    ):
+        MockClient.return_value = _mock_client()
+        MockPM.return_value.sync_positions.return_value = {
+            "closed": [], "canceled": [], "verified": [], "orphans": [],
+        }
+
+        user_db.create_user("alice", "Alice", SAMPLE_CREDS)
+        orch = Orchestrator(global_config, user_db)
+        orch.activate_user("alice")
+
+        # Mutate Alice's config in the DB
+        user_db.update_user_config("alice", auto_execute=True, max_leverage=7)
+
+        assert orch.refresh_user_config("alice") is True
+
+        # The Pipeline.refresh_config method was invoked with a fresh Config
+        # carrying the new DB values
+        pipeline_mock = orch.pipelines["alice"].pipeline
+        pipeline_mock.refresh_config.assert_called_once()
+        new_config = pipeline_mock.refresh_config.call_args.args[0]
+        assert new_config.strategy.auto_execute is True
+        assert new_config.strategy.max_leverage == 7
+        # ctx.config also gets the new object — anyone reading from ctx
+        # (ConfirmationSweeper, future code) sees the new values too
+        assert orch.pipelines["alice"].config is new_config
+
+    @patch("src.orchestrator.HyperliquidClient")
+    @patch("src.orchestrator.PositionManager")
+    @patch("src.orchestrator.Pipeline")
+    def test_refresh_does_not_rebuild_client(
+        self, MockPipeline, MockPM, MockClient, global_config, user_db,
+    ):
+        """Refresh is the lightweight path — must NOT instantiate a new
+        HyperliquidClient. Only deactivate+activate (heavyweight, used by
+        /promote_to_mainnet for network changes) should do that."""
+        MockClient.return_value = _mock_client()
+        MockPM.return_value.sync_positions.return_value = {
+            "closed": [], "canceled": [], "verified": [], "orphans": [],
+        }
+
+        user_db.create_user("alice", "Alice", SAMPLE_CREDS)
+        orch = Orchestrator(global_config, user_db)
+        orch.activate_user("alice")
+        client_calls_before = MockClient.call_count
+
+        user_db.update_user_config("alice", auto_execute=True)
+        orch.refresh_user_config("alice")
+
+        assert MockClient.call_count == client_calls_before, (
+            "refresh_user_config must not construct a new HyperliquidClient"
+        )
+
+    @patch("src.orchestrator.HyperliquidClient")
+    @patch("src.orchestrator.PositionManager")
+    @patch("src.orchestrator.Pipeline")
+    def test_refresh_picks_up_port_changes(
+        self, MockPipeline, MockPM, MockClient, global_config, user_db,
+    ):
+        """Same path covers /port edits — new port_usd / port_mode must
+        reach the pipeline's Config."""
+        MockClient.return_value = _mock_client()
+        MockPM.return_value.sync_positions.return_value = {
+            "closed": [], "canceled": [], "verified": [], "orphans": [],
+        }
+
+        user_db.create_user("alice", "Alice", SAMPLE_CREDS)
+        orch = Orchestrator(global_config, user_db)
+        orch.activate_user("alice")
+
+        user_db.set_port("alice", port_usd=750.0, port_mode="compound")
+        assert orch.refresh_user_config("alice") is True
+
+        pipeline_mock = orch.pipelines["alice"].pipeline
+        new_config = pipeline_mock.refresh_config.call_args.args[0]
+        assert new_config.port.port_usd == 750.0
+        assert new_config.port.port_mode == "compound"
+
+
 class TestStop:
     def test_stop_closes_all(self, global_config, user_db):
         orch = Orchestrator(global_config, user_db)
