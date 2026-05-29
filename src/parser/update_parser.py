@@ -210,6 +210,56 @@ def parse_stop_hit(raw: str) -> StopHit:
     return StopHit(pair=pair, trade_id=trade_id, loss_pct=loss_pct)
 
 
+# @PotionScannerBot wraps each CP message with header + footer noise
+# (e.g. ``Trade Update: ...``, ``Source: Potion #Perp Bot Calls``,
+# ``Trade Now: here``, a trailing UTC timestamp). The structured parsers
+# match on keywords and don't care, but ``parse_canceled``'s reason
+# extraction used to slurp the entire wrapper into the reason field.
+# These patterns strip the noise so the reason ends up as just the
+# substantive line(s). Match against the start of the line (after
+# whitespace).
+_CANCEL_NOISE_LINE_PATTERNS = (
+    re.compile(r"^Trade Update:", re.IGNORECASE),
+    re.compile(r"^Source:\s*Potion", re.IGNORECASE),
+    re.compile(r"^Trade Now:", re.IGNORECASE),
+    re.compile(r"^Called by", re.IGNORECASE),
+    re.compile(r"^New Call Detected", re.IGNORECASE),
+    # Bare UTC-style timestamp footer, e.g. "2026-05-25 14:08 UTC"
+    re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}"),
+    # Standalone "TRADE CANCELED" header line (handled by classifier; not
+    # a reason)
+    re.compile(r"^TRADE\s+CANCELED\s*$", re.IGNORECASE),
+)
+
+
+def _extract_cancel_reason(text: str) -> str:
+    """Take the substantive lines after the structured header (PAIR or
+    ``#NNN`` anchor), stopping at @PotionScannerBot wrapper footers.
+
+    Without this filter, the wrapper noise from the relay bot ends up in
+    ``Canceled.reason`` and pollutes ``trade_events.action_taken`` (bug
+    #4 on the 2026-05-25 CP soak — saw e.g. "orders canceled; reason:
+    Source: Potion #Perp Bot Calls TRADE CANCELED TRAD…").
+    """
+    raw_lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+    # Anchor at the PAIR / "#NNNN" line — the real reason follows it.
+    anchor_idx = None
+    for i, ln in enumerate(raw_lines):
+        if re.search(r"PAIR[:\s]*\S+/\S+", ln, re.IGNORECASE):
+            anchor_idx = i
+            break
+        if re.search(r"#\d{3,}", ln):
+            anchor_idx = i
+            break
+    start_idx = (anchor_idx + 1) if anchor_idx is not None else 1
+    body = []
+    for ln in raw_lines[start_idx:]:
+        if any(p.match(ln) for p in _CANCEL_NOISE_LINE_PATTERNS):
+            continue
+        body.append(ln)
+    return " ".join(body).strip()
+
+
 def parse_canceled(raw: str) -> Canceled:
     text = _clean(raw)
 
@@ -224,13 +274,14 @@ def parse_canceled(raw: str) -> Canceled:
         if m:
             pair = m.group(1).upper()
 
-    # Reason: parenthesized text, or everything after the first line
+    # Reason: explicit parenthesized text wins; otherwise extract the
+    # substantive lines after the structured header, filtering out
+    # @PotionScannerBot wrapper noise.
     m = re.search(r"\(([^)]+)\)", text)
     if m:
         reason = m.group(1).strip()
     else:
-        lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
-        reason = " ".join(lines[1:]) if len(lines) > 1 else ""
+        reason = _extract_cancel_reason(text)
 
     return Canceled(trade_id=trade_id, pair=pair, reason=reason)
 

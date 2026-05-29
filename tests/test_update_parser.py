@@ -212,6 +212,43 @@ class TestCanceled:
         assert r.trade_id == 2060
         assert r.pair == "STX/USDT"
 
+    def test_canceled_potion_scanner_wrapper_noise_stripped(self):
+        """2026-05-25 soak (bug #4): the @PotionScannerBot relay wraps
+        each cancel message with ``Trade Update:`` / ``Source:`` headers
+        and a ``Trade Now: here`` + UTC timestamp footer. Without
+        filtering, that whole wrapper ended up in ``Canceled.reason``
+        and polluted ``trade_events.action_taken``.
+
+        The substantive reason in this verbatim CP-via-forwarder
+        message is just "TP1 target hit before reaching the entry"."""
+        raw = (
+            "Trade Update: Trade Canceled\n"
+            "Source: Potion #Perp Bot Calls\n\n"
+            "🤝 TRADE CANCELED\n\n"
+            "PAIR: NEAR/USDT #2126\n\n"
+            "TP1 target hit before reaching the entry\n\n"
+            "Trade Now: here\n\n"
+            "2026-05-25 14:08 UTC"
+        )
+        r = parse_canceled(raw)
+        assert r.trade_id == 2126
+        assert r.pair == "NEAR/USDT"
+        assert r.reason == "TP1 target hit before reaching the entry"
+        # Wrapper lines must NOT have leaked into the reason
+        assert "Source:" not in r.reason
+        assert "Trade Update:" not in r.reason
+        assert "Trade Now:" not in r.reason
+        assert "UTC" not in r.reason
+
+    def test_canceled_parenthesized_reason_still_wins(self):
+        """Pre-existing behaviour: when CP emits ``(reason)`` in parens,
+        that's the explicit signal; honour it."""
+        r = parse_canceled(
+            "Trade #1268 Canceled\n(price moved too fast, would have stopped)"
+        )
+        assert r.trade_id == 1268
+        assert r.reason == "price moved too fast, would have stopped"
+
 
 # ------------------------------------------------------------------
 # TRADE_CLOSED
