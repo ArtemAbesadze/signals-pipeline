@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -54,10 +55,57 @@ _PORT_WARN_FRACTION = 0.95
 
 _TRADE_ID_RE = re.compile(r"#(\d{3,})")
 
+# Pipeline-level message dedup (Bug #14). @PotionScannerBot delivers each CP
+# signal as two variants (base text + same text with a one-line summary header
+# prepended). Both arrive as legitimately-different bytes, so the forwarder
+# correctly forwards both. Without dedup, every handler runs twice. The
+# observed inter-variant delay on the 2026-05-25 soak was ~50ms–3s; 60s gives
+# generous headroom while staying well below any legitimate same-event
+# recurrence in CP's protocol (CP does not resend ``TP1_HIT`` for the same
+# trade id).
+_DEDUP_WINDOW_SEC = 60.0
+
+# Maximum cache size before we prune expired entries. Bounded memory; a single
+# CP signal day produces ~100–200 distinct (trade_id, msg_type) keys.
+_DEDUP_CACHE_PRUNE_AT = 256
+
 # Max length we'll store in trade_events.action_taken. Keeps the audit
 # table compact when an upstream error includes a long stack trace or
 # raw exchange-response blob (D6).
 _MAX_ACTION_TAKEN_LEN = 1000
+
+
+# Message types we dedup. Excludes NOISE (no work done) and PREPARATION/
+# MANUAL_UPDATE (informational; handler does no exchange work that would
+# double-fire). Everything that mutates state or applies P&L is in here.
+_DEDUPABLE_MESSAGE_TYPES = frozenset({
+    MessageType.SIGNAL_ALERT,
+    MessageType.ORDER_PENDING,
+    MessageType.TRADE_LIVE,
+    MessageType.TP_HIT,
+    MessageType.ALL_TP_HIT,
+    MessageType.BREAKEVEN,
+    MessageType.STOP_HIT,
+    MessageType.CANCELED,
+    MessageType.TRADE_CLOSED,
+})
+
+
+# Audit-row event type written when we suppress a duplicate. Keeps
+# trade_events.event_type semantically aligned with the message that
+# came in, so a post-mortem can grep e.g. ``WHERE event_type='tp_hit'
+# AND action_taken LIKE 'deduplicated%'`` to see what was caught.
+_DEDUP_AUDIT_EVENT_TYPE = {
+    MessageType.SIGNAL_ALERT: EventType.SIGNAL_ALERT,
+    MessageType.ORDER_PENDING: EventType.ORDER_PENDING,
+    MessageType.TRADE_LIVE: EventType.TRADE_LIVE,
+    MessageType.TP_HIT: EventType.TP_HIT,
+    MessageType.ALL_TP_HIT: EventType.TRADE_CLOSED,
+    MessageType.BREAKEVEN: EventType.BREAKEVEN,
+    MessageType.STOP_HIT: EventType.STOP_HIT,
+    MessageType.CANCELED: EventType.CANCEL,
+    MessageType.TRADE_CLOSED: EventType.TRADE_CLOSED,
+}
 
 
 def _extract_trade_id_from_text(raw: str) -> int | None:
@@ -106,6 +154,11 @@ class Pipeline:
         self._pm = PositionManager(client, db)
         self._asset_meta = client.get_asset_meta()
         self._notifier = notifier
+        # Bug #14 — pipeline-level dedup of @PotionScannerBot's two-variant
+        # delivery. Keyed by (trade_id, msg_type), value is the monotonic
+        # timestamp of the last accepted message. Pruned on add when it
+        # crosses the prune threshold. See module-level _DEDUP_WINDOW_SEC.
+        self._dedup_cache: dict[tuple[int, MessageType], float] = {}
 
     def refresh_config(self, new_config: Config) -> None:
         """Swap the cached per-user Config with a fresh one from the DB.
@@ -129,6 +182,39 @@ class Pipeline:
         """
         msg_type = classify(raw_message)
         logger.info("Classified message as: %s", msg_type.value)
+
+        # Bug #14: dedup @PotionScannerBot's two-variant delivery at the
+        # boundary so downstream handlers don't have to. Without this,
+        # _apply_pnl_to_port double-credits compound/watermark ports and
+        # the BE path generates extra SL replacement orders (observed on
+        # #2127 IMX — 4 SL rows for one trade).
+        if msg_type in _DEDUPABLE_MESSAGE_TYPES:
+            trade_id = _extract_trade_id_from_text(raw_message)
+            if trade_id is not None:
+                key = (trade_id, msg_type)
+                now = time.monotonic()
+                last_seen = self._dedup_cache.get(key)
+                if last_seen is not None and (now - last_seen) < _DEDUP_WINDOW_SEC:
+                    logger.info(
+                        "Deduplicated %s for trade #%d (last seen %.1fs ago)",
+                        msg_type.value, trade_id, now - last_seen,
+                    )
+                    self._record_event(
+                        trade_id=trade_id,
+                        event_type=_DEDUP_AUDIT_EVENT_TYPE[msg_type],
+                        raw_text=raw_message,
+                        action_taken=(
+                            f"deduplicated: same ({msg_type.value}) within "
+                            f"{_DEDUP_WINDOW_SEC:.0f}s of prior message"
+                        ),
+                    )
+                    return
+                self._dedup_cache[key] = now
+                if len(self._dedup_cache) > _DEDUP_CACHE_PRUNE_AT:
+                    cutoff = now - _DEDUP_WINDOW_SEC
+                    self._dedup_cache = {
+                        k: v for k, v in self._dedup_cache.items() if v > cutoff
+                    }
 
         handlers = {
             MessageType.SIGNAL_ALERT: self._handle_signal,

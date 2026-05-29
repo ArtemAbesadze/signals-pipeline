@@ -701,6 +701,171 @@ class TestOrderStatusReconciliation:
         assert pipeline._mark_order_filled(5001, OrderType.TP1) is False
 
 
+class TestPipelineDedup:
+    """Bug #14 — @PotionScannerBot delivers each CP signal as two variants
+    (base + summary-prefixed). The forwarder correctly forwards both as
+    legitimately-different bytes. The pipeline dedups on (trade_id,
+    msg_type) at the boundary so handlers never see duplicates."""
+
+    def _seed_open_trade_with_orders(self, db):
+        """Same seed pattern as TestOrderStatusReconciliation. Inlined
+        so this class doesn't depend on cross-class helpers."""
+        from src.state.models import TradeRecord
+        trade = TradeRecord(
+            trade_id=5001, user_id="test_user", pair="ETH/USDT", coin="ETH",
+            side="LONG", risk_level="LOW", trade_type="SWING", size_hint="1-4%",
+            entry_price=3000.0, stop_loss=2900.0,
+            tp1=3050.0, tp2=3100.0, tp3=3200.0,
+            leverage=10, signal_leverage=10,
+            position_size_usd=300.0, position_size_coin=0.1,
+        )
+        db.create_trade(trade)
+        db.update_trade_status(5001, TradeStatus.OPEN)
+        oid = 9000
+        for ot, side, sz, px in [
+            (OrderType.ENTRY, "BUY", 0.1, 3000.0),
+            (OrderType.STOP_LOSS, "SELL", 0.1, 2900.0),
+            (OrderType.TP1, "SELL", 0.033, 3050.0),
+            (OrderType.TP2, "SELL", 0.033, 3100.0),
+            (OrderType.TP3, "SELL", 0.034, 3200.0),
+        ]:
+            row_id = db.record_order(5001, ot, "ETH", side, sz, px)
+            db.set_order_oid(row_id, oid)
+            oid += 1
+        return 5001
+
+    def _tp_msg(self, n: int = 1, trade_id: int = 5001) -> str:
+        return (
+            f"✅ **TP TARGET {n} HIT**\n\n"
+            f"**📝PAIR:** ETH/USDT #{trade_id}\n\n"
+            f"**💰PROFIT:** +2.50% 📈"
+        )
+
+    def test_duplicate_tp_hit_suppressed_within_window(self, pipeline, db):
+        """Identical TP_HIT seen twice — second is suppressed at the
+        boundary. Audit row still gets written so post-mortem can see
+        we caught a dupe."""
+        self._seed_open_trade_with_orders(db)
+        msg = self._tp_msg(1)
+
+        pipeline.process_message(msg)
+        pipeline.process_message(msg)
+
+        tp_events = [
+            e for e in db.get_events_for_trade(5001)
+            if e.event_type.value == "tp_hit"
+        ]
+        assert len(tp_events) == 2
+        assert "deduplicated" not in (tp_events[0].action_taken or "")
+        assert "deduplicated" in (tp_events[1].action_taken or "")
+
+    def test_dedup_keyed_on_message_type_not_just_trade(self, pipeline, db):
+        """Same trade_id, different msg_type — both pass through."""
+        self._seed_open_trade_with_orders(db)
+        tp = self._tp_msg(1)
+        be = (
+            "**BREAK EVEN HIT AFTER TP1**\n\n"
+            "**📝PAIR:** ETH/USDT #5001\n\n"
+            "Price has returned to entry after **TP1** was secured."
+        )
+
+        pipeline.process_message(tp)
+        pipeline.process_message(be)
+
+        events = db.get_events_for_trade(5001)
+        tp_count = sum(1 for e in events if e.event_type.value == "tp_hit")
+        be_count = sum(1 for e in events if e.event_type.value == "breakeven")
+        assert tp_count == 1
+        assert be_count == 1
+        assert all("deduplicated" not in (e.action_taken or "") for e in events)
+
+    def test_dedup_keyed_on_trade_id_not_just_message_type(self, pipeline, db):
+        """Same msg_type, different trade_id — both pass through."""
+        self._seed_open_trade_with_orders(db)
+        from src.state.models import TradeRecord
+        trade2 = TradeRecord(
+            trade_id=5002, user_id="test_user", pair="BTC/USDT", coin="BTC",
+            side="LONG", risk_level="LOW", trade_type="SWING", size_hint="1-4%",
+            entry_price=50000.0, stop_loss=49000.0,
+            tp1=50500.0, tp2=51000.0, tp3=52000.0,
+            leverage=10, signal_leverage=10,
+            position_size_usd=300.0, position_size_coin=0.006,
+        )
+        db.create_trade(trade2)
+        db.update_trade_status(5002, TradeStatus.OPEN)
+
+        pipeline.process_message(self._tp_msg(1, trade_id=5001))
+        pipeline.process_message(
+            self._tp_msg(1, trade_id=5002).replace("ETH/USDT", "BTC/USDT")
+        )
+
+        e_5001 = [
+            e for e in db.get_events_for_trade(5001)
+            if e.event_type.value == "tp_hit"
+        ]
+        e_5002 = [
+            e for e in db.get_events_for_trade(5002)
+            if e.event_type.value == "tp_hit"
+        ]
+        assert len(e_5001) == 1
+        assert len(e_5002) == 1
+        assert "deduplicated" not in (e_5001[0].action_taken or "")
+        assert "deduplicated" not in (e_5002[0].action_taken or "")
+
+    def test_dedup_expires_after_window(self, pipeline, db, monkeypatch):
+        """Once _DEDUP_WINDOW_SEC has elapsed, a same-key message is
+        processed normally again — the cache shouldn't trap legitimate
+        later events."""
+        from src import pipeline as pipeline_module
+
+        self._seed_open_trade_with_orders(db)
+        msg = self._tp_msg(1)
+
+        fake_now = [1000.0]
+        monkeypatch.setattr(
+            pipeline_module.time, "monotonic", lambda: fake_now[0],
+        )
+
+        pipeline.process_message(msg)
+        fake_now[0] += pipeline_module._DEDUP_WINDOW_SEC + 1.0
+        pipeline.process_message(msg)
+
+        tp_events = [
+            e for e in db.get_events_for_trade(5001)
+            if e.event_type.value == "tp_hit"
+        ]
+        assert len(tp_events) == 2
+        assert all(
+            "deduplicated" not in (e.action_taken or "") for e in tp_events
+        )
+
+    def test_dedup_cache_prunes_when_size_exceeds_threshold(
+        self, pipeline, db, monkeypatch,
+    ):
+        """Memory bound — stale entries are dropped once the cache crosses
+        _DEDUP_CACHE_PRUNE_AT, so a long-running bot doesn't accumulate
+        an unbounded dict."""
+        from src import pipeline as pipeline_module
+        from src.parser.classifier import MessageType as _MT
+
+        fake_now = [1000.0]
+        monkeypatch.setattr(
+            pipeline_module.time, "monotonic", lambda: fake_now[0],
+        )
+
+        for i in range(pipeline_module._DEDUP_CACHE_PRUNE_AT + 50):
+            pipeline._dedup_cache[(i, _MT.TP_HIT)] = fake_now[0]
+
+        fake_now[0] += pipeline_module._DEDUP_WINDOW_SEC + 1.0
+
+        self._seed_open_trade_with_orders(db)
+        pipeline.process_message(self._tp_msg(1))
+
+        cutoff = fake_now[0] - pipeline_module._DEDUP_WINDOW_SEC
+        assert all(v > cutoff for v in pipeline._dedup_cache.values())
+        assert (5001, _MT.TP_HIT) in pipeline._dedup_cache
+
+
 class TestCanceledFlow:
     def test_cancel_pending_trade(self, pipeline, db, client):
         """Cancel on a pending trade (entry not yet filled)."""
