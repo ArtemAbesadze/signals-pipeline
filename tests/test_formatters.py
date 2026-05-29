@@ -8,6 +8,7 @@ from src.telegram.formatters import (
     format_audit_trail,
     format_main_menu,
     format_port,
+    format_trading_hub,
 )
 
 
@@ -170,6 +171,42 @@ class TestFormatMainMenu:
         assert "TP1 +13.93%" in text
         assert "🎯" in text   # TP_HIT icon
         assert "⚖️" in text   # BREAKEVEN icon
+
+
+class TestFormatTradingHub:
+    """The Trading screen has to surface spot USDC, not just perp margin.
+    On HL under portfolio margin, ``account_value`` (perp side) reads
+    near-zero while the user's actual USDC sits in spot — bug #9 from the
+    2026-05-25 CP soak."""
+
+    def test_shows_both_usdc_and_perp_value(self):
+        balance = {
+            "usdc_balance": "649.00",
+            "account_value": "1.49",  # the misleading-on-its-own value
+            "total_margin_used": "0.50",
+            "total_position_value": "20.00",
+            "withdrawable": "648.50",
+        }
+        text = format_trading_hub(balance, positions=[], open_trades=0)
+        # User has to be able to find both numbers on screen
+        assert "$649.00" in text
+        assert "$1.49" in text
+        # And know which is which
+        assert "USDC" in text
+        assert "Perp" in text
+
+    def test_unavailable_balance_renders(self):
+        text = format_trading_hub(balance=None, positions=None)
+        assert "Unavailable" in text
+
+    def test_unrealized_pnl_included_when_positions(self):
+        balance = {"usdc_balance": "1000", "account_value": "50"}
+        positions = [
+            {"unrealized_pnl": "5.50"},
+            {"unrealized_pnl": "-2.30"},
+        ]
+        text = format_trading_hub(balance, positions, open_trades=2)
+        assert "$3.20" in text  # net unrealised
 
 
 class TestFormatPort:

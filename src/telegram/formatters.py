@@ -475,13 +475,25 @@ def format_calls_view(trades: list) -> str:
 
 
 def format_trading_hub(balance: dict[str, str] | None, positions: list | None, open_trades: int = 0) -> str:
-    """Format the trading hub summary."""
+    """Format the trading hub summary.
+
+    On Hyperliquid under portfolio margin, free USDC sits in the spot
+    clearinghouse and only gets pulled into the perp margin summary as
+    it's used. Showing only ``account_value`` (perp margin) makes the
+    Trading screen look near-empty even when the user has substantial
+    spot USDC — that's bug #9 from the 2026-05-25 CP soak ($1.49 perp
+    margin shown while ~$649 USDC was sitting in spot). Show both,
+    labelled clearly.
+    """
     text = "📊 *Trading*\n\n"
 
     if balance:
-        text += f"💰 Balance: {format_usd(balance.get('account_value', '0'))}\n"
+        usdc = balance.get("usdc_balance", "0")
+        perp_value = balance.get("account_value", "0")
+        text += f"💵 USDC: {format_usd(usdc)}\n"
+        text += f"📊 Perp account value: {format_usd(perp_value)}\n"
     else:
-        text += "💰 Balance: _Unavailable_\n"
+        text += "💵 Balance: _Unavailable_\n"
 
     # Calculate unrealized PnL from positions
     if positions:
