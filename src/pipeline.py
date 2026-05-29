@@ -39,7 +39,7 @@ from src.parser.update_parser import (
 import re
 
 from src.state.database import TradeDatabase
-from src.state.models import EventType, TradeRecord, TradeStatus
+from src.state.models import EventType, OrderStatus, OrderType, TradeRecord, TradeStatus
 from src.state.user_db import UserDatabase
 from src.strategy.position_sizer import (
     PositionSizeError,
@@ -468,6 +468,12 @@ class Pipeline:
 
         logger.info("TP%d hit for trade #%d %s (+%.2f%%)", tp.tp_number, tp.trade_id, tp.pair, tp.profit_pct)
 
+        # Reconcile our local orders table — CP just told us this TP
+        # filled on the exchange, but we don't poll. See ``_mark_order_filled``.
+        _tp_type = {1: OrderType.TP1, 2: OrderType.TP2, 3: OrderType.TP3}.get(tp.tp_number)
+        if _tp_type is not None:
+            self._mark_order_filled(tp.trade_id, _tp_type)
+
         # Check if we should move SL to breakeven
         preset = self._config.get_active_preset()
         be_after = preset.move_sl_to_breakeven_after
@@ -509,6 +515,15 @@ class Pipeline:
             return
 
         logger.info("All TPs hit for trade #%d %s (+%.2f%%)", atp.trade_id, atp.pair, atp.profit_pct)
+
+        # Reconcile orders: every still-SUBMITTED TP filled; the SL
+        # would have been auto-canceled by HL when the position closed.
+        for _tp_type in (OrderType.TP1, OrderType.TP2, OrderType.TP3):
+            self._mark_order_filled(atp.trade_id, _tp_type)
+        self._cancel_remaining_orders_of_types(
+            atp.trade_id, (OrderType.STOP_LOSS,),
+        )
+
         self._db.update_trade_status(
             atp.trade_id, TradeStatus.CLOSED,
             close_reason="all_tp_hit", pnl_pct=atp.profit_pct,
@@ -584,6 +599,13 @@ class Pipeline:
             return
 
         logger.info("Stop hit for trade #%d %s (%.2f%%)", sh.trade_id, sh.pair, sh.loss_pct)
+
+        # Reconcile orders: SL filled; HL auto-canceled any remaining TPs.
+        self._mark_order_filled(sh.trade_id, OrderType.STOP_LOSS)
+        self._cancel_remaining_orders_of_types(
+            sh.trade_id, (OrderType.TP1, OrderType.TP2, OrderType.TP3),
+        )
+
         self._db.update_trade_status(
             sh.trade_id, TradeStatus.CLOSED,
             close_reason="stop_hit", pnl_pct=sh.loss_pct,
@@ -728,6 +750,12 @@ class Pipeline:
             tl.trade_id, tl.pair,
         )
 
+        # Reconcile orders: entry order is now FILLED on the exchange.
+        # Idempotent if already filled (e.g. immediate fill at submit
+        # time set fill_price already, or @PotionScannerBot duplicate
+        # TRADE_LIVE).
+        self._mark_order_filled(tl.trade_id, OrderType.ENTRY)
+
         self._record_event(
             trade_id=tl.trade_id,
             event_type=EventType.TRADE_LIVE,
@@ -858,6 +886,101 @@ class Pipeline:
             )
         except Exception:
             logger.exception("Failed to record trade event")
+
+    def _mark_order_filled(
+        self,
+        trade_id: int,
+        order_type: OrderType,
+        fill_price: float | None = None,
+    ) -> bool:
+        """Best-effort: mark the first SUBMITTED order of ``order_type``
+        for ``trade_id`` as FILLED, in response to a CP lifecycle event.
+
+        CP doesn't tell us the exact exchange fill price — we use the
+        order's own target price as approximation (or the provided
+        override). The audit story is still complete: ``trade_events``
+        has the verbatim CP message, and ``orders.fill_price`` is
+        documented as "approximate from CP-event time" in this path.
+
+        Without this, ``orders`` rows for TPs/SL/entry stay at
+        ``status='submitted'`` even after they fill on the exchange,
+        because we don't poll. See Bug #3 on the 2026-05-25 soak —
+        ``#2127 IMX`` had TP1 and TP2 hit per CP but order rows still
+        said ``submitted`` for both. Idempotent: a second call for the
+        same trade+type finds nothing in SUBMITTED state and no-ops,
+        which makes the @PotionScannerBot duplicate-message pattern
+        safe.
+
+        Returns True when an order was updated, False otherwise.
+        """
+        try:
+            orders = self._db.get_orders_for_trade(trade_id)
+        except Exception:
+            logger.exception("Could not fetch orders for trade #%d", trade_id)
+            return False
+        for order in orders:
+            if (
+                order.order_type == order_type
+                and order.status == OrderStatus.SUBMITTED
+                and order.oid is not None
+            ):
+                effective_price = (
+                    fill_price if fill_price is not None else order.price
+                )
+                try:
+                    self._db.update_order_status(
+                        order.oid, OrderStatus.FILLED, fill_price=effective_price,
+                    )
+                    logger.info(
+                        "Trade #%d: marked %s FILLED @ %s (from CP event)",
+                        trade_id, order_type.value, effective_price,
+                    )
+                    return True
+                except Exception:
+                    logger.exception(
+                        "Trade #%d: failed to mark %s FILLED",
+                        trade_id, order_type.value,
+                    )
+                    return False
+        return False
+
+    def _cancel_remaining_orders_of_types(
+        self,
+        trade_id: int,
+        order_types: tuple[OrderType, ...],
+    ) -> int:
+        """Mark any still-SUBMITTED orders of the given types as CANCELED.
+
+        Used when SL fills on the exchange (HL auto-cancels the resting
+        TP siblings, but we don't get a per-order notification) or when
+        ALL_TP_HIT lands (entry SL becomes irrelevant). Returns the count
+        canceled."""
+        try:
+            orders = self._db.get_orders_for_trade(trade_id)
+        except Exception:
+            logger.exception("Could not fetch orders for trade #%d", trade_id)
+            return 0
+        canceled = 0
+        for order in orders:
+            if (
+                order.order_type in order_types
+                and order.status == OrderStatus.SUBMITTED
+                and order.oid is not None
+            ):
+                try:
+                    self._db.update_order_status(order.oid, OrderStatus.CANCELED)
+                    canceled += 1
+                except Exception:
+                    logger.exception(
+                        "Trade #%d: failed to mark %s CANCELED",
+                        trade_id, order.order_type.value,
+                    )
+        if canceled:
+            logger.info(
+                "Trade #%d: marked %d remaining orders CANCELED (types=%s)",
+                trade_id, canceled, [t.value for t in order_types],
+            )
+        return canceled
 
     def _build_decision_snapshot(
         self,

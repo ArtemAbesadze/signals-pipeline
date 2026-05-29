@@ -357,6 +357,124 @@ class TestStopHitFlow:
         assert closed_trade.pnl_pct == -77.7
 
 
+class TestOrderStatusReconciliation:
+    """Phase 4.1 follow-up: CP lifecycle events update local ``orders``
+    rows so they don't stay at ``status='submitted'`` after they actually
+    fill on the exchange. Caught on 2026-05-25 with #2127 IMX — TP1 and
+    TP2 hit per CP, but our DB still said both were resting."""
+
+    def _seed_open_trade_with_orders(self, db):
+        """Create an OPEN trade with all 5 order rows in SUBMITTED state."""
+        from src.state.models import TradeRecord
+        trade = TradeRecord(
+            trade_id=5001, user_id="test_user", pair="ETH/USDT", coin="ETH",
+            side="LONG", risk_level="LOW", trade_type="SWING", size_hint="1-4%",
+            entry_price=3000.0, stop_loss=2900.0,
+            tp1=3050.0, tp2=3100.0, tp3=3200.0,
+            leverage=10, signal_leverage=10,
+            position_size_usd=300.0, position_size_coin=0.1,
+        )
+        db.create_trade(trade)
+        db.update_trade_status(5001, TradeStatus.OPEN)
+        # Insert orders with deterministic oids — submit_trade would
+        # normally do this; we shortcut for the test.
+        oid = 9000
+        for ot, side, sz, px in [
+            (OrderType.ENTRY, "BUY", 0.1, 3000.0),
+            (OrderType.STOP_LOSS, "SELL", 0.1, 2900.0),
+            (OrderType.TP1, "SELL", 0.033, 3050.0),
+            (OrderType.TP2, "SELL", 0.033, 3100.0),
+            (OrderType.TP3, "SELL", 0.034, 3200.0),
+        ]:
+            row_id = db.record_order(5001, ot, "ETH", side, sz, px)
+            db.set_order_oid(row_id, oid)  # marks as SUBMITTED
+            oid += 1
+        return 5001
+
+    def _tp_msg(self, n: int, pct: float = 5.0) -> str:
+        return (
+            f"✅ **TP TARGET {n} HIT**\n\n"
+            f"**📝PAIR:** ETH/USDT #5001\n\n"
+            f"**💰PROFIT:** +{pct:.2f}% 📈\n"
+            f"**⏳PERIOD:** 10 Minutes"
+        )
+
+    def test_tp_hit_marks_corresponding_tp_filled(self, pipeline, db):
+        self._seed_open_trade_with_orders(db)
+
+        pipeline.process_message(self._tp_msg(1, pct=1.67))
+
+        orders = {o.order_type: o for o in db.get_orders_for_trade(5001)}
+        assert orders[OrderType.TP1].status == OrderStatus.FILLED
+        assert orders[OrderType.TP1].fill_price == 3050.0
+        # Other TPs untouched
+        assert orders[OrderType.TP2].status == OrderStatus.SUBMITTED
+        assert orders[OrderType.TP3].status == OrderStatus.SUBMITTED
+
+    def test_tp_hit_is_idempotent(self, pipeline, db):
+        """@PotionScannerBot duplicates TP_HIT messages. Second call must
+        not regress status or crash — TP1 stays FILLED."""
+        self._seed_open_trade_with_orders(db)
+        pipeline.process_message(self._tp_msg(1))
+        pipeline.process_message(self._tp_msg(1))
+        orders = {o.order_type: o for o in db.get_orders_for_trade(5001)}
+        assert orders[OrderType.TP1].status == OrderStatus.FILLED
+
+    def test_trade_live_marks_entry_filled(self, pipeline, db):
+        self._seed_open_trade_with_orders(db)
+        msg = (
+            "LIVE ETH\n"
+            "**TRADE IS LIVE** ✅\n\n"
+            "**PAIR:** ETH/USDT #5001"
+        )
+        pipeline.process_message(msg)
+
+        orders = {o.order_type: o for o in db.get_orders_for_trade(5001)}
+        assert orders[OrderType.ENTRY].status == OrderStatus.FILLED
+
+    def test_all_tp_hit_fills_all_tps_and_cancels_sl(self, pipeline, db):
+        self._seed_open_trade_with_orders(db)
+        msg = (
+            "🔥ALL TAKE-PROFIT TARGETS HIT\n\n"
+            "📝PAIR: ETH/USDT #5001\n\n"
+            "💰PROFIT: +12.5% 📈\n"
+            "⏳PERIOD: 2 HOURS"
+        )
+        pipeline.process_message(msg)
+
+        orders = {o.order_type: o for o in db.get_orders_for_trade(5001)}
+        assert orders[OrderType.TP1].status == OrderStatus.FILLED
+        assert orders[OrderType.TP2].status == OrderStatus.FILLED
+        assert orders[OrderType.TP3].status == OrderStatus.FILLED
+        # SL was auto-canceled by HL when the position closed
+        assert orders[OrderType.STOP_LOSS].status == OrderStatus.CANCELED
+
+    def test_stop_hit_fills_sl_and_cancels_tps(self, pipeline, db):
+        self._seed_open_trade_with_orders(db)
+        msg = (
+            "**STOP TARGET HIT**\n\n"
+            "PAIR: ETH/USDT #5001\n\n"
+            "LOSS: -3.33%"
+        )
+        pipeline.process_message(msg)
+
+        orders = {o.order_type: o for o in db.get_orders_for_trade(5001)}
+        assert orders[OrderType.STOP_LOSS].status == OrderStatus.FILLED
+        assert orders[OrderType.STOP_LOSS].fill_price == 2900.0
+        # HL auto-cancels the TPs when SL fills
+        assert orders[OrderType.TP1].status == OrderStatus.CANCELED
+        assert orders[OrderType.TP2].status == OrderStatus.CANCELED
+        assert orders[OrderType.TP3].status == OrderStatus.CANCELED
+
+    def test_mark_order_filled_returns_false_when_already_filled(self, pipeline, db):
+        """Direct unit test of the helper — second call finds nothing in
+        SUBMITTED state and reports no work done."""
+        self._seed_open_trade_with_orders(db)
+        assert pipeline._mark_order_filled(5001, OrderType.TP1) is True
+        # Second invocation: TP1 is now FILLED, helper finds nothing to do
+        assert pipeline._mark_order_filled(5001, OrderType.TP1) is False
+
+
 class TestCanceledFlow:
     def test_cancel_pending_trade(self, pipeline, db, client):
         """Cancel on a pending trade (entry not yet filled)."""
