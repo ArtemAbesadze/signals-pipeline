@@ -209,6 +209,11 @@ async def port_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def port_amount_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle text input when the user is setting the port amount."""
+    # Defense-in-depth: ChatType.PRIVATE in the registration should keep us
+    # off non-DM updates, but channel_post has user_data=None and bypassing
+    # the filter would crash here on `.get`. Cheap to guard.
+    if context.user_data is None:
+        return
     if context.user_data.get("awaiting_port") != "amount":
         return
 

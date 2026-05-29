@@ -428,6 +428,11 @@ async def trade_note_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def trade_note_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle text input when user is adding a trade note."""
+    # Defense-in-depth: ChatType.PRIVATE in the registration should keep us
+    # off non-DM updates, but channel_post has user_data=None and bypassing
+    # the filter would crash here on `.get`. Cheap to guard.
+    if context.user_data is None:
+        return
     trade_id = context.user_data.get("awaiting_note")
     if trade_id is None:
         return

@@ -237,6 +237,11 @@ async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def config_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle text input for config value changes (leverage, risk limits)."""
+    # Defense-in-depth: ChatType.PRIVATE in the registration should keep us
+    # off non-DM updates, but channel_post has user_data=None and bypassing
+    # the filter would crash here on `.get`. Cheap to guard.
+    if context.user_data is None:
+        return
     awaiting = context.user_data.get("awaiting_config")
     if not awaiting:
         return  # Not waiting for config input, ignore

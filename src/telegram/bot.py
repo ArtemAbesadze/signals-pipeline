@@ -188,8 +188,16 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("preset", preset_command))
         self._app.add_handler(CommandHandler("auto", auto_command))
         self._app.add_handler(CallbackQueryHandler(config_callback, pattern=r"^cfg:"))
-        # Text handler for config value input (leverage, risk limits) — low priority
-        self._app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, config_text_handler), group=2)
+        # Text handler for config value input (leverage, risk limits) — low priority.
+        # ChatType.PRIVATE excludes channel_post updates from the input adapter; without
+        # this the handler fires on every CP signal and crashes with NoneType.user_data.
+        self._app.add_handler(
+            MessageHandler(
+                filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+                config_text_handler,
+            ),
+            group=2,
+        )
 
         # Trade views
         self._app.add_handler(CommandHandler("trades", trades_command))
@@ -205,9 +213,13 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("port", port_command))
         self._app.add_handler(CallbackQueryHandler(port_callback, pattern=r"^port:"))
         # Text handler for port-amount input — separate group so it cohabits
-        # cleanly with the config and note text handlers
+        # cleanly with the config and note text handlers. ChatType.PRIVATE
+        # excludes channel_post updates from the input adapter.
         self._app.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, port_amount_text_handler),
+            MessageHandler(
+                filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+                port_amount_text_handler,
+            ),
             group=1,
         )
 
@@ -220,7 +232,14 @@ class TelegramBot:
 
         # Trade notes
         self._app.add_handler(CallbackQueryHandler(trade_note_callback, pattern=r"^trade_note:"))
-        self._app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, trade_note_text_handler), group=3)
+        # ChatType.PRIVATE excludes channel_post updates from the input adapter.
+        self._app.add_handler(
+            MessageHandler(
+                filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+                trade_note_text_handler,
+            ),
+            group=3,
+        )
 
         # Admin commands
         self._app.add_handler(CommandHandler("admin", admin_help_command))
