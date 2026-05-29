@@ -106,15 +106,14 @@ Key files when something breaks:
 
 ## Current phase
 
-**Phase 4.1 is validated end-to-end via `/inject` synthetic trades.**
-Branch `rework/scope-v1`, HEAD is the CLAUDE.md commit immediately
-following `016d57e`. The architecture pivot (Telegram channel + Telethon
-forwarder) is shipped; both launchd agents are running; one user (Artem)
-is onboarded on testnet with auto_execute=ON; the full chain
-(`/inject → orchestrator → pipeline → HL testnet → manual close`) has
-been exercised cleanly. The last piece — verifying the chain against a
-*real* CP signal flowing through @PotionScannerBot → forwarder → channel
-→ bot → trade — is just patience.
+**Phase 4.1 has shipped its first real CP signals and survived a
+six-bug debugging round.** Branch `rework/scope-v1`, HEAD is the
+CLAUDE.md commit immediately following `bc80fbd`. The first signal day
+(2026-05-25) put two real CP trades through the pipeline (NEAR #2126,
+IMX #2127), surfaced six bugs across the stack, and all six were fixed
+in session 3. Ready for soak round 2 with the fixes in place; once
+those are observed on a fresh CP signal day, Phase 4.1 officially
+closes.
 
 Shipped (Phase 1–3.5):
 
@@ -134,7 +133,7 @@ Shipped (Phase 1–3.5):
 | 3.4 | `747eaeb` | README rewrite — operator's manual for the private-tool scope; full inventory of what's on disk, DB inspection recipes, cleanup commands, VPS migration playbook |
 | 3.5 | `0ee481f` | Mainnet promotion gate — typed `MAINNET` confirmation in `/register` + `/promote_to_mainnet`, big-trade Telegram confirmation dialog ($100 / 5-min defaults), ConfirmationSweeper background task |
 
-Phase 4.1 (sessions 2026-05-24 → 2026-05-25):
+Phase 4.1 — wiring (sessions 2026-05-24 → 2026-05-25):
 
 | # | Commit | What |
 |---|---|---|
@@ -145,6 +144,20 @@ Phase 4.1 (sessions 2026-05-24 → 2026-05-25):
 | 4.1e | `381bbc2` | `start_polling(allowed_updates=Update.ALL_TYPES)` — Telegram doesn't push `channel_post` by default; bug discovered during end-to-end testing |
 | 4.1f | `18d475e` | Hot-reload pipeline Config after Telegram setting edits — without this, `update_user_config(...)` updated the DB but the running pipeline kept its stale cached Config (`Pipeline.refresh_config` + `Orchestrator.refresh_user_config` + handler hooks) |
 | 4.1g | `d4d427e` + `016d57e` | Testnet position floor — on testnet, sub-min calculated sizes bump UP to `RiskConfig.testnet_position_floor_usd` (default $15) instead of skipping. Lets you exercise the full pipeline on testnet without funding the wallet to the level size-by-risk math demands. Broadened in `016d57e` to cover the gap where calc clears HL min but loses notional to `szDecimals` flooring downstream (MEDIUM at $500 port → $10 → $9.25 BTC notional → rejected). Mainnet path unchanged — still raises. |
+
+Phase 4.1 — first real CP signal post-mortem & fixes (session 2026-05-29):
+
+The first night of real signals (NEAR #2126 + IMX #2127 on 2026-05-25)
+exposed six bugs. All fixed; tests added for each.
+
+| # | Bug | Commit | Fix summary |
+|---|---|---|---|
+| 1 | Forwarder didn't preserve message order — Telethon dispatches each `events.NewMessage` handler as its own asyncio task, concurrent `send_message` calls raced. IMX/#2127 showed BREAKEVEN posted before TP1_HIT in our channel even though CP sent in order. | `b45c068` | `asyncio.Lock` around the send call serialises forwarding in receive order. Extracted to testable `_forward_one`; new test specifically asserts no overlapping sends + correct ordering on concurrent submissions. |
+| 3 + 8 | Local `orders` table stayed at `status='submitted'` after exchange-side fills. IMX TP1 + TP2 hit per CP, but our DB still said both resting. Downstream: `/trades` vs `/positions` disagreed, PnL math wrong, "pending entry" UI for filled trades. | `12354c1` | Pipeline lifecycle handlers reconcile the orders table: `_handle_trade_live`→entry FILLED, `_handle_tp_hit`→TP{n} FILLED, `_handle_all_tp_hit`→all TPs FILLED + SL CANCELED, `_handle_stop_hit`→SL FILLED + TPs CANCELED. Uses target price as approx fill_price (CP doesn't expose exact fills); idempotent against the @PotionScannerBot duplicate-message pattern. |
+| 9 | Trading menu showed perp `account_value` ($1.49) as "Balance" while ~$649 sat in spot USDC under HL portfolio margin. | `6c0e661` | Show both: `💵 USDC: $649.00` + `📊 Perp account value: $1.49`. |
+| 4 | `parse_canceled` slurped @PotionScannerBot wrapper noise into the reason — "Source: Potion #Perp Bot Calls TRADE CANCELED TRAD..." instead of the actual reason text. | `66b9f84` | `_extract_cancel_reason` anchors on PAIR/`#NNN` line, walks forward dropping known wrapper-header/footer patterns. Parenthesized reason still wins when CP uses that format. |
+| 11 | **D10 case**: cancel handler used local `trade.status` to decide cancel-orders vs market-close. NEAR's entry filled silently on HL (no `TRADE_LIVE` from CP); status stayed PENDING; cancel handler only canceled the resting orders; position stayed open uncovered. Discovered by checking HL directly two days later. | `3ca1402` | **D10 codified** in CLAUDE.md and REWORK_BRIEF.md: HL is source of truth for position state. `_handle_canceled` now queries `get_open_positions()` and routes to `close_position` when HL has a position, falls back to local status if HL query itself fails. |
+| 12 | HL rejected our 10% IOC close-spread limit prices with "Price too far from oracle". Even HL's own UI hit the same when the user tried to close NEAR — testnet oracle drift + thin orderbook. | `bc80fbd` | `CLOSE_LIMIT_SPREAD_PCT = 3.0` constant used in both `PositionManager.close_position` and the `confirm_close_pos_callback` raw-position close path. Sentinel test prevents quiet re-broadening. |
 
 ### Phase 4.1 architecture pivot — why we're not on Discord
 
@@ -188,19 +201,26 @@ classify; ..."` on a real forwarded breakeven message in 2026-05-24
 session — `classify` returns `breakeven`, `parse_breakeven` returns the
 expected `Breakeven(pair='ETH/USDT', trade_id=2096, tp_secured=2)`.
 
-### Phase 4.1 — where we left off (end of 2026-05-25 session)
+### Phase 4.1 — where we left off (end of 2026-05-29 session)
 
-**Status: synthetic end-to-end validated; awaiting real CP signal to officially close 4.1.**
+**Status: six bugs from first signal day fixed; ready for soak round 2.**
 
 State of the world at session end:
 
-- ✅ Both launchd agents installed and `state=running`: `local.potion-perps-bot` + `local.potion-perps-forwarder`.
-- ✅ Telethon forwarder signed in as Artem (id `7441245554`), forwarding @PotionScannerBot DMs to channel `-1003954991193`.
-- ✅ Main bot running with `adapter=telegram_channel`, **2 active pipelines** (swaag + Artem).
-- ✅ Channel → bot link validated: manual channel posts classify as `noise` in `logs/bot.log`.
-- ✅ Full pipeline validated via `/inject`: signal classify → port check → size (with testnet floor) → build orders → HL testnet submission → manual close. Most recent successful trade IDs (synthetic, `80000-89999` range): **#80842 ETH LONG HIGH $15** (proves testnet floor works — HIGH=1%=$5 calc bumped to floor $15), **#88271 SOL SHORT LOW $20** (no floor needed).
-- ✅ Artem registered on testnet with master `0x274d87Ba5a72C322B8233a9dD30Aaba6500716DF`, api_wallet `0x9cbF9865652Aec91031cB339dc2de72a226dEdA7`, port $500 / withdraw, **auto_execute=ON** (user chose; mainnet gate doesn't apply).
-- ⏳ Real @PotionScannerBot CP signal flowing through end-to-end — still waiting on CP's cadence. Real CP trade_ids are < 80000 (CP is currently in the ~2000-3000 range).
+- ✅ All six bugs from the 2026-05-25 first signal day fixed (see commit table above).
+- ✅ 671 tests passing, including specific regression tests for the six bugs.
+- ✅ D10 codified: HL is source of truth for position state.
+- ✅ Artem registered on testnet, port $500 / withdraw, auto_execute=ON, master `0x274d87Ba5a72C322B8233a9dD30Aaba6500716DF`, api_wallet `0x9cbF9865652Aec91031cB339dc2de72a226dEdA7`.
+- ✅ Both launchd agents reinstalled at session end (this CLAUDE.md commit is followed by `deploy/launchd/install.sh all`).
+- ⏳ Next CP signal day will verify the six fixes hold end-to-end. The chain that needs to flow cleanly: forwarder serialised → channel post in receive order → bot parses → testnet floor sizes if needed → submit to HL → CP lifecycle events arrive → orders table reconciles to FILLED → close on TP3 or SL or cancel works without leaving a hanging position.
+
+**One outstanding artefact from session 1's soak**: NEAR #2126 position
+still open on HL testnet (entry filled silently on 2026-05-25, our DB
+says canceled, the cancel-handler bug let it slip through). HL's UI
+also can't close it under testnet oracle conditions (rejected with the
+same "Price too far from oracle" error the bot was hitting). Leave it
+until testnet resets or until the orderbook improves; no real-money
+risk, doesn't affect the Phase 4.2 testing path.
 
 ### Picking up next session — concrete steps
 
@@ -295,7 +315,7 @@ Phase 5 = parking lot (weekly performance report, VPS, CI/CD, backtest tooling).
 
 ## Tests
 
-**650/650 passing** as of `016d57e` (up from 594 at end of Phase 3.5; +56 tests in Phase 4.1 across the channel adapter, the Telethon forwarder, the second launchd agent, the channel-post passthrough in dm_only_filter, `Orchestrator.refresh_user_config`, and the testnet position floor).
+**671/671 passing** as of `bc80fbd` (up from 594 at end of Phase 3.5; +77 tests in Phase 4.1: channel adapter, Telethon forwarder, second launchd agent, channel-post passthrough, `Orchestrator.refresh_user_config`, testnet position floor, plus the session-3 regression set — forwarder serialisation, orders-table reconciliation, trading-hub balance, cancel-parser wrapper-noise, `_handle_canceled` HL position check, close-spread sentinel + math).
 
 ---
 
