@@ -13,7 +13,7 @@ import importlib.util
 import os
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -113,3 +113,101 @@ class TestSecureSession:
         # Must not raise
         forwarder._secure_session(session)
         assert not session.exists()
+
+
+class TestForwardOne:
+    """The serialised forward path. Telethon dispatches each
+    ``events.NewMessage`` handler as its own asyncio task, so without
+    the lock two near-simultaneous DMs race on ``send_message`` and the
+    destination channel gets them in whichever-completed-first order
+    rather than receive order. Caught on the 2026-05-25 CP soak where
+    BREAKEVEN appeared in our channel *before* the TP1_HIT that
+    triggered it."""
+
+    @pytest.mark.asyncio
+    async def test_empty_text_skipped(self, forwarder):
+        import asyncio as _a
+        mock_client = MagicMock()
+        mock_client.send_message = _make_async_mock()
+        lock = _a.Lock()
+        result = await forwarder._forward_one(mock_client, lock, 123, "")
+        assert result is False
+        mock_client.send_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_normal_text_forwarded(self, forwarder):
+        import asyncio as _a
+        mock_client = MagicMock()
+        mock_client.send_message = _make_async_mock()
+        lock = _a.Lock()
+        result = await forwarder._forward_one(
+            mock_client, lock, 123, "TRADING SIGNAL ALERT...",
+        )
+        assert result is True
+        mock_client.send_message.assert_awaited_once_with(
+            123, "TRADING SIGNAL ALERT...",
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_failure_swallowed(self, forwarder):
+        """Network errors must not propagate — they'd kill the Telethon
+        event loop and stop the forwarder until launchd restarts it."""
+        import asyncio as _a
+        mock_client = MagicMock()
+        mock_client.send_message = _make_async_mock(
+            side_effect=RuntimeError("network down"),
+        )
+        lock = _a.Lock()
+        result = await forwarder._forward_one(mock_client, lock, 123, "x")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_concurrent_calls_serialize_in_receive_order(self, forwarder):
+        """Two ``_forward_one`` tasks started concurrently must call
+        ``send_message`` in submission order — the lock is the contract
+        that prevents the 2026-05-25 BREAKEVEN-before-TP1 reordering.
+
+        Verifies BOTH that ordering is preserved AND that no two
+        ``send_message`` calls are ever in flight at once (which is what
+        produces racy ordering in the real Telethon dispatcher)."""
+        import asyncio as _a
+        completion_order: list[str] = []
+        in_flight: list[str] = []
+
+        async def slow_send(chat_id, text):
+            in_flight.append(text)
+            try:
+                # Even one assertion failure here proves the lock is
+                # broken — Telethon's real dispatcher would otherwise
+                # run both sends concurrently.
+                assert len(in_flight) == 1, f"overlapping sends: {in_flight}"
+                await _a.sleep(0.01)
+                completion_order.append(text)
+            finally:
+                in_flight.remove(text)
+
+        mock_client = MagicMock()
+        mock_client.send_message = _make_async_mock(side_effect=slow_send)
+        lock = _a.Lock()
+
+        t1 = _a.create_task(
+            forwarder._forward_one(mock_client, lock, 123, "first"),
+        )
+        # Yield so t1 acquires the lock before t2 starts
+        await _a.sleep(0)
+        t2 = _a.create_task(
+            forwarder._forward_one(mock_client, lock, 123, "second"),
+        )
+        await _a.gather(t1, t2)
+
+        assert completion_order == ["first", "second"]
+
+
+def _make_async_mock(side_effect=None):
+    """AsyncMock factory — separated so we can configure side_effect
+    cleanly without importing the unittest.mock symbol at module top
+    (Python 3.8+ exposes it but the rest of the file uses MagicMock)."""
+    from unittest.mock import AsyncMock
+    if side_effect is None:
+        return AsyncMock()
+    return AsyncMock(side_effect=side_effect)

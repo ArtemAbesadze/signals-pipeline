@@ -119,6 +119,44 @@ def _secure_session(path: Path) -> None:
         logger.warning("Could not chmod 600 on session file %s: %s", path, e)
 
 
+async def _forward_one(
+    client,
+    lock: asyncio.Lock,
+    dest_channel_id: int,
+    text: str,
+) -> bool:
+    """Forward one message, serialized through ``lock``.
+
+    Telethon dispatches each ``events.NewMessage`` handler as its own
+    asyncio task — without serialisation, two near-simultaneous DMs spawn
+    two concurrent ``send_message`` calls and the destination channel
+    receives them in whichever-completed-first order. That order is racy
+    and ignores send order, which is what corrupted the lifecycle stream
+    on 2026-05-25 (we saw BREAKEVEN posted before TP1_HIT in the channel
+    even though CP sent them in the correct order).
+
+    Holding the lock around the network call forces in-order posting at
+    the cost of throughput — fine for our cadence (a few signals per
+    hour at most). Returns True on success, False on send failure or
+    empty input. Never raises.
+    """
+    if not text:
+        return False
+    async with lock:
+        try:
+            await client.send_message(dest_channel_id, text)
+            logger.info(
+                "Forwarded %d-char message to channel %d",
+                len(text), dest_channel_id,
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "Failed to forward to channel %d", dest_channel_id,
+            )
+            return False
+
+
 async def run(cfg: dict) -> None:
     """Main forwarder loop. Returns when the client disconnects.
 
@@ -145,22 +183,19 @@ async def run(cfg: dict) -> None:
         cfg["source_bot"], source_entity.id, cfg["dest_channel_id"],
     )
 
+    # All forwarding goes through this lock so that two DMs arriving
+    # near-simultaneously land in the destination channel in receive
+    # order. See ``_forward_one`` docstring for the failure mode this
+    # prevents.
+    forward_lock = asyncio.Lock()
+
     @client.on(events.NewMessage(from_users=source_entity, incoming=True))
     async def on_dm(event):
         text = (event.message.text or "").strip()
         if not text:
             logger.debug("Skipping empty DM from source bot")
             return
-        try:
-            await client.send_message(cfg["dest_channel_id"], text)
-            logger.info(
-                "Forwarded %d-char message to channel %d",
-                len(text), cfg["dest_channel_id"],
-            )
-        except Exception:
-            logger.exception(
-                "Failed to forward to channel %d", cfg["dest_channel_id"],
-            )
+        await _forward_one(client, forward_lock, cfg["dest_channel_id"], text)
 
     await client.run_until_disconnected()
 
