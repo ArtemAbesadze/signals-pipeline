@@ -100,6 +100,7 @@ Key files when something breaks:
 | **D7** | User picks testnet or mainnet at registration (current flow stays). |
 | **D8** | Local laptop deployment (24/7). Server migration deferred. Keep design portable (env vars, file config). |
 | **D9** | Daily SQLite backups to `backups/`, date-stamped, prune > 30 days. |
+| **D10** | Hyperliquid is the source of truth for position state. Before decisions that act on a trade (cancel, close, modify SL), query HL directly rather than trusting cached local `trade.status`. CP lifecycle messages drive the audit trail and reconcile the orders table (Bug #3 fix), but they can be missed/mangled/delayed — HL is the authoritative state for what's actually on the books. Forced by 2026-05-25 NEAR/#2126 — silent entry fill, no `TRADE_LIVE` from CP, cancel handler left an open position because it trusted local `status=PENDING`. |
 
 ---
 

@@ -627,7 +627,18 @@ class Pipeline:
             ))
 
     def _handle_canceled(self, raw: str) -> None:
-        """Trade canceled — cancel all orders on exchange."""
+        """Trade canceled — cancel resting orders, market-close if there's
+        a position.
+
+        Critical: queries HL for position state (D10) rather than trusting
+        ``trade.status``. The 2026-05-25 NEAR/#2126 case showed why —
+        the entry resting order filled silently on HL, CP never sent a
+        ``TRADE_LIVE`` event, so our local ``trade.status`` stayed
+        ``PENDING``. The cancel handler then only called ``cancel_trade``
+        (which just cancels resting orders) and left the actual position
+        uncovered on the exchange. HL is authoritative for what's on the
+        books; CP messages are the audit signal, not the state signal.
+        """
         cancel = parse_canceled(raw)
         trade = self._db.get_trade(cancel.trade_id)
         if not trade:
@@ -641,9 +652,28 @@ class Pipeline:
             return
 
         logger.info("Trade #%d canceled: %s", cancel.trade_id, cancel.reason)
-        if trade.status == TradeStatus.OPEN:
+
+        # D10: ask HL whether there's an actual position, don't trust
+        # the cached ``trade.status``. On query failure, fall back to
+        # the local status — better than crashing the cancel.
+        try:
+            positions = self._client.get_open_positions()
+            has_position = any(
+                p.get("coin") == trade.coin
+                and float(p.get("size", 0) or 0) != 0
+                for p in positions
+            )
+        except Exception:
+            logger.exception(
+                "Could not query HL for position on cancel of #%d; "
+                "falling back to local trade.status=%s",
+                cancel.trade_id, trade.status.value,
+            )
+            has_position = trade.status == TradeStatus.OPEN
+
+        if has_position:
             self._pm.close_position(cancel.trade_id, trade.coin, reason="canceled")
-            action = f"position closed; reason: {cancel.reason or 'n/a'}"
+            action = f"position closed (HL had open position); reason: {cancel.reason or 'n/a'}"
         else:
             self._pm.cancel_trade(cancel.trade_id)
             action = f"orders canceled; reason: {cancel.reason or 'n/a'}"

@@ -164,6 +164,14 @@ Designed to run locally on Artem's laptop, 24/7. Server migration comes later. K
 
 Lightweight daily SQLite backup (`sqlite3 .backup`, dump to a local `backups/` directory with date-stamped filenames, prune older than 30 days). Schedule via a background asyncio task in `main.py` or cron.
 
+### D10. Hyperliquid is the source of truth for position state (Phase 4.1)
+
+Before decisions that act on a trade (cancel, close, modify SL), query HL directly rather than trusting the cached local `trade.status`. CP's lifecycle messages (`TRADE_LIVE`, `TP_HIT`, `STOP_HIT`, `ALL_TP_HIT`) remain the **audit signal** and drive the orders-table reconcile (Bug #3 fix from the 2026-05-25 soak) — but they can be missed, delayed, or sent in a format our parser misses. HL is the only place that knows what's actually on the exchange.
+
+**Forced by:** 2026-05-25 NEAR/#2126. Entry resting order filled silently on HL; CP never sent a `TRADE_LIVE` event; `trade.status` stayed `PENDING`. When the cancel arrived, the handler took the `cancel_trade` branch (orders only, no market close) based on the stale status. Position remained open on HL, our DB said canceled — discovered when the user checked HL directly.
+
+**Application:** `_handle_canceled` calls `get_open_positions()` and dispatches to `close_position` (cancel orders + market-close) when HL has a position, `cancel_trade` (orders only) when it doesn't. Other handlers that read `trade.status` to make exchange-affecting decisions will be migrated as we find them.
+
 ---
 
 ## Phase plan
