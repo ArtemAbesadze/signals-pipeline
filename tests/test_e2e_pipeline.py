@@ -357,6 +357,119 @@ class TestStopHitFlow:
         assert closed_trade.pnl_pct == -77.7
 
 
+class TestClosePositionSpread:
+    """Bug #12 / Phase 4.1: HL rejects limit orders too far from the
+    oracle. The old 10% IOC-close spread tripped this on the 2026-05-25
+    NEAR position. 3% is wide enough to fill at mid but stays inside
+    HL's oracle-distance tolerance."""
+
+    def test_constant_is_3pct(self):
+        """Sentinel: if anyone bumps the spread back up, the docstring
+        analysis (HL tolerance ~5%, drift on testnet thin orderbook)
+        needs to be revisited. Failing this test = think first."""
+        from src.exchange.position_manager import CLOSE_LIMIT_SPREAD_PCT
+        assert CLOSE_LIMIT_SPREAD_PCT == 3.0
+
+    def test_long_close_uses_mid_minus_spread(self, tmpdir):
+        """Closing a long position = SELL → limit at mid * 0.97. The
+        SELL crosses the bid (which sits near mid), so IOC fills
+        immediately at ~mid; the spread is just the maximum acceptable
+        slippage HL would accept before rejecting."""
+        from src.exchange.position_manager import PositionManager
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.get_open_positions.return_value = [
+            {"coin": "ETH", "size": 0.1, "entry_price": "3000.0",
+             "unrealized_pnl": "0", "leverage": "10", "liquidation_price": "2700.0"},
+        ]
+        client.get_all_mids.return_value = {"ETH": "3000.0"}
+        client.exchange.order.return_value = _mock_fill_response(oid=42, avg_px=3000.0)
+        client.exchange.cancel.return_value = None
+
+        db = TradeDatabase(user_id="test_user", db_path=tmpdir / "spread.db")
+        from src.state.models import TradeRecord
+        trade = TradeRecord(
+            trade_id=999, user_id="test_user", pair="ETH/USDT", coin="ETH",
+            side="LONG", risk_level="LOW", trade_type="SWING", size_hint="1-4%",
+            entry_price=3000.0, stop_loss=2900.0,
+            tp1=3050.0, tp2=3100.0, tp3=3200.0,
+            leverage=10, signal_leverage=10,
+            position_size_usd=300.0, position_size_coin=0.1,
+        )
+        db.create_trade(trade)
+        db.update_trade_status(999, TradeStatus.OPEN)
+
+        pm = PositionManager(client, db)
+        pm.close_position(999, "ETH", reason="test")
+
+        # Find the close order — it's the IOC limit with reduce_only=True
+        close_calls = [
+            call_args for call_args in client.exchange.order.call_args_list
+            if (call_args[1].get("reduce_only", False)
+                or (len(call_args[0]) >= 5
+                    and isinstance(call_args[0][4], dict)
+                    and call_args[0][4].get("limit", {}).get("tif") == "Ioc"))
+        ]
+        assert close_calls, f"Expected an IOC close order; got {client.exchange.order.call_args_list}"
+        # Positional args: (coin, is_buy, size, limit_px, order_type, ...)
+        coin, is_buy, size, limit_px = close_calls[-1][0][:4]
+        assert coin == "ETH"
+        assert is_buy is False  # closing a long = sell
+        # Mid 3000 * (1 - 0.03) = 2910 (rounded to 5 sig figs = 2910)
+        assert limit_px == pytest.approx(2910.0, rel=0.001), (
+            f"long-close limit_px should be mid * 0.97, got {limit_px}"
+        )
+        db.close()
+
+    def test_short_close_uses_mid_plus_spread(self, tmpdir):
+        """Closing a short position = BUY → limit at mid * 1.03."""
+        from src.exchange.position_manager import PositionManager
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.get_open_positions.return_value = [
+            {"coin": "BTC", "size": -0.005, "entry_price": "60000.0",
+             "unrealized_pnl": "0", "leverage": "10", "liquidation_price": "66000.0"},
+        ]
+        client.get_all_mids.return_value = {"BTC": "60000.0"}
+        client.exchange.order.return_value = _mock_fill_response(oid=42, avg_px=60000.0)
+        client.exchange.cancel.return_value = None
+
+        db = TradeDatabase(user_id="test_user", db_path=tmpdir / "spread2.db")
+        from src.state.models import TradeRecord
+        trade = TradeRecord(
+            trade_id=998, user_id="test_user", pair="BTC/USDT", coin="BTC",
+            side="SHORT", risk_level="LOW", trade_type="SWING", size_hint="1-4%",
+            entry_price=60000.0, stop_loss=61800.0,
+            tp1=58800.0, tp2=57600.0, tp3=55200.0,
+            leverage=10, signal_leverage=10,
+            position_size_usd=300.0, position_size_coin=0.005,
+        )
+        db.create_trade(trade)
+        db.update_trade_status(998, TradeStatus.OPEN)
+
+        pm = PositionManager(client, db)
+        pm.close_position(998, "BTC", reason="test")
+
+        close_calls = [
+            call_args for call_args in client.exchange.order.call_args_list
+            if (call_args[1].get("reduce_only", False)
+                or (len(call_args[0]) >= 5
+                    and isinstance(call_args[0][4], dict)
+                    and call_args[0][4].get("limit", {}).get("tif") == "Ioc"))
+        ]
+        assert close_calls
+        coin, is_buy, size, limit_px = close_calls[-1][0][:4]
+        assert coin == "BTC"
+        assert is_buy is True  # closing a short = buy
+        # Mid 60000 * (1 + 0.03) = 61800
+        assert limit_px == pytest.approx(61800.0, rel=0.001), (
+            f"short-close limit_px should be mid * 1.03, got {limit_px}"
+        )
+        db.close()
+
+
 class TestOrderStatusReconciliation:
     """Phase 4.1 follow-up: CP lifecycle events update local ``orders``
     rows so they don't stay at ``status='submitted'`` after they actually

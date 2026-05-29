@@ -15,6 +15,22 @@ from src.state.database import TradeDatabase
 
 logger = logging.getLogger(__name__)
 
+# Slippage spread for IOC limit-close orders. Hyperliquid rejects
+# limit orders whose price sits too far from the oracle (the
+# "Price too far from oracle" error). Mainnet tolerance is ~5%
+# of the oracle price; testnet is sometimes tighter when the
+# orderbook is thin and the oracle has drifted. The old 10%
+# spread (mid * 0.9 / mid * 1.1) tripped this check on the
+# 2026-05-25 CP soak when the user tried to close the NEAR
+# position both through our bot and through HL's own UI.
+#
+# 3% is wide enough to clear the spread + brief price drift
+# while still landing inside HL's oracle tolerance under normal
+# conditions. If liquidity is deep enough that the IOC fills
+# immediately, the actual fill price will be ~mid; the spread is
+# only the *maximum acceptable* slippage.
+CLOSE_LIMIT_SPREAD_PCT = 3.0
+
 
 class OrderSubmissionError(Exception):
     """Raised when an order fails to submit."""
@@ -317,10 +333,16 @@ class PositionManager:
         # Market close: sell if long, buy if short
         size = abs(pos["size"])
         is_buy = pos["size"] < 0  # buy to close short, sell to close long
-        # Use aggressive price for IOC, rounded to 5 sig figs (Hyperliquid requirement)
+        # Use aggressive IOC limit, rounded to 5 sig figs (HL requirement).
+        # Spread is ``CLOSE_LIMIT_SPREAD_PCT`` to stay inside HL's
+        # oracle-distance tolerance — see constant docstring for the
+        # 2026-05-25 context.
         mids = self._client.get_all_mids()
         mid = float(mids.get(coin, 0))
-        limit_px = _round_price(mid * 0.9 if not is_buy else mid * 1.1)
+        _spread = CLOSE_LIMIT_SPREAD_PCT / 100.0
+        limit_px = _round_price(
+            mid * (1 + _spread) if is_buy else mid * (1 - _spread)
+        )
 
         result = self._client.exchange.order(
             coin, is_buy, size, limit_px,

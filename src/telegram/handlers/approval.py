@@ -12,7 +12,12 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from src.exchange.order_builder import build_orders
-from src.exchange.position_manager import OrderSubmissionError, PositionManager, _round_price
+from src.exchange.position_manager import (
+    CLOSE_LIMIT_SPREAD_PCT,
+    OrderSubmissionError,
+    PositionManager,
+    _round_price,
+)
 from src.orchestrator import Orchestrator
 from src.parser.signal_parser import ParsedSignal, RiskLevel, Side
 from src.state.models import EventType, TradeRecord, TradeStatus
@@ -312,9 +317,15 @@ async def confirm_close_pos_callback(update: Update, context: ContextTypes.DEFAU
 
         size = abs(pos["size"])
         is_buy = pos["size"] < 0  # buy to close short
+        # Same IOC-with-tight-spread pattern as
+        # ``PositionManager.close_position`` — stays inside HL's
+        # oracle-distance tolerance. See ``CLOSE_LIMIT_SPREAD_PCT``.
         mids = ctx.client.get_all_mids()
         mid = float(mids.get(coin, 0))
-        limit_px = _round_price(mid * 0.9 if not is_buy else mid * 1.1)
+        _spread = CLOSE_LIMIT_SPREAD_PCT / 100.0
+        limit_px = _round_price(
+            mid * (1 + _spread) if is_buy else mid * (1 - _spread)
+        )
 
         ctx.client.exchange.order(
             coin, is_buy, size, limit_px,
