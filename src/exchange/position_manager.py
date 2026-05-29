@@ -318,7 +318,19 @@ class PositionManager:
     def close_position(self, trade_id: int, coin: str, reason: str = "manual") -> None:
         """Market-close any remaining position for a trade.
 
-        Cancels open orders first, then submits a market close if a position exists.
+        Cancels open orders first, then submits a market close if a position
+        exists. Raises ``OrderSubmissionError`` when HL rejects the close
+        (e.g. "Price too far from oracle"); does NOT mark the trade as
+        closed in that case — the position is still open and the caller
+        should surface the error to the user (Bug #13 from the 2026-05-29
+        soak: previously this method always called ``update_trade_status
+        (CLOSED)`` after the order call regardless of whether HL actually
+        filled, accepted, or rejected it).
+
+        Idempotency: if HL accepts the order but doesn't fill (IOC with
+        no matching liquidity at the limit price), the trade status is
+        ALSO left untouched — the position is still on the books and
+        the caller should retry or escalate. Logged as a warning.
         """
         # Cancel any remaining open orders
         self.cancel_trade(trade_id)
@@ -327,6 +339,7 @@ class PositionManager:
         positions = self._client.get_open_positions()
         pos = next((p for p in positions if p["coin"] == coin), None)
         if not pos or pos["size"] == 0:
+            # No exchange position — orders are canceled, mark CLOSED for audit
             self._db.update_trade_status(trade_id, TradeStatus.CLOSED, close_reason=reason)
             return
 
@@ -350,13 +363,36 @@ class PositionManager:
             reduce_only=True,
         )
 
+        # Inspect HL's response — don't assume success.
+        error = _get_error(result)
+        if error:
+            logger.error(
+                "Failed to market-close %s for trade #%d: %s",
+                coin, trade_id, error,
+            )
+            raise OrderSubmissionError(f"Market close rejected: {error}")
+
         fill = _extract_fill(result)
         if fill:
-            logger.info("Position closed: %s %s @ %s", coin, fill.get("totalSz"), fill.get("avgPx"))
-        else:
-            logger.warning("Position close may not have filled fully: %s", result)
+            logger.info(
+                "Position closed: %s %s @ %s (trade #%d)",
+                coin, fill.get("totalSz"), fill.get("avgPx"), trade_id,
+            )
+            self._db.update_trade_status(
+                trade_id, TradeStatus.CLOSED, close_reason=reason,
+            )
+            return
 
-        self._db.update_trade_status(trade_id, TradeStatus.CLOSED, close_reason=reason)
+        # No error AND no fill: IOC accepted but no matching liquidity at
+        # the limit price. Position is still open. Don't mark CLOSED.
+        logger.warning(
+            "Market close for %s (trade #%d) submitted but did NOT fill — "
+            "position likely still open. HL response: %s",
+            coin, trade_id, result,
+        )
+        raise OrderSubmissionError(
+            f"Market close submitted but did not fill — position may still be open"
+        )
 
     def move_stop_loss(self, trade_id: int, coin: str, new_price: float) -> bool:
         """Cancel the existing SL and place a new one at *new_price*.

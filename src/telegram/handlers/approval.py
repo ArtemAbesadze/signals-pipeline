@@ -16,6 +16,8 @@ from src.exchange.position_manager import (
     CLOSE_LIMIT_SPREAD_PCT,
     OrderSubmissionError,
     PositionManager,
+    _extract_fill,
+    _get_error,
     _round_price,
 )
 from src.orchestrator import Orchestrator
@@ -327,14 +329,53 @@ async def confirm_close_pos_callback(update: Update, context: ContextTypes.DEFAU
             mid * (1 + _spread) if is_buy else mid * (1 - _spread)
         )
 
-        ctx.client.exchange.order(
+        result = ctx.client.exchange.order(
             coin, is_buy, size, limit_px,
             {"limit": {"tif": "Ioc"}},
             reduce_only=True,
         )
 
+        # Bug #13: previously this handler showed "Position Closed" no
+        # matter what HL returned. Now: inspect the response and tell
+        # the user what actually happened.
+        error = _get_error(result)
+        if error:
+            logger.error("Failed to market-close %s: %s", coin, error)
+            await query.edit_message_text(
+                f"⚠️ *Close failed for {coin}* — {error}\n\n"
+                "Position is still open. Common cause on testnet is "
+                "oracle drift — try again in a few seconds, or close "
+                "from HL directly.",
+                parse_mode="Markdown",
+            )
+            return
+
+        fill = _extract_fill(result)
+        if fill:
+            avg_px = fill.get("avgPx", "?")
+            total_sz = fill.get("totalSz", size)
+            logger.info(
+                "Market-closed %s: %s @ %s",
+                coin, total_sz, avg_px,
+            )
+            await query.edit_message_text(
+                f"*Position Closed* — {coin}\n\n"
+                f"Filled: {total_sz} @ ${avg_px}",
+                parse_mode="Markdown",
+            )
+            return
+
+        # Order accepted by HL but no fill — IOC with no matching liquidity.
+        # Position is still open. Surface honestly.
+        logger.warning(
+            "Market-close for %s submitted but did NOT fill — "
+            "position likely still open. HL response: %s",
+            coin, result,
+        )
         await query.edit_message_text(
-            f"*Position Closed* — {coin} has been market-closed.",
+            f"⚠️ *Close submitted but didn't fill* — {coin} may still be open. "
+            "Likely thin orderbook at the limit price. Check HL directly "
+            "or try again.",
             parse_mode="Markdown",
         )
     except Exception as e:

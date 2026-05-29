@@ -470,6 +470,119 @@ class TestClosePositionSpread:
         db.close()
 
 
+class TestClosePositionResponseHandling:
+    """Bug #13 from 2026-05-29: ``close_position`` previously called
+    ``update_trade_status(CLOSED)`` unconditionally after the order
+    submission, regardless of whether HL filled, rejected, or just
+    rested without matching. User saw "Position Closed" notifications
+    while NEAR remained open on the exchange.
+
+    Post-fix contract:
+      - fill in response       → mark CLOSED, return cleanly
+      - error in response      → raise OrderSubmissionError, leave status
+      - no fill, no error      → raise OrderSubmissionError, leave status
+    """
+
+    def _seed_open_trade_with_hl_position(self, tmpdir, coin: str):
+        from src.exchange.position_manager import PositionManager
+        from unittest.mock import MagicMock
+        from src.state.models import TradeRecord
+
+        client = MagicMock()
+        client.get_open_positions.return_value = [
+            {"coin": coin, "size": 5.0, "entry_price": "100.0",
+             "unrealized_pnl": "0", "leverage": "10", "liquidation_price": "90.0"},
+        ]
+        client.get_all_mids.return_value = {coin: "100.0"}
+        client.exchange.cancel.return_value = None
+
+        db = TradeDatabase(user_id="test_user", db_path=tmpdir / f"{coin}.db")
+        trade = TradeRecord(
+            trade_id=7777, user_id="test_user", pair=f"{coin}/USDT", coin=coin,
+            side="LONG", risk_level="LOW", trade_type="SWING", size_hint="1-4%",
+            entry_price=100.0, stop_loss=95.0, tp1=102.0, tp2=105.0, tp3=110.0,
+            leverage=10, signal_leverage=10,
+            position_size_usd=500.0, position_size_coin=5.0,
+        )
+        db.create_trade(trade)
+        db.update_trade_status(7777, TradeStatus.OPEN)
+        return client, db, PositionManager(client, db)
+
+    def test_close_fills_marks_trade_closed(self, tmpdir):
+        client, db, pm = self._seed_open_trade_with_hl_position(tmpdir, "ETH")
+        client.exchange.order.return_value = _mock_fill_response(
+            oid=42, avg_px=99.5,
+        )
+        pm.close_position(7777, "ETH", reason="test_filled")
+        assert db.get_trade(7777).status == TradeStatus.CLOSED
+        assert db.get_trade(7777).close_reason == "test_filled"
+        db.close()
+
+    def test_close_rejected_by_hl_raises_and_leaves_status(self, tmpdir):
+        """The 2026-05-29 NEAR case: HL rejects with 'Price too far from
+        oracle'. Pre-fix: code reported success anyway. Post-fix: raise
+        the error, leave the trade status untouched (cancel_trade set
+        CANCELED earlier in the call)."""
+        client, db, pm = self._seed_open_trade_with_hl_position(tmpdir, "NEAR")
+        client.exchange.order.return_value = {
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {"statuses": [
+                    {"error": "Price too far from oracle"},
+                ]},
+            },
+        }
+        from src.exchange.position_manager import OrderSubmissionError
+        with pytest.raises(OrderSubmissionError, match="Price too far from oracle"):
+            pm.close_position(7777, "NEAR", reason="test_reject")
+        # Status was set by cancel_trade (called first) → CANCELED, not CLOSED
+        assert db.get_trade(7777).status == TradeStatus.CANCELED
+        db.close()
+
+    def test_close_accepted_but_no_fill_raises_and_leaves_status(self, tmpdir):
+        """IOC with no matching liquidity at the limit price: HL accepts
+        the order but it doesn't fill. Position is still open. Don't
+        mark CLOSED — raise so the caller surfaces the truth."""
+        client, db, pm = self._seed_open_trade_with_hl_position(tmpdir, "SOL")
+        client.exchange.order.return_value = _mock_exchange_response(oid=42)  # resting, no fill
+        from src.exchange.position_manager import OrderSubmissionError
+        with pytest.raises(OrderSubmissionError, match="did not fill"):
+            pm.close_position(7777, "SOL", reason="test_nofill")
+        assert db.get_trade(7777).status == TradeStatus.CANCELED
+        db.close()
+
+    def test_close_with_no_hl_position_marks_closed_without_order(self, tmpdir):
+        """Sanity: when HL has nothing to close, skip the market-close
+        step and mark the trade CLOSED for audit. Doesn't call
+        ``exchange.order`` at all."""
+        from src.exchange.position_manager import PositionManager
+        from unittest.mock import MagicMock
+        from src.state.models import TradeRecord
+        client = MagicMock()
+        client.get_open_positions.return_value = []  # nothing on HL
+        client.exchange.cancel.return_value = None
+
+        db = TradeDatabase(user_id="test_user", db_path=tmpdir / "noop.db")
+        trade = TradeRecord(
+            trade_id=6666, user_id="test_user", pair="BTC/USDT", coin="BTC",
+            side="LONG", risk_level="LOW", trade_type="SWING", size_hint="1-4%",
+            entry_price=50000.0, stop_loss=48000.0,
+            tp1=51000.0, tp2=52000.0, tp3=55000.0,
+            leverage=10, signal_leverage=10,
+            position_size_usd=500.0, position_size_coin=0.01,
+        )
+        db.create_trade(trade)
+        db.update_trade_status(6666, TradeStatus.OPEN)
+
+        pm = PositionManager(client, db)
+        pm.close_position(6666, "BTC", reason="no_position")
+        assert db.get_trade(6666).status == TradeStatus.CLOSED
+        assert db.get_trade(6666).close_reason == "no_position"
+        client.exchange.order.assert_not_called()
+        db.close()
+
+
 class TestOrderStatusReconciliation:
     """Phase 4.1 follow-up: CP lifecycle events update local ``orders``
     rows so they don't stay at ``status='submitted'`` after they actually
@@ -610,7 +723,10 @@ class TestCanceledFlow:
 
         Post-D10: local ``trade.status=OPEN`` is no longer sufficient by
         itself; HL also has to confirm the position. Both consistent in
-        this test."""
+        this test. Post-Bug-#13: ``close_position`` only marks the trade
+        CLOSED after seeing a real fill in the HL response — so we have
+        to return a fill response from the mock, not the default
+        "resting" one."""
         from src.state.models import TradeRecord
         trade = TradeRecord(
             trade_id=1249, user_id="test_user", pair="DOT/USDT", coin="DOT",
@@ -624,6 +740,11 @@ class TestCanceledFlow:
             {"coin": "DOT", "size": 14.0, "entry_price": "7.0",
              "unrealized_pnl": "0", "leverage": "10", "liquidation_price": "5.0"},
         ]
+        client.get_all_mids.return_value = {"DOT": "7.0"}
+        # Bug #13 fix expects a real fill in the response for the market-close
+        client.exchange.order.side_effect = lambda *a, **kw: _mock_fill_response(
+            oid=9999, avg_px=6.95,
+        )
 
         pipeline.process_message(_load("canceled_04.txt"))  # DOT #1249
 
@@ -656,6 +777,11 @@ class TestCanceledFlow:
             {"coin": "NEAR", "size": 5.7, "entry_price": "2.615",
              "unrealized_pnl": "0", "leverage": "20", "liquidation_price": "2.0"},
         ]
+        client.get_all_mids.return_value = {"NEAR": "2.615"}
+        # Bug #13 fix expects a real fill in the response for the market-close
+        client.exchange.order.side_effect = lambda *a, **kw: _mock_fill_response(
+            oid=9998, avg_px=2.60,
+        )
 
         pipeline.process_message(_load("canceled_01.txt"))  # RENDER #1265 — wrong, use raw
         # Actually use a NEAR-specific cancel message
