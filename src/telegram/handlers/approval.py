@@ -337,15 +337,16 @@ async def confirm_close_pos_callback(update: Update, context: ContextTypes.DEFAU
 
         # Bug #13: previously this handler showed "Position Closed" no
         # matter what HL returned. Now: inspect the response and tell
-        # the user what actually happened.
+        # the user what actually happened. The error string passes
+        # through verbatim from HL — no hardcoded interpretation, since
+        # HL can reject for many reasons (oracle drift, insufficient
+        # margin, asset issues, ...) and hardcoding context for one of
+        # them is misleading when a different one fires.
         error = _get_error(result)
         if error:
             logger.error("Failed to market-close %s: %s", coin, error)
             await query.edit_message_text(
-                f"⚠️ *Close failed for {coin}* — {error}\n\n"
-                "Position is still open. Common cause on testnet is "
-                "oracle drift — try again in a few seconds, or close "
-                "from HL directly.",
+                f"⚠️ *Close failed for {coin}* — {error}",
                 parse_mode="Markdown",
             )
             return
