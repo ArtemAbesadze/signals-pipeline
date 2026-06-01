@@ -608,6 +608,99 @@ def cleanup_test_data(db_path: Path) -> dict[str, int]:
         conn.close()
 
 
+def _list_test_orders_with_oid(db_path: Path) -> list[tuple[str, int, str]]:
+    """Return ``(user_id, oid, coin)`` for every test order whose oid is
+    set in the local DB. Used by ``cancel_orphan_orders_on_hl`` to pair
+    HL cancel calls with the right user's credentials.
+
+    The bot's DB may say these orders are FILLED or CANCELED — that's
+    the design-limitation ghost the test driver creates (synthetic CP
+    events don't trigger real HL state changes). They're still resting
+    on HL and need an actual HL cancel call.
+    """
+    if not db_path.exists():
+        return []
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            """SELECT user_id, oid, coin
+               FROM orders
+               WHERE trade_id BETWEEN ? AND ?
+                 AND oid IS NOT NULL""",
+            (TEST_TRADE_ID_MIN, TEST_TRADE_ID_MAX),
+        ).fetchall()
+        return [(r[0], int(r[1]), r[2]) for r in rows]
+    finally:
+        conn.close()
+
+
+def cancel_orphan_orders_on_hl(db_path: Path) -> dict[str, int]:
+    """Cancel any test orders still resting on HL.
+
+    Walks every order row in the test trade ID range that has an oid
+    (i.e. actually made it to the exchange at some point), groups by
+    user_id, builds a HyperliquidClient per user, and fires a cancel
+    against each oid. Already-canceled orders return OK from HL — the
+    call is idempotent. Errors per-order are caught + logged so one
+    failure doesn't block the rest.
+
+    Returns ``{user_id: {"canceled": N, "errors": M}}``.
+    """
+    from src.exchange.hyperliquid import HyperliquidClient  # local — keep top of file dep-free
+    from src.state.user_db import UserDatabase
+
+    rows = _list_test_orders_with_oid(db_path)
+    if not rows:
+        return {}
+
+    # Group oids by user_id so we build one HL client per user.
+    by_user: dict[str, list[tuple[int, str]]] = {}
+    for user_id, oid, coin in rows:
+        by_user.setdefault(user_id, []).append((oid, coin))
+
+    udb = UserDatabase()
+    results: dict[str, dict[str, int]] = {}
+    try:
+        for user_id, oid_coin_pairs in by_user.items():
+            creds = udb.get_user_credentials_decrypted(user_id)
+            if not creds:
+                logger.warning(
+                    "Skipping cancel for user %s — no credentials in DB", user_id,
+                )
+                continue
+            try:
+                client = HyperliquidClient(
+                    account_address=creds["account_address"],
+                    private_key=creds["api_secret"],
+                    network=creds.get("network", "testnet"),
+                )
+            except Exception:
+                logger.exception("Skipping cancel for user %s — client init failed", user_id)
+                continue
+            canceled = 0
+            errors = 0
+            for oid, coin in oid_coin_pairs:
+                try:
+                    client.exchange.cancel(coin, oid)
+                    canceled += 1
+                except Exception as e:
+                    # HL returns OK for already-canceled orders; this catch
+                    # is for real transport / signing failures.
+                    logger.warning(
+                        "Cancel failed for %s oid=%s (user=%s): %s",
+                        coin, oid, user_id, e,
+                    )
+                    errors += 1
+            results[user_id] = {"canceled": canceled, "errors": errors}
+            logger.info(
+                "User %s: canceled %d test orders on HL (%d errors)",
+                user_id, canceled, errors,
+            )
+    finally:
+        udb.close()
+    return results
+
+
 # ============================================================================
 # Forwarder management
 # ============================================================================
@@ -921,10 +1014,27 @@ def main() -> None:
     db_path = _REPO_ROOT / "data" / "trades.db"
 
     if args.cleanup:
-        result = cleanup_test_data(db_path)
+        # Cancel orphan HL orders FIRST — once we delete the DB rows
+        # we lose the oid → user_id mapping needed to know which
+        # credentials to use for the cancel call. HL cancel is
+        # idempotent so already-canceled orders are no-ops.
+        try:
+            hl_result = cancel_orphan_orders_on_hl(db_path)
+        except Exception:
+            logger.exception(
+                "HL orphan cleanup failed — proceeding with DB cleanup anyway",
+            )
+            hl_result = {}
+        for uid, counts in hl_result.items():
+            logger.info(
+                "  HL: user=%s canceled=%d errors=%d",
+                uid, counts["canceled"], counts["errors"],
+            )
+
+        db_result = cleanup_test_data(db_path)
         logger.info(
-            "Cleanup complete — deleted %d trades, %d orders, %d events",
-            result["trades"], result["orders"], result["trade_events"],
+            "DB cleanup — deleted %d trades, %d orders, %d events",
+            db_result["trades"], db_result["orders"], db_result["trade_events"],
         )
         return
 

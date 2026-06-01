@@ -39,6 +39,7 @@ from scripts.test_driver import (
     TradePlan,
     _all_tp_profit_pct,
     _format_price,
+    _list_test_orders_with_oid,
     _stop_loss_pct,
     _tp_profit_pct,
     assign_scenarios,
@@ -312,6 +313,65 @@ class TestCleanup:
     def test_cleanup_no_db_returns_zeros(self, tmp_path):
         result = cleanup_test_data(tmp_path / "missing.db")
         assert result == {"trades": 0, "orders": 0, "trade_events": 0}
+
+
+class TestHlOrphanOrderCleanup:
+    """The synthetic CP-format events ``all_tp_hit`` / ``stop_hit`` /
+    ``canceled`` mark orders as FILLED or CANCELED in the local DB, but
+    the orders are still resting on HL because the synthetic events
+    didn't actually trigger any real exchange fills. Each test run
+    leaks a handful of these orphan orders. ``--cleanup`` should
+    cancel them on HL before deleting the DB rows."""
+
+    def _seed_orders_db(self, tmp_path, rows):
+        """Create a minimal orders table at ``tmp_path/trades.db`` and
+        insert *rows* = list of (trade_id, user_id, oid, coin, status)."""
+        db = tmp_path / "trades.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            """CREATE TABLE orders (
+                trade_id INTEGER, user_id TEXT, oid INTEGER,
+                order_type TEXT, coin TEXT, side TEXT,
+                size REAL, price REAL, status TEXT
+            )"""
+        )
+        for tid, uid, oid, coin, status in rows:
+            conn.execute(
+                "INSERT INTO orders VALUES (?, ?, ?, 'entry', ?, 'BUY', 1.0, 1.0, ?)",
+                (tid, uid, oid, coin, status),
+            )
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_lists_test_orders_with_oid_only(self, tmp_path):
+        db = self._seed_orders_db(tmp_path, [
+            (7_000_005, "alice", 12345, "ETH", "canceled"),
+            (7_000_006, "alice", 67890, "BTC", "filled"),
+            (1234,      "alice", 11111, "SOL", "filled"),   # real CP trade — must be excluded
+            (7_000_007, "alice", None,  "ADA", "pending"),  # no oid — excluded
+            (7_000_008, "bob",   22222, "INJ", "filled"),
+        ])
+        rows = _list_test_orders_with_oid(db)
+        # Order from query is unspecified; sort for stable assertions
+        rows = sorted(rows, key=lambda r: (r[0], r[1]))
+        assert rows == [
+            ("alice", 12345, "ETH"),
+            ("alice", 67890, "BTC"),
+            ("bob",   22222, "INJ"),
+        ]
+
+    def test_returns_empty_when_no_db(self, tmp_path):
+        rows = _list_test_orders_with_oid(tmp_path / "missing.db")
+        assert rows == []
+
+    def test_returns_empty_when_no_test_orders(self, tmp_path):
+        db = self._seed_orders_db(tmp_path, [
+            (1234, "alice", 11111, "SOL", "filled"),
+            (2127, "alice", 22222, "ETH", "filled"),
+        ])
+        rows = _list_test_orders_with_oid(db)
+        assert rows == []
 
 
 class TestRealisticPercentages:
