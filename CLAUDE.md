@@ -323,9 +323,9 @@ Audit every closed trade with the README's "Inspecting a single trade end-to-end
 - Chronological `trade_events` cleanly tells the story
 - `orders` table shows the expected 5 orders (entry + SL + TP1/2/3) with the right statuses
 
-#### Known unfixed production bugs (surfaced by 4.2/4.3, not yet fixed)
+#### Fixed Phase 4.3 production bugs
 
-##### Bug #18 — Price precision exceeds HL's max-decimals cap on tight-tick coins
+##### Bug #18 — Price precision exceeds HL's max-decimals cap on tight-tick coins (✅ fixed `e351b6f`)
 
 Surfaced 2026-06-01 during the first Telethon-fixed test driver run on
 kBONK (synthetic trade #7000001). HL rejected SL + TP2 + TP3 with
@@ -369,35 +369,36 @@ test #7000001 (kBONK SHORT 3708 @ 0.005393) followed the
 Direct query: ``client.get_open_positions()`` returned the kBONK
 position; ``client.get_open_orders()`` returned only the TP1.
 
-Fix outline (do not ship inline with 4.3 — keep separate):
+**Fix landed at `e351b6f`** (2026-06-01):
 
-1. `_round_price` in `src/exchange/order_builder.py` (line 38) and the
-   duplicated copy in `src/exchange/position_manager.py` (line 40)
-   must enforce both constraints: 5 sig figs **and** ≤ 6 decimals
-   for perps. The conservative form is:
-   ```python
-   def _round_price(price: float, sig_figs: int = 5, max_decimals: int = 6) -> float:
-       sig_rounded = round_sig_figs(price, sig_figs)
-       return round(sig_rounded, max_decimals)
-   ```
-2. Confirm against HL's `meta` endpoint — there may be a per-asset
-   `pxDecimals` field that gives the real cap; prefer it over a
-   hard-coded 6 if it's reliably populated.
-3. Add a parametrized test feeding each low-priced HL coin (`kBONK`,
-   `kSHIB`, `kPEPE`, `kDOGS`, `kLUNC`, `kNEIRO`) through `build_orders`
-   with a representative entry and asserting every output price
-   satisfies both constraints. Test class:
-   `tests/test_order_builder.py::TestPricePrecisionForTightTickCoins`.
-4. Audit existing real CP trades on low-priced coins to see if any
-   live positions were silently left without an SL. SQL:
-   ```sql
-   SELECT t.trade_id, t.coin, t.status,
-          SUM(CASE WHEN o.order_type='stop_loss' AND o.status='pending' THEN 1 ELSE 0 END) AS sl_unsubmitted
-   FROM trades t LEFT JOIN orders o
-     ON t.trade_id = o.trade_id AND t.user_id = o.user_id
-   WHERE t.coin LIKE 'k%' OR t.coin IN ('PEPE','SHIB','BONK','DOGS','LUNC','NEIRO')
-   GROUP BY t.trade_id;
-   ```
+1. `_round_price` in both `src/exchange/order_builder.py:38` and
+   `src/exchange/position_manager.py:40` now enforces both constraints
+   simultaneously — sig-figs round first, then `round(..., max_decimals=6)`.
+2. New `TestPricePrecisionForTightTickCoins` class in
+   `tests/test_e2e_pipeline.py` — 23 parametrized cases covering low-priced
+   coins, sig-figs preservation, high-priced no-op, and a sentinel
+   verifying the two duplicated copies agree on every test price.
+3. Confirmed in production: after the fix, /positions → Close kBONK
+   succeeded (where it previously got "Order has invalid price"). All
+   subsequent test runs on DOGE/ADA passed Bug #18 cleanly.
+
+**Audit query for historical victims** (run if you want to find any real
+CP trades on low-priced coins that may have been left uncovered before
+the fix):
+
+```sql
+SELECT t.trade_id, t.coin, t.status,
+       SUM(CASE WHEN o.order_type='stop_loss' AND o.status='pending' THEN 1 ELSE 0 END) AS sl_unsubmitted
+FROM trades t LEFT JOIN orders o
+  ON t.trade_id = o.trade_id AND t.user_id = o.user_id
+WHERE t.coin LIKE 'k%' OR t.coin IN ('PEPE','SHIB','BONK','DOGS','LUNC','NEIRO')
+GROUP BY t.trade_id
+HAVING sl_unsubmitted > 0;
+```
+
+**Open follow-up**: long-term, consolidate the two `_round_price` copies
+into a shared utility (e.g. `src/utils/hl_price.py`). For now the
+sentinel test catches drift; refactor when there's a third caller.
 
 #### Operational notes — what we learned
 
