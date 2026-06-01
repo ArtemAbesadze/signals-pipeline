@@ -323,6 +323,82 @@ Audit every closed trade with the README's "Inspecting a single trade end-to-end
 - Chronological `trade_events` cleanly tells the story
 - `orders` table shows the expected 5 orders (entry + SL + TP1/2/3) with the right statuses
 
+#### Known unfixed production bugs (surfaced by 4.2/4.3, not yet fixed)
+
+##### Bug #18 — Price precision exceeds HL's max-decimals cap on tight-tick coins
+
+Surfaced 2026-06-01 during the first Telethon-fixed test driver run on
+kBONK (synthetic trade #7000001). HL rejected SL + TP2 + TP3 with
+"Order has invalid price"; entry + TP1 were accepted by coincidence.
+
+Root cause: `src/exchange/order_builder.py::_round_price` rounds to 5
+significant figures but does **not** cap decimal places. HL perps
+enforce TWO constraints on order prices simultaneously: at most 5 sig
+figs AND at most 6 decimal places. For coins priced below ~$0.01, 5
+sig figs naturally produces 7+ decimals → exceeds HL's decimal cap →
+"Order has invalid price".
+
+Example from the test (kBONK SHORT, entry 0.005393):
+
+| Order | Price | Decimals | Sig figs | HL verdict |
+|---|---|---|---|---|
+| entry | 0.005393 | 6 | 4 | OK |
+| SL | 0.0055009 | 7 | 5 | REJECTED |
+| TP1 | 0.005366 | 6 | 4 | OK (lucky) |
+| TP2 | 0.0053391 | 7 | 5 | REJECTED |
+| TP3 | 0.0052851 | 7 | 5 | REJECTED |
+
+Affected coins on the bot's existing pool: `kBONK`, `kSHIB`, `kPEPE`,
+`kDOGS`, `kLUNC`, `kNEIRO`, plus any other base coin priced below
+~$0.01. Real CP signals on these would silently lose orders the same
+way — TP1 might land OK but SL almost certainly won't.
+
+**D10 implication — the dangerous part.** A rejected SL means the
+position is left **uncovered** on HL. The pipeline marks the trade as
+opened locally (entry fills) but only entry + TP1 actually exist on
+the exchange. When CP later sends `stop_hit`, the bot reconciles SL
+as FILLED in the DB even though no SL was ever submitted — the DB
+lies, the position runs. Same risk class as NEAR #2126.
+
+**Empirically confirmed on 2026-06-01 during test driver run #2**:
+test #7000001 (kBONK SHORT 3708 @ 0.005393) followed the
+``stop_hit`` scenario. After the synthetic stop_hit event:
+- DB: ``status=closed, close_reason=stop_hit``
+- HL: position still open, **no SL anywhere**, unrealized
+  -$0.06 and drifting. Only the reduceOnly TP1 buy remained.
+Direct query: ``client.get_open_positions()`` returned the kBONK
+position; ``client.get_open_orders()`` returned only the TP1.
+
+Fix outline (do not ship inline with 4.3 — keep separate):
+
+1. `_round_price` in `src/exchange/order_builder.py` (line 38) and the
+   duplicated copy in `src/exchange/position_manager.py` (line 40)
+   must enforce both constraints: 5 sig figs **and** ≤ 6 decimals
+   for perps. The conservative form is:
+   ```python
+   def _round_price(price: float, sig_figs: int = 5, max_decimals: int = 6) -> float:
+       sig_rounded = round_sig_figs(price, sig_figs)
+       return round(sig_rounded, max_decimals)
+   ```
+2. Confirm against HL's `meta` endpoint — there may be a per-asset
+   `pxDecimals` field that gives the real cap; prefer it over a
+   hard-coded 6 if it's reliably populated.
+3. Add a parametrized test feeding each low-priced HL coin (`kBONK`,
+   `kSHIB`, `kPEPE`, `kDOGS`, `kLUNC`, `kNEIRO`) through `build_orders`
+   with a representative entry and asserting every output price
+   satisfies both constraints. Test class:
+   `tests/test_order_builder.py::TestPricePrecisionForTightTickCoins`.
+4. Audit existing real CP trades on low-priced coins to see if any
+   live positions were silently left without an SL. SQL:
+   ```sql
+   SELECT t.trade_id, t.coin, t.status,
+          SUM(CASE WHEN o.order_type='stop_loss' AND o.status='pending' THEN 1 ELSE 0 END) AS sl_unsubmitted
+   FROM trades t LEFT JOIN orders o
+     ON t.trade_id = o.trade_id AND t.user_id = o.user_id
+   WHERE t.coin LIKE 'k%' OR t.coin IN ('PEPE','SHIB','BONK','DOGS','LUNC','NEIRO')
+   GROUP BY t.trade_id;
+   ```
+
 #### Operational notes — what we learned
 
 - **swaag (`7375268438`) is a real user on a SEPARATE testnet account** (master `0x8fd9888fB9ad93A968aB9C2e4eA12036C286BC98`). Not just a test fixture. She's active, has credentials, no port set. Every CP signal flowing through the pipeline currently produces a `skipped: port not configured` event + Telegram DM to her. Either ask her to set a port, or temporarily deactivate via admin API if she'd be annoyed.
