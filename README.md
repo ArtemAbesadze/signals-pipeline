@@ -724,12 +724,98 @@ Full text in [`docs/REWORK_BRIEF.md`](docs/REWORK_BRIEF.md). Short version:
 
 ---
 
+## Testing — synthetic CP signal driver
+
+A third process (`scripts/test_driver.py`) replaces the real Telegram
+forwarder during test runs. It generates synthetic CP-format signals
+and drives each through its full lifecycle, posting to the same mirror
+channel that the real forwarder uses. Everything downstream — parser,
+pipeline, position manager, Hyperliquid — runs unmodified.
+
+**Test trade IDs live in `[7_000_000, 7_999_999]`.** Real CP trade IDs
+are 4 digits (max ~3000), so any 7-digit `trade_id` in the DB is
+synthetic. This is the primary "obvious test trade" marker; everything
+else (cleanup, inspection, filtering) keys off this range.
+
+### Run
+
+```bash
+# Copy the template and tweak trade_count / duration / scenarios
+cp config/test_driver.example.yaml config/test_driver.yaml
+
+# Dry run — print the plan, post nothing
+python3 scripts/test_driver.py --dry-run
+
+# Live run — stops the real forwarder, posts to mirror channel,
+# runs all scheduled trades concurrently, exits when done.
+python3 scripts/test_driver.py
+
+# Bulk delete every test trade across runs
+python3 scripts/test_driver.py --cleanup
+```
+
+The driver does NOT restart the real forwarder on exit — restart it
+manually with `launchctl kickstart -k gui/$(id -u)/local.potion-perps-forwarder`
+when you're done testing.
+
+### Scenarios
+
+Five lifecycle paths, fired uniformly across the configured trade count:
+
+| Scenario | Sequence |
+|---|---|
+| `all_tp_hit` | signal → trade_live → TP1 → BE → TP2 → ALL_TP |
+| `stop_hit` | signal → trade_live → stop |
+| `tp1_then_stop` | signal → trade_live → TP1 → BE → stop |
+| `cancel_pending` | signal → cancel (entry never filled) |
+| `cancel_after_fill` | signal → trade_live → cancel (D10 forced market close) |
+
+### Inspecting test trades while a run is in progress
+
+```bash
+# Lifecycle event count per test trade — green means it's progressing
+sqlite3 -header -column data/trades.db \
+  "SELECT t.trade_id, t.coin, t.side, t.status, t.close_reason,
+          COUNT(e.id) AS event_count
+   FROM trades t LEFT JOIN trade_events e
+     ON t.trade_id = e.trade_id AND t.user_id = e.user_id
+   WHERE t.trade_id >= 7000000
+   GROUP BY t.trade_id ORDER BY t.trade_id;"
+
+# Most recent events across all test trades
+sqlite3 -header -column data/trades.db \
+  "SELECT trade_id, event_type, occurred_at, action_taken
+   FROM trade_events
+   WHERE trade_id >= 7000000
+   ORDER BY occurred_at DESC LIMIT 20;"
+
+# Any errors hit during the run
+sqlite3 data/trades.db \
+  "SELECT trade_id, occurred_at, action_taken FROM trade_events
+   WHERE trade_id >= 7000000 AND event_type = 'error';"
+```
+
+### What the driver does NOT test
+
+- **Real market behavior** — orders filling at synthetic price levels;
+  testnet orderbooks are thin and most TP/SL orders will rest unfilled.
+- **Real exchange rejections beyond submit time** — oracle distance on
+  closes, slippage, etc. Closes happen because we *send* a cancel /
+  TP-hit message, not because the market hit the price.
+- **The Telethon forwarder itself** — it's stopped for the test.
+
+These need real CP signals + real markets. The driver tests the bot's
+*signal processing*, not the exchange interaction beyond order submit.
+
+---
+
 ## Development
 
 ```bash
 python3 -m pytest tests/                  # full suite, ~5s
 python3 -m pytest tests/test_e2e_pipeline.py -v  # one file
 python3 -m pytest tests/test_e2e_pipeline.py::TestPipelineDedup -v  # one class
+python3 -m pytest tests/test_test_driver.py -v   # test driver tests only
 
 git checkout -b feature/<name>            # branch from rework/scope-v1
 ```
@@ -744,7 +830,7 @@ Conventions enforced across the codebase:
 - **No bot-imposed exit logic.** The active preset is the only authority on exits.
 - **Per-user isolation.** Composite PK `(user_id, trade_id)`. All queries filter by user.
 - **HL is source of truth for state** (D10). Local DB drives the audit story; HL drives action decisions.
-- **Tests close behind code.** 684 tests across `tests/`. New features land with tests, not after.
+- **Tests close behind code.** 718 tests across `tests/`. New features land with tests, not after.
 
 ---
 
@@ -761,6 +847,7 @@ Conventions enforced across the codebase:
 | 3.5 | Mainnet promotion gate (confirmation dialog) | ✅ shipped |
 | 4.1 | Telegram channel adapter + Telethon forwarder + D10 + bugs #1, #3, #8, #9, #4, #11, #12, #13, #14, #15 | ✅ shipped |
 | 4.2 | Real CP signal soak — observe & fix | ⏳ in progress |
+| 4.3 | Synthetic test driver (`scripts/test_driver.py`) — full-lifecycle integration tests via the mirror channel | ✅ shipped |
 | 5 | Parking lot — weekly perf report, VPS, CI/CD, backtest tooling | ⏳ later |
 
 Full phase breakdown: [`docs/REWORK_BRIEF.md`](docs/REWORK_BRIEF.md).

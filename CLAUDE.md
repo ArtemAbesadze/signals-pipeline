@@ -32,7 +32,8 @@ potion-perps-bot/
 │   └── config.yaml                      # active, gitignored
 ├── deploy/launchd/                      # Two launchd agents (bot + forwarder, Phase 3.2 / 4.1)
 ├── scripts/
-│   └── telethon_forwarder.py            # Phase 4.1 — user-account DM forwarder
+│   ├── telethon_forwarder.py            # Phase 4.1 — user-account DM forwarder
+│   └── test_driver.py                   # Phase 4.3 — synthetic CP signal driver (test trade IDs 7_000_000+)
 ├── docs/
 │   ├── REWORK_BRIEF.md                  # full rework spec (D1–D9 + phases)
 │   ├── telegram-bot-plan.md             # legacy SaaS design — reversed in D4
@@ -51,7 +52,7 @@ potion-perps-bot/
 │   ├── strategy/position_sizer.py       # sizing + pre-trade risk gate
 │   ├── telegram/                        # bot + handlers + notifications + monitors + confirmation_sweeper
 │   └── utils/                           # structlog setup, symbol mapper
-├── tests/                               # 638 tests across 33 files
+├── tests/                               # 718 tests across 34 files
 └── signals/
     ├── samples/                         # Real CP samples for parser tests (Discord format — still valid via forwarder)
     └── test/                            # E2E test fixtures
@@ -81,9 +82,10 @@ Key files when something breaks:
 5. **Per-user isolation.** Composite PK `(user_id, trade_id)` on `trades` and `orders`. All queries filter by `user_id`. One user's bug cannot touch another user's data.
 6. **DM-only for Telegram.** `dm_only_filter` middleware rejects group messages. Credential-collection messages are deleted on receipt.
 7. **No Discord edit handling.** CP sends all updates as new messages, never edits existing ones. `on_message` only — do not add `on_message_edit`.
-8. **Tests close behind code.** 638 tests today across `tests/`. New features land with tests, not after.
+8. **Tests close behind code.** 718 tests today across `tests/`. New features land with tests, not after.
 9. **Branch first during rework.** Active branch: `rework/scope-v1`. No commits to `main` until the rework is feature-complete.
 10. **README is current.** Phase 3.4 rewrote it for the private-tool scope. Keep it accurate as the codebase evolves — no longer frozen.
+11. **Test trade IDs live in `[7_000_000, 7_999_999]`.** Real CP IDs are 4 digits (max ~3000), so any 7-digit `trade_id` in `trades` / `orders` / `trade_events` is synthetic from `scripts/test_driver.py`. Bulk-delete with `python3 scripts/test_driver.py --cleanup`. Don't intermix this range with real CP trade IDs anywhere.
 
 ---
 
@@ -274,6 +276,42 @@ These came up during 4.1 but aren't worth interrupting flow for. Pick when you'v
 
 Once Step 2 has even one real CP trade, you're in 4.2. The mechanics are identical to what `/inject` produced — same pipeline, same auto_execute, same manual-close flow. Goal of 4.2 = **observe** rather than build.
 
+#### Step 5 — Phase 4.3 synthetic test driver (`scripts/test_driver.py`)
+
+For end-to-end testing without waiting on real CP, Phase 4.3 added a
+third process that replaces the real forwarder during test runs. It
+generates synthetic CP-format messages and walks each through its full
+lifecycle (all five scenarios — `all_tp_hit`, `stop_hit`,
+`tp1_then_stop`, `cancel_pending`, `cancel_after_fill`). Posts to the
+same mirror channel via `TELEGRAM_BOT_TOKEN`, so everything downstream
+runs unmodified.
+
+Test trade IDs in `[7_000_000, 7_999_999]` — 7 digits vs real CP's
+4 digits make them unmistakable in the DB. Bulk inspect or delete:
+
+```bash
+python3 scripts/test_driver.py --dry-run         # print plan, post nothing
+python3 scripts/test_driver.py                   # live run, posts to mirror channel
+python3 scripts/test_driver.py --cleanup         # delete WHERE trade_id BETWEEN 7M and 7.999M
+```
+
+Config: `config/test_driver.example.yaml`. Tunables: trade_count,
+duration_minutes, scenario list (default = all five uniformly), per-event
+timing windows, coin pool exclusions, side/risk distributions.
+
+Critical behaviour to remember: the driver **stops the real
+forwarder on startup** (via `launchctl bootout`) and does **NOT
+restart it on exit**. After a test run, manually
+`launchctl kickstart -k gui/$(id -u)/local.potion-perps-forwarder`
+to resume normal operation. This is intentional — overlapping real
+CP signals with synthetic ones during a test would confuse the
+audit trail.
+
+What the driver does NOT test: real market behaviour (orders
+filling, slippage), real exchange rejections beyond submit time, the
+Telethon forwarder itself (it's stopped). Closes happen because we
+*send* the close-event message, not because the market moved.
+
 Soak target: at least one full CP signal day. Specifically want to see:
 - Multiple `signal_alert` opens that fire as auto-execute on Artem
 - At least one `tp_hit` event (CP hits a TP)
@@ -315,7 +353,7 @@ Phase 5 = parking lot (weekly performance report, VPS, CI/CD, backtest tooling).
 
 ## Tests
 
-**671/671 passing** as of `bc80fbd` (up from 594 at end of Phase 3.5; +77 tests in Phase 4.1: channel adapter, Telethon forwarder, second launchd agent, channel-post passthrough, `Orchestrator.refresh_user_config`, testnet position floor, plus the session-3 regression set — forwarder serialisation, orders-table reconciliation, trading-hub balance, cancel-parser wrapper-noise, `_handle_canceled` HL position check, close-spread sentinel + math).
+**718/718 passing** (up from 671 at end of Phase 4.1's session-3 bug-fix run; +34 tests in Phase 4.3 for `tests/test_test_driver.py` — template fidelity round-trips through classify+parse for every event type, price level math, schedule generation determinism, scenario assignment, coin pool filtering, trade-ID allocation, and cleanup safety; +13 additional tests across Bug #13 (close-result verification), Bug #14 (pipeline dedup), Bug #15 (channel-post text-handler guards) that landed in the same window).
 
 ---
 
@@ -331,6 +369,8 @@ Phase 5 = parking lot (weekly performance report, VPS, CI/CD, backtest tooling).
 | Restart forwarder | `launchctl kickstart -k gui/$(id -u)/local.potion-perps-forwarder` |
 | Stop bot | `launchctl bootout gui/$(id -u)/local.potion-perps-bot` |
 | Foreground run (testing) | `python3 main.py` + `python3 scripts/telethon_forwarder.py` |
+| Synthetic test driver | `python3 scripts/test_driver.py [--dry-run \| --cleanup]` (Phase 4.3 — replaces forwarder) |
+| Test trade ID range | `[7_000_000, 7_999_999]` — bulk inspect: `WHERE trade_id >= 7000000` |
 | Tests | `python3 -m pytest tests/ -v` |
 | New branch | `git checkout -b <name>` from `rework/scope-v1` |
 | Env vars | `.env` (gitignored); template in `.env.example` |

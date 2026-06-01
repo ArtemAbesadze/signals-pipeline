@@ -1,0 +1,66 @@
+# Test driver configuration — synthetic CP-format signal generator
+#
+# Spin up `python3 scripts/test_driver.py` to run; the driver replaces
+# the real Telegram forwarder for the duration of the test (it stops
+# `local.potion-perps-forwarder` on startup and does NOT auto-restart
+# it on exit — restart with `launchctl kickstart -k gui/$(id -u)/local.potion-perps-forwarder`
+# yourself when you're done).
+#
+# Test trade IDs are in the range [7_000_000, 7_999_999] so they're
+# trivially distinguishable from real CP trades (max ~4 digits). Bulk
+# inspect / cleanup via `python3 scripts/test_driver.py --cleanup`.
+
+test_driver:
+  # Volume + cadence
+  trade_count: 5               # how many test trades to fire across the run
+  duration_minutes: 60         # wall-clock window — trades randomly distributed
+
+  # If true, start times are uniform-random across the window; otherwise
+  # evenly spaced (each 1/N of the way through).
+  randomize_start_times: true
+
+  # Scenarios — uniformly distributed across `trade_count`. If trade_count
+  # isn't divisible by the number of scenarios, the extras are random picks.
+  scenarios:
+    - all_tp_hit                 # signal → live → TP1 → BE → TP2 → ALL_TP
+    - stop_hit                   # signal → live → stop
+    - tp1_then_stop              # signal → live → TP1 → BE → stop
+    - cancel_pending             # signal → cancel (entry never filled)
+    - cancel_after_fill          # signal → live → cancel (D10 case — forces market close)
+
+  # Per-event inter-arrival delays in seconds. Each delay is sampled
+  # uniformly from [min, max] and ticks from the previous event in the
+  # same trade. Lifecycles for different trades run concurrently and
+  # freely interleave.
+  timing_sec:
+    signal_to_live:        [30,  120]
+    live_to_first_tp:      [60,  180]
+    first_tp_to_breakeven: [10,  60]
+    between_tps:           [60,  240]
+    final_event:           [60,  300]
+    cancel_after_fill:     [90,  300]
+
+  # Coin selection — randomly drawn from coins seen in signals/samples/.
+  # Coins missing from the HL asset universe (e.g. XRP on testnet) are
+  # filtered out automatically at startup; `exclude_coins` lets you also
+  # blacklist specific ones (e.g. if testnet liquidity is too thin).
+  coin_pool_from: signals/samples/
+  exclude_coins: [XRP]
+
+  # Per-trade randomization weights
+  side_distribution:
+    LONG: 0.5
+    SHORT: 0.5
+  risk_distribution:
+    LOW: 0.4
+    MEDIUM: 0.4
+    HIGH: 0.2
+
+  # Real forwarder management
+  stop_real_forwarder_on_start: true
+
+  # Mirror channel — same channel the real forwarder posts to
+  signals_channel_id: -1003954991193
+
+  # Deterministic seeding for reproducible test runs. null = random each run.
+  seed: null
