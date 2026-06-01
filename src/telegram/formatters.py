@@ -173,7 +173,12 @@ def _format_recent_event_line(event: Any, now_local: datetime, tz: ZoneInfo) -> 
     # Truncate long actions to keep the dashboard tight
     if len(action) > 70:
         action = action[:67] + "..."
-    return f"  {icon} {time_str}  {action}"
+    # Escape Markdown specials — action_taken legitimately contains
+    # underscores (enum values like ``trade_closed``, ``tp_hit``) which
+    # otherwise open an italic entity Telegram can never close, breaking
+    # the whole /menu render. Surfaced 2026-06-01 when the Bug #14 dedup
+    # row landed in the recent-events feed.
+    return f"  {icon} {time_str}  {_md_escape(action)}"
 
 
 def _format_port_change_line(h: dict, tz: ZoneInfo, applies: bool) -> str:
@@ -323,7 +328,8 @@ def format_audit_trail(trade: Any, events: list[Any], tz: ZoneInfo = _NY) -> str
             action = e.action_taken or e.event_type.value
             if len(action) > 80:
                 action = action[:77] + "..."
-            event_lines.append(f"  {time_str}  {icon} {action}")
+            # Escape Markdown specials — see _format_recent_event_line above
+            event_lines.append(f"  {time_str}  {icon} {_md_escape(action)}")
         events_section = "\n".join(event_lines)
     else:
         events_section = "\n📋 *Events:* none"

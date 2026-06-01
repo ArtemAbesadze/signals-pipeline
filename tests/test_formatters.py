@@ -172,6 +172,40 @@ class TestFormatMainMenu:
         assert "🎯" in text   # TP_HIT icon
         assert "⚖️" in text   # BREAKEVEN icon
 
+    def test_recent_event_action_taken_underscores_are_escaped(self):
+        """Regression: Bug #14 dedup audit rows contain enum-value text
+        like ``trade_closed`` whose underscore opens a legacy-Markdown
+        italic entity Telegram can never close, breaking /menu with
+        ``Can't parse entities``. Discovered 2026-06-01 in production.
+        Every interpolated action_taken in a Markdown render must be
+        escaped via _md_escape."""
+        events = [
+            _ev(EventType.TRADE_CLOSED,
+                "deduplicated: same (trade_closed) within 60s of prior message",
+                hour=23),
+            _ev(EventType.TP_HIT,
+                "deduplicated: same (tp_hit) within 60s of prior message",
+                hour=22),
+        ]
+        text = format_main_menu(
+            display_name="A",
+            port_state={"port_usd": 100.0, "port_mode": "withdraw", "port_watermark": None},
+            wallet_usd=500.0, pipeline_active=True, auto_execute=False,
+            preset_name="even_split",
+            open_trades=[], today_count_closed=0, today_total_pnl_pct=0.0,
+            today_wins=0, today_losses=0, recent_events=events,
+        )
+        # The dedup audit rows must appear with escaped underscores. If
+        # they appear unescaped, Telegram's legacy-Markdown parser opens
+        # an italic entity at the first underscore and never finds the
+        # close → entire /menu render rejected.
+        assert "trade\\_closed" in text
+        assert "tp\\_hit" in text
+        # And the bare-underscore form must NOT appear in the
+        # action_taken rendering (which is outside code spans).
+        assert "(trade_closed)" not in text
+        assert "(tp_hit)" not in text
+
 
 class TestFormatTradingHub:
     """The Trading screen has to surface spot USDC, not just perp margin.
