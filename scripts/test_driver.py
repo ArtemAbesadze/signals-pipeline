@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from telethon import TelegramClient
 
 # Make src.* imports work when running as a top-level script
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -78,8 +79,6 @@ TEST_TRADE_ID_MAX = 7_999_999
 
 HL_TESTNET_API = "https://api.hyperliquid-testnet.xyz"
 HL_MAINNET_API = "https://api.hyperliquid.xyz"
-
-TELEGRAM_API_BASE = "https://api.telegram.org"
 
 # Cancel reasons — pulled from real samples so the cancel parser handles them.
 _CANCEL_REASONS = (
@@ -376,26 +375,21 @@ def _http_post_json(url: str, payload: dict) -> Any:
 
 # ============================================================================
 # Telegram posting
+#
+# We post via Telethon (Artem's user account), not via the bot's token.
+# A bot does NOT receive ``channel_post`` updates for messages it itself
+# sent to a channel — Telegram's API silently drops them since the bot
+# already knows the message (it has the sendMessage response). Posting
+# as a user account makes each test message look identical to a real CP
+# message that the production Telethon forwarder delivers.
+#
+# The real forwarder is stopped during a test run (driver does this on
+# startup), so we can safely reuse its existing session file.
 # ============================================================================
 
-async def post_to_channel(token: str, channel_id: int, text: str) -> dict:
-    """Post *text* to the mirror channel via Bot API. Sync HTTP under asyncio."""
-    url = f"{TELEGRAM_API_BASE}/bot{token}/sendMessage"
-    payload = urllib.parse.urlencode({
-        "chat_id": str(channel_id),
-        "text": text,
-    }).encode("utf-8")
-
-    def _do_post() -> dict:
-        req = urllib.request.Request(url, data=payload, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
-            return {"ok": False, "error_code": e.code, "description": body}
-
-    return await asyncio.to_thread(_do_post)
+async def post_to_channel(client: TelegramClient, channel_id: int, text: str):
+    """Post *text* to the mirror channel as Artem's user account."""
+    return await client.send_message(channel_id, text)
 
 
 # ============================================================================
@@ -607,7 +601,7 @@ def stop_real_forwarder() -> bool:
 
 async def run_one_trade(
     plan: TradePlan,
-    token: str,
+    client: TelegramClient,
     channel_id: int,
     timing_cfg: dict[str, list[float]],
     rng: random.Random,
@@ -630,17 +624,16 @@ async def run_one_trade(
                 plan.trade_id, ev.event_type, len(text),
             )
             continue
-        result = await post_to_channel(token, channel_id, text)
-        if result.get("ok"):
+        try:
+            message = await post_to_channel(client, channel_id, text)
             logger.info(
                 "Trade #%d: posted %s (msg_id=%s)",
-                plan.trade_id, ev.event_type,
-                result.get("result", {}).get("message_id"),
+                plan.trade_id, ev.event_type, getattr(message, "id", "?"),
             )
-        else:
+        except Exception as e:
             logger.error(
                 "Trade #%d: FAILED to post %s — %s",
-                plan.trade_id, ev.event_type, result,
+                plan.trade_id, ev.event_type, e,
             )
     logger.info("Trade #%d: scenario complete", plan.trade_id)
 
@@ -653,12 +646,6 @@ async def run_test(config: dict, db_path: Path, dry_run: bool) -> None:
     cfg = config["test_driver"]
     seed = cfg.get("seed")
     rng = random.Random(seed)
-
-    token = _read_telegram_token()
-    if not token:
-        raise SystemExit(
-            "TELEGRAM_BOT_TOKEN not found in .env — required for posting"
-        )
 
     network = _read_network_from_config()
     channel_id = int(cfg["signals_channel_id"])
@@ -736,14 +723,53 @@ async def run_test(config: dict, db_path: Path, dry_run: bool) -> None:
 
     timing_cfg = cfg["timing_sec"]
 
-    async def _trade_task(plan: TradePlan) -> None:
-        await asyncio.sleep(plan.start_offset_sec)
-        await run_one_trade(plan, token, channel_id, timing_cfg, rng, dry_run=False)
+    # Start a Telethon client signed in as the user account (same session
+    # file as the real forwarder). Posts via this client look like real
+    # CP messages relayed from Artem's TG account — the bot will receive
+    # ``channel_post`` updates for them. Posting via the bot's own token
+    # silently fails: Telegram doesn't generate channel_post events for a
+    # bot's own outgoing messages.
+    telethon_cfg = _read_telethon_config()
+    session_path = Path(telethon_cfg["session_file"])
+    if not session_path.is_absolute():
+        session_path = _REPO_ROOT / session_path
+    if not session_path.exists():
+        raise SystemExit(
+            f"Telethon session not found at {session_path}. Run "
+            "`python3 scripts/telethon_forwarder.py` once to log in, "
+            "then retry the test driver."
+        )
 
-    tasks = [asyncio.create_task(_trade_task(p)) for p in plans]
-    logger.info("Run started. Waiting for all %d trades to complete...", len(tasks))
-    await asyncio.gather(*tasks, return_exceptions=False)
-    logger.info("All test trades complete.")
+    client = TelegramClient(
+        str(session_path),
+        telethon_cfg["api_id"],
+        telethon_cfg["api_hash"],
+    )
+    await client.start(phone=telethon_cfg["phone"])
+    try:
+        me = await client.get_me()
+        logger.info(
+            "Signed in as %s (id=%d) — posting as user account",
+            getattr(me, "first_name", None) or getattr(me, "username", "?"),
+            me.id,
+        )
+
+        async def _trade_task(plan: TradePlan) -> None:
+            await asyncio.sleep(plan.start_offset_sec)
+            await run_one_trade(
+                plan, client, channel_id, timing_cfg, rng, dry_run=False,
+            )
+
+        tasks = [asyncio.create_task(_trade_task(p)) for p in plans]
+        logger.info(
+            "Run started. Waiting for all %d trades to complete...",
+            len(tasks),
+        )
+        await asyncio.gather(*tasks, return_exceptions=False)
+        logger.info("All test trades complete.")
+    finally:
+        await client.disconnect()
+        logger.info("Telethon client disconnected.")
 
 
 def _weighted_choice(rng: random.Random, weights: dict[str, float]) -> str:
@@ -761,15 +787,49 @@ def _default_leverage_for_risk(risk: str) -> int:
 # Env / config helpers
 # ============================================================================
 
-def _read_telegram_token() -> str | None:
-    """Pull TELEGRAM_BOT_TOKEN from .env or the environment."""
+def _load_dotenv() -> None:
+    """Populate ``os.environ`` from .env if not already set. Idempotent."""
     env_path = _REPO_ROOT / ".env"
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("TELEGRAM_BOT_TOKEN="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-    return os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip().strip('"').strip("'")
+        os.environ.setdefault(key, val)
+
+
+def _read_telethon_config() -> dict:
+    """Pull TG_API_ID/TG_API_HASH/TG_PHONE/TG_SESSION_FILE from .env or env.
+
+    Mirrors the env contract used by ``scripts/telethon_forwarder.py`` so
+    the same .env file works for both. Raises a clean error listing the
+    missing vars rather than failing deep inside Telethon's client init.
+    """
+    _load_dotenv()
+    required = ("TG_API_ID", "TG_API_HASH", "TG_PHONE")
+    missing = [k for k in required if not os.environ.get(k)]
+    if missing:
+        raise SystemExit(
+            f"test_driver: missing env vars: {', '.join(missing)}. "
+            "These are the same vars used by scripts/telethon_forwarder.py "
+            "— see its module docstring for how to set them up."
+        )
+    try:
+        api_id = int(os.environ["TG_API_ID"])
+    except ValueError as e:
+        raise SystemExit(f"test_driver: TG_API_ID must be an integer: {e}")
+    return {
+        "api_id": api_id,
+        "api_hash": os.environ["TG_API_HASH"],
+        "phone": os.environ["TG_PHONE"],
+        "session_file": os.environ.get(
+            "TG_SESSION_FILE", "data/.telethon_session",
+        ),
+    }
 
 
 def _read_network_from_config() -> str:
