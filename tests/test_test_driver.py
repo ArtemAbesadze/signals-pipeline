@@ -37,7 +37,10 @@ from scripts.test_driver import (
     TEST_TRADE_ID_MAX,
     TEST_TRADE_ID_MIN,
     TradePlan,
+    _all_tp_profit_pct,
     _format_price,
+    _stop_loss_pct,
+    _tp_profit_pct,
     assign_scenarios,
     cleanup_test_data,
     compute_price_levels,
@@ -309,6 +312,79 @@ class TestCleanup:
     def test_cleanup_no_db_returns_zeros(self, tmp_path):
         result = cleanup_test_data(tmp_path / "missing.db")
         assert result == {"trades": 0, "orders": 0, "trade_events": 0}
+
+
+class TestRealisticPercentages:
+    """Surfaced 2026-06-01: the test driver originally used random %s
+    (10–50 for TP1, 80–250 for ALL_TP, 20–80 for STOP) — surfaced in the
+    bot's notifications as wildly inflated numbers (e.g. ``-63.24%``
+    on a position whose actual HL P&L was ~$0.05). The percentages now
+    derive from the signal's prices × leverage so they match what real
+    CP would emit and what an operator can sanity-check against HL.
+
+    These exact values also go into ``trades.pnl_pct`` via the bot's
+    lifecycle handlers — wrong values trip the daily-loss circuit
+    breaker arbitrarily."""
+
+    def test_tp1_profit_matches_long_price_move_times_leverage(self):
+        plan = _make_plan(side="LONG")  # entry=4.50, leverage=14
+        # TP1 = entry × 1.005 → 0.5% move → 7.0% at lev=14
+        expected = 0.5 * plan.leverage
+        assert abs(_tp_profit_pct(plan, 1) - expected) < 0.01
+
+    def test_tp2_profit_matches_long_price_move_times_leverage(self):
+        plan = _make_plan(side="LONG")
+        # TP2 = entry × 1.010 → 1.0% move
+        expected = 1.0 * plan.leverage
+        assert abs(_tp_profit_pct(plan, 2) - expected) < 0.01
+
+    def test_tp_profit_short_symmetric_with_long(self):
+        """A SHORT trade with the same %-distance levels produces the
+        same magnitude profit %. Catches a sign-flip bug if anyone
+        edits ``compute_price_levels`` or ``_move_pct``."""
+        long_plan = _make_plan(side="LONG")
+        short_plan = _make_plan(side="SHORT")
+        for tp in (1, 2, 3):
+            assert abs(
+                _tp_profit_pct(long_plan, tp) - _tp_profit_pct(short_plan, tp)
+            ) < 0.01
+
+    def test_stop_loss_pct_is_realistic(self):
+        plan = _make_plan(side="LONG")
+        # SL = entry × 0.98 → 2.0% move → 28.0% at lev=14
+        expected = 2.0 * plan.leverage
+        assert abs(_stop_loss_pct(plan) - expected) < 0.01
+
+    def test_kbonk_stop_loss_at_low_leverage_realistic(self):
+        """Concrete regression: the production kBONK SHORT lev=5x trade
+        showed -63.24% in /menu when actual HL P&L was ~$0.05. With
+        the fix, that trade's stop_hit should report -10% — matches
+        the 2% price move × 5x leverage. Audit clarity restored."""
+        levels = compute_price_levels("SHORT", 0.005393)
+        plan = TradePlan(
+            trade_id=7_000_001, coin="kBONK", pair="1000BONK/USDT",
+            side="SHORT", risk="LOW", leverage=5, entry=0.005393,
+            scenario=SCENARIOS["stop_hit"], start_offset_sec=0.0,
+            **levels,
+        )
+        assert abs(_stop_loss_pct(plan) - 10.0) < 0.05
+
+    def test_all_tp_profit_average_with_leverage(self):
+        plan = _make_plan(side="LONG")
+        # Even-split avg of 0.5%/1.0%/2.0% = ~1.166% × lev=14 → ~16.3%
+        expected_min = 0.5 * plan.leverage   # at worst, equal to TP1 only
+        expected_max = 2.0 * plan.leverage   # at most, equal to TP3 only
+        result = _all_tp_profit_pct(plan)
+        assert expected_min < result < expected_max
+
+    def test_zero_entry_doesnt_crash(self):
+        """Defensive: a price of 0 (shouldn't happen but) returns 0."""
+        plan = _make_plan(side="LONG")
+        plan.entry = 0.0
+        plan.sl = 0.0
+        plan.tp1 = 0.0; plan.tp2 = 0.0; plan.tp3 = 0.0
+        assert _stop_loss_pct(plan) == 0.0
+        assert _tp_profit_pct(plan, 1) == 0.0
 
 
 class TestScenarios:

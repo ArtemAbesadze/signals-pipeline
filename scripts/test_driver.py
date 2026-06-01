@@ -423,6 +423,50 @@ def render_signal_alert(plan: TradePlan) -> str:
     )
 
 
+def _move_pct(reference: float, entry: float) -> float:
+    """Absolute price-move percentage between *entry* and *reference*.
+    The bot's downstream display uses this × leverage to render the
+    profit/loss as a real CP would."""
+    if entry == 0:
+        return 0.0
+    return abs(reference - entry) / entry * 100.0
+
+
+def _tp_profit_pct(plan: "TradePlan", tp_number: int) -> float:
+    """Realistic profit% for a TP hit — matches what real CP would show
+    given the signal's prices and leverage. CP's percentages are the
+    price-move-from-entry × the leverage (i.e. P&L on the collateral).
+
+    Before this, the test driver used ``rng.uniform(10, 50) * tp_number``
+    which surfaced as wildly inflated numbers in the bot's notifications
+    (e.g. ``+37%`` profit on a $0.05 actual move). Tying the display
+    percentage to the actual signal prices keeps the audit log honest
+    and matches the user's real HL P&L."""
+    tp_price = {1: plan.tp1, 2: plan.tp2, 3: plan.tp3}.get(tp_number, plan.tp1)
+    return _move_pct(tp_price, plan.entry) * plan.leverage
+
+
+def _all_tp_profit_pct(plan: "TradePlan") -> float:
+    """Realistic profit% for ALL_TP_HIT — weighted average of the three
+    TP profits by the preset's tp_split, then leveraged. The bot writes
+    this into ``trades.pnl_pct`` so it has to make sense relative to the
+    other test trades and to anything an operator sees in /stats."""
+    split = (1 / 3.0, 1 / 3.0, 1 / 3.0)  # even split — close enough for test math
+    move = (
+        _move_pct(plan.tp1, plan.entry) * split[0]
+        + _move_pct(plan.tp2, plan.entry) * split[1]
+        + _move_pct(plan.tp3, plan.entry) * split[2]
+    )
+    return move * plan.leverage
+
+
+def _stop_loss_pct(plan: "TradePlan") -> float:
+    """Realistic loss% for a STOP_HIT — price-move from entry to SL ×
+    leverage. Reported as a positive number (the template prefixes the
+    minus sign)."""
+    return _move_pct(plan.sl, plan.entry) * plan.leverage
+
+
 def render_event(event_type: str, plan: TradePlan, params: dict, rng: random.Random) -> str:
     """Render a lifecycle event message for a trade plan."""
     if event_type == "signal_alert":
@@ -431,10 +475,7 @@ def render_event(event_type: str, plan: TradePlan, params: dict, rng: random.Ran
         return _TRADE_LIVE_TEMPLATE.format(coin=plan.coin, pair=plan.pair, trade_id=plan.trade_id)
     if event_type == "tp_hit":
         tp_number = params.get("tp_number", 1)
-        # Use a plausible profit percent for the display field; the bot
-        # uses this for the audit row but does not validate against the
-        # actual TP price.
-        profit_pct = rng.uniform(10, 50) * tp_number
+        profit_pct = _tp_profit_pct(plan, tp_number)
         period = rng.randint(5, 90)
         return _TP_HIT_TEMPLATE.format(
             tp_number=tp_number, pair=plan.pair, trade_id=plan.trade_id,
@@ -446,7 +487,7 @@ def render_event(event_type: str, plan: TradePlan, params: dict, rng: random.Ran
             tp_secured=tp_secured, pair=plan.pair, trade_id=plan.trade_id,
         )
     if event_type == "all_tp_hit":
-        profit_pct = rng.uniform(80, 250)
+        profit_pct = _all_tp_profit_pct(plan)
         hours = rng.randint(1, 12)
         minutes = rng.randint(0, 59)
         return _ALL_TP_HIT_TEMPLATE.format(
@@ -454,7 +495,7 @@ def render_event(event_type: str, plan: TradePlan, params: dict, rng: random.Ran
             period_hours=hours, period_minutes=minutes,
         )
     if event_type == "stop_hit":
-        loss_pct = rng.uniform(20, 80)
+        loss_pct = _stop_loss_pct(plan)
         return _STOP_HIT_TEMPLATE.format(
             pair=plan.pair, trade_id=plan.trade_id, loss_pct=loss_pct,
         )
@@ -733,9 +774,12 @@ async def run_test(config: dict, db_path: Path, dry_run: bool) -> None:
     session_path = Path(telethon_cfg["session_file"])
     if not session_path.is_absolute():
         session_path = _REPO_ROOT / session_path
-    if not session_path.exists():
+    # Telethon appends ``.session`` to the session name internally —
+    # the on-disk file is ``<session>.session``. Check for either.
+    if not session_path.exists() and not session_path.with_suffix(".session").exists():
         raise SystemExit(
-            f"Telethon session not found at {session_path}. Run "
+            f"Telethon session not found at {session_path} or "
+            f"{session_path.with_suffix('.session')}. Run "
             "`python3 scripts/telethon_forwarder.py` once to log in, "
             "then retry the test driver."
         )
