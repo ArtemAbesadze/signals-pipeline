@@ -10,7 +10,7 @@ from src.orchestrator import Orchestrator
 from src.state.models import TradeRecord, TradeStatus
 from src.state.user_db import UserDatabase
 from src.telegram.formatters import format_audit_trail, format_balance, format_positions, format_stats
-from src.telegram.keyboards import trading_sub_keyboard
+from src.telegram.keyboards import positions_keyboard, trading_sub_keyboard
 from src.telegram.middleware import registered_only
 
 logger = logging.getLogger(__name__)
@@ -328,30 +328,22 @@ async def trading_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=trading_sub_keyboard())
             return
 
-        # Build close buttons for each position
-        keyboard_rows: list[list[InlineKeyboardButton]] = []
+        # Per-coin close buttons via the shared helper — same keyboard
+        # the /positions slash command renders, so the close path is
+        # reachable from both entry points.
+        trade_id_by_coin: dict[str, int] = {}
         if positions and trade_db:
-            open_trades = trade_db.get_open_trades()
-            trade_by_coin = {t.coin: t for t in open_trades}
-            for pos in positions:
-                coin = pos.get("coin", "")
-                if not coin:
-                    continue
-                if coin in trade_by_coin:
-                    tid = trade_by_coin[coin].trade_id
-                    keyboard_rows.append(
-                        [InlineKeyboardButton(f"🔴 Close {coin}", callback_data=f"close_trade:{tid}")]
-                    )
-                else:
-                    keyboard_rows.append(
-                        [InlineKeyboardButton(f"🔴 Close {coin}", callback_data=f"close_pos:{coin}")]
-                    )
+            try:
+                for t in trade_db.get_open_trades():
+                    trade_id_by_coin[t.coin] = t.trade_id
+            except Exception:
+                logger.exception("Failed to load open trades for positions keyboard")
 
-        # Add nav footer
-        from src.telegram.keyboards import _back_refresh_close
-        keyboard_rows.extend(_back_refresh_close("menu:trading", "⬅️ Trading"))
-        keyboard = InlineKeyboardMarkup(keyboard_rows)
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=positions_keyboard(positions, trade_id_by_coin),
+        )
 
     elif data == "trading:trades":
         if not trade_db:

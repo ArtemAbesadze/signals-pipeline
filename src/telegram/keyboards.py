@@ -89,6 +89,48 @@ def trading_sub_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(_back_refresh_close("menu:trading", "⬅️ Trading"))
 
 
+def positions_keyboard(
+    positions: list[dict],
+    trade_id_by_coin: dict[str, int] | None = None,
+    back_target: str = "menu:trading",
+    back_label: str = "⬅️ Trading",
+) -> InlineKeyboardMarkup:
+    """Positions screen keyboard — per-coin ``🔴 Close {coin}`` buttons
+    plus the standard back/refresh/close footer.
+
+    Shared between the ``/positions`` slash command and the Trading menu's
+    positions screen so the close button is always reachable from both
+    entry points. Discovered 2026-06-01: the slash command path used
+    ``trading_sub_keyboard()`` (no close buttons) while the trading-menu
+    path built its own close-button keyboard — same screen, different UX.
+
+    Args:
+        positions: HL ``get_open_positions()`` result — list of dicts
+            with at least a ``"coin"`` key.
+        trade_id_by_coin: For positions with a matching open trade
+            in the DB, route to ``close_trade:{tid}`` (cancel-aware
+            close that uses the bot's lifecycle). Positions WITHOUT a
+            matching trade route to ``close_pos:{coin}`` (raw exchange
+            close — used for orphans / ghosts). Pass ``None`` to send
+            everything down the raw-close path.
+        back_target: Callback data for the back button.
+        back_label: Display label for the back button.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    trade_id_by_coin = trade_id_by_coin or {}
+    for pos in positions or []:
+        coin = pos.get("coin", "")
+        if not coin:
+            continue
+        if coin in trade_id_by_coin:
+            tid = trade_id_by_coin[coin]
+            rows.append([InlineKeyboardButton(f"🔴 Close {coin}", callback_data=f"close_trade:{tid}")])
+        else:
+            rows.append([InlineKeyboardButton(f"🔴 Close {coin}", callback_data=f"close_pos:{coin}")])
+    rows.extend(_back_refresh_close(back_target, back_label))
+    return InlineKeyboardMarkup(rows)
+
+
 def port_keyboard() -> InlineKeyboardMarkup:
     """Port management — state + history view (Phase 2.2 Commit B)."""
     return InlineKeyboardMarkup([

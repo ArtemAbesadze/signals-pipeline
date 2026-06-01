@@ -13,7 +13,7 @@ from telegram.ext import ContextTypes
 
 from src.orchestrator import Orchestrator
 from src.telegram.formatters import format_balance, format_positions
-from src.telegram.keyboards import trading_sub_keyboard
+from src.telegram.keyboards import positions_keyboard, trading_sub_keyboard
 from src.telegram.middleware import registered_only
 
 logger = logging.getLogger(__name__)
@@ -59,7 +59,12 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 @registered_only
 async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /positions — show open positions."""
+    """Handle /positions — show open positions with per-coin close buttons.
+
+    Uses the shared ``positions_keyboard`` helper so the close buttons
+    are reachable from both the ``/positions`` slash command and the
+    Trading menu's positions screen (they previously diverged).
+    """
     user_id = context.user_data["user_id"]
     client = _get_client(context, user_id)
 
@@ -76,11 +81,25 @@ async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("⚠️ Failed to fetch positions. Try again later.")
         return
 
-    text = format_positions(positions)
+    # Match the Trading-menu positions path: build per-coin close buttons,
+    # routing to ``close_trade:{tid}`` for HL positions that have a local
+    # open trade (so the close goes through the lifecycle reconciliation)
+    # vs ``close_pos:{coin}`` for orphan / ghost positions.
+    orchestrator: Orchestrator | None = context.bot_data.get("orchestrator")
+    trade_id_by_coin: dict[str, int] = {}
+    if orchestrator is not None:
+        ctx = orchestrator.pipelines.get(user_id)
+        if ctx is not None and ctx.db is not None:
+            try:
+                for t in ctx.db.get_open_trades():
+                    trade_id_by_coin[t.coin] = t.trade_id
+            except Exception:
+                logger.exception("Failed to load open trades for /positions buttons")
+
     await update.message.reply_text(
-        text,
+        format_positions(positions),
         parse_mode="Markdown",
-        reply_markup=trading_sub_keyboard(),
+        reply_markup=positions_keyboard(positions, trade_id_by_coin),
     )
 
 
