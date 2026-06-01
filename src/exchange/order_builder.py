@@ -35,16 +35,26 @@ def _floor_to(value: float, decimals: int) -> float:
     return math.floor(value * factor) / factor
 
 
-def _round_price(price: float, sig_figs: int = 5) -> float:
-    """Round a price to N significant figures (Hyperliquid tick size rule).
+def _round_price(price: float, sig_figs: int = 5, max_decimals: int = 6) -> float:
+    """Round a price honoring Hyperliquid's TWO simultaneous constraints.
 
-    Hyperliquid requires prices to have at most 5 significant figures.
+    HL perps require: at most ``sig_figs`` significant figures AND at most
+    ``max_decimals`` decimal places. Either alone is insufficient — for
+    low-priced coins (kBONK, kSHIB, kPEPE, kDOGS, kLUNC, kNEIRO, plus any
+    base under ~$0.01), 5 sig figs naturally produces 7+ decimals which
+    HL rejects with "Order has invalid price." See Bug #18 (2026-06-01).
+
+    Apply sig-figs rounding first, then enforce the decimal cap by a
+    second ``round`` to ``max_decimals`` places. The cap is a no-op when
+    sig-figs would have produced fewer decimals (typical for higher-
+    priced coins).
     """
     if price == 0:
         return 0.0
     magnitude = math.floor(math.log10(abs(price)))
     factor = 10 ** (sig_figs - 1 - magnitude)
-    return round(price * factor) / factor
+    sig_rounded = round(price * factor) / factor
+    return round(sig_rounded, max_decimals)
 
 
 @dataclass

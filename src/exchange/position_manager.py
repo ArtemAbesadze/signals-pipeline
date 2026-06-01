@@ -36,14 +36,20 @@ class OrderSubmissionError(Exception):
     """Raised when an order fails to submit."""
 
 
-def _round_price(price: float, sig_figs: int = 5) -> float:
-    """Round a price to N significant figures (Hyperliquid uses 5)."""
+def _round_price(price: float, sig_figs: int = 5, max_decimals: int = 6) -> float:
+    """Round a price honoring HL's TWO simultaneous constraints:
+    at most ``sig_figs`` significant figures AND at most ``max_decimals``
+    decimal places. See ``order_builder._round_price`` for the full
+    rationale (Bug #18, 2026-06-01) — this is the duplicated copy used by
+    close_position / move_sl_to_breakeven; keep the two in sync.
+    """
     if price == 0:
         return 0.0
     d = math.ceil(math.log10(abs(price)))
     power = sig_figs - d
     magnitude = 10 ** power
-    return round(price * magnitude) / magnitude
+    sig_rounded = round(price * magnitude) / magnitude
+    return round(sig_rounded, max_decimals)
 
 
 def _get_statuses(result: dict) -> list:

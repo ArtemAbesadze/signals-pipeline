@@ -357,6 +357,111 @@ class TestStopHitFlow:
         assert closed_trade.pnl_pct == -77.7
 
 
+class TestPricePrecisionForTightTickCoins:
+    """Bug #18 (2026-06-01): HL perps require prices to satisfy BOTH
+    constraints simultaneously — at most 5 significant figures AND at
+    most 6 decimal places. The original ``_round_price`` only enforced
+    sig-figs; for coins under ~$0.01, 5 sig figs naturally produces 7
+    decimals → HL rejects with "Order has invalid price".
+
+    Surfaced empirically on kBONK SHORT entry=0.005393 during the first
+    Telethon-fixed test driver run (synthetic trade #7000001). SL +
+    TP2 + TP3 rejected; entry + TP1 accepted by coincidence (their
+    rounded values landed at exactly 6 decimals). Also blocked
+    closing the resulting position via Telegram — the close-spread
+    price hit the same cap.
+
+    Both ``order_builder._round_price`` and ``position_manager._round_price``
+    must pass these checks — they're duplicated, and any divergence
+    means submission and close use different rules."""
+
+    @pytest.fixture
+    def round_builder(self):
+        from src.exchange.order_builder import _round_price as fn
+        return fn
+
+    @pytest.fixture
+    def round_manager(self):
+        from src.exchange.position_manager import _round_price as fn
+        return fn
+
+    def _decimals(self, price: float) -> int:
+        s = repr(price)
+        return len(s.split(".")[1]) if "." in s else 0
+
+    def _sig_figs(self, price: float) -> int:
+        """Count significant figures by looking at the decimal repr."""
+        if price == 0:
+            return 0
+        s = f"{price:.15g}".lstrip("0").lstrip(".").lstrip("0")
+        return len(s.replace(".", "").rstrip("0"))
+
+    @pytest.mark.parametrize("raw_price,label", [
+        (0.005393,  "kBONK entry (4 sig figs, 6 dec)"),
+        (0.0055009, "kBONK SL — was 7 dec, rejected pre-fix"),
+        (0.0053391, "kBONK TP2 — was 7 dec, rejected pre-fix"),
+        (0.0052851, "kBONK TP3 — was 7 dec, rejected pre-fix"),
+        (0.000123456, "PEPE-class — 6 sig figs but 9 dec"),
+        (0.00002345, "kPEPE-class — even smaller"),
+    ])
+    def test_low_priced_coins_round_to_at_most_6_decimals(
+        self, round_builder, round_manager, raw_price, label,
+    ):
+        """The HL perps cap. Bug #18 was that this never got enforced."""
+        r1 = round_builder(raw_price)
+        r2 = round_manager(raw_price)
+        assert self._decimals(r1) <= 6, f"order_builder gave {r1} ({label})"
+        assert self._decimals(r2) <= 6, f"position_manager gave {r2} ({label})"
+
+    @pytest.mark.parametrize("raw_price", [
+        0.005393, 0.0055009, 0.0053391, 0.0052851,
+        0.01411, 0.30, 50000.0, 1.4171, 117.4, 4.50,
+    ])
+    def test_sig_figs_constraint_still_holds(
+        self, round_builder, round_manager, raw_price,
+    ):
+        """The fix must not regress the original 5-sig-figs guarantee."""
+        for fn in (round_builder, round_manager):
+            rounded = fn(raw_price)
+            assert self._sig_figs(rounded) <= 5, (
+                f"{fn.__module__}._round_price({raw_price}) → {rounded} "
+                f"has {self._sig_figs(rounded)} sig figs"
+            )
+
+    @pytest.mark.parametrize("raw_price", [
+        50000.0, 1.4171, 117.4, 4.50, 0.30, 0.01411,
+    ])
+    def test_higher_priced_coins_untouched(
+        self, round_builder, round_manager, raw_price,
+    ):
+        """For prices ≥ ~$0.01, the 6-decimal cap shouldn't change
+        the result vs the old sig-figs-only round. Sanity check that
+        we didn't accidentally clip ZK/ADA/ETH/BTC prices."""
+        for fn in (round_builder, round_manager):
+            rounded = fn(raw_price)
+            # Same magnitude, no surprise rounding
+            assert abs(rounded - raw_price) / max(raw_price, 1e-9) < 0.001, (
+                f"{fn.__module__}._round_price({raw_price}) shifted to {rounded}"
+            )
+
+    def test_both_implementations_agree_on_test_cases(
+        self, round_builder, round_manager,
+    ):
+        """The two _round_price copies are duplicated; if they ever
+        disagree, submission and close will use different prices —
+        causing exactly the kind of "submitted fine but can't close"
+        scenario Bug #18 produced."""
+        test_prices = [
+            0.005393, 0.0055009, 0.0053391, 0.0052851,
+            0.01411, 0.30, 50000.0, 0.0001234, 1.4171,
+        ]
+        for p in test_prices:
+            assert round_builder(p) == round_manager(p), (
+                f"_round_price disagrees on {p}: "
+                f"builder={round_builder(p)}, manager={round_manager(p)}"
+            )
+
+
 class TestClosePositionSpread:
     """Bug #12 / Phase 4.1: HL rejects limit orders too far from the
     oracle. The old 10% IOC-close spread tripped this on the 2026-05-25
