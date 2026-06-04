@@ -11,7 +11,11 @@ from cryptography.fernet import Fernet
 from src.config.settings import Config, ExchangeConfig
 from src.crypto import reset_fernet
 from src.health import HealthServer
-from src.orchestrator import Orchestrator, UserPipelineContext
+from src.orchestrator import (
+    Orchestrator,
+    UserPipelineContext,
+    build_exchange_client,
+)
 from src.state.database import TradeDatabase
 from src.state.models import TradeRecord, TradeStatus
 from src.state.user_db import UserDatabase
@@ -63,6 +67,38 @@ def _mock_client():
     client.get_open_orders.return_value = []
     client.get_asset_meta.return_value = {}
     return client
+
+
+class TestBuildExchangeClient:
+    """Phase 6 Commit 3 — the single multi-exchange construction seam."""
+
+    @patch("src.orchestrator.HyperliquidClient")
+    def test_hyperliquid_explicit(self, MockHL):
+        cfg = ExchangeConfig(
+            network="testnet", account_address="0xMASTER",
+            api_wallet="0xWALLET", api_secret="0xSECRET", exchange="hyperliquid",
+        )
+        client = build_exchange_client(cfg)
+        MockHL.assert_called_once_with(
+            account_address="0xMASTER", private_key="0xSECRET", network="testnet",
+        )
+        assert client is MockHL.return_value
+
+    @patch("src.orchestrator.HyperliquidClient")
+    def test_defaults_to_hyperliquid(self, MockHL):
+        # ExchangeConfig defaults exchange='hyperliquid'
+        build_exchange_client(ExchangeConfig(account_address="0xM", api_secret="0xS"))
+        assert MockHL.called
+
+    def test_blofin_not_implemented(self):
+        cfg = ExchangeConfig(exchange="blofin", account_address="KEY", api_secret="SEC")
+        with pytest.raises(NotImplementedError, match="Blofin"):
+            build_exchange_client(cfg)
+
+    def test_unknown_exchange_raises(self):
+        cfg = ExchangeConfig(exchange="ftx")
+        with pytest.raises(ValueError, match="Unknown exchange"):
+            build_exchange_client(cfg)
 
 
 class TestDispatch:

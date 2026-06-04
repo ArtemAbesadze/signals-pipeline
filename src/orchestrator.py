@@ -11,7 +11,7 @@ import os
 from dataclasses import dataclass
 from typing import Callable
 
-from src.config.settings import Config
+from src.config.settings import Config, ExchangeConfig
 from src.exchange.hyperliquid import HyperliquidClient
 from src.exchange.position_manager import PositionManager
 from src.health import HealthServer
@@ -20,6 +20,36 @@ from src.state.database import TradeDatabase
 from src.state.user_db import UserDatabase
 
 logger = logging.getLogger(__name__)
+
+
+def build_exchange_client(exchange_config: ExchangeConfig):
+    """Construct the exchange client for a user, dispatched on which exchange
+    they're configured for (``exchange_config.exchange``).
+
+    The single seam where the multi-exchange split happens: HL and Blofin
+    users coexist, each routed to their own client. Only Hyperliquid is
+    implemented today; the Blofin adapter lands in Phase 6 Stage 2 (this
+    raises a clear NotImplementedError until then rather than silently
+    mis-constructing an HL client for a Blofin user).
+
+    The credential fields are intentionally neutral (see ``ExchangeConfig``):
+    for HL ``account_address`` is the master address and ``api_secret`` the
+    API-wallet key; for Blofin ``account_address`` will hold the API key,
+    ``api_secret`` the secret, and ``passphrase`` the third credential.
+    """
+    exchange = (exchange_config.exchange or "hyperliquid").lower()
+    if exchange == "hyperliquid":
+        return HyperliquidClient(
+            account_address=exchange_config.account_address,
+            private_key=exchange_config.api_secret,
+            network=exchange_config.network,
+        )
+    if exchange == "blofin":
+        raise NotImplementedError(
+            "Blofin exchange adapter is not implemented yet (Phase 6 Stage 2). "
+            "A user is configured for Blofin but BlofinClient does not exist."
+        )
+    raise ValueError(f"Unknown exchange '{exchange_config.exchange}'")
 
 
 @dataclass
@@ -95,11 +125,7 @@ class Orchestrator:
 
         user_config = self._user_db.get_user_config_as_config(user_id, self._global_config)
 
-        client = HyperliquidClient(
-            account_address=user_config.exchange.account_address,
-            private_key=user_config.exchange.api_secret,
-            network=user_config.exchange.network,
-        )
+        client = build_exchange_client(user_config.exchange)
 
         db = TradeDatabase(user_id=user_id, db_path=self._global_config.database.path)
 
@@ -274,11 +300,7 @@ class Orchestrator:
     def _activate_default_user(self) -> None:
         """Backward-compatible single-user mode from .env + global config."""
         user_id = "default"
-        client = HyperliquidClient(
-            account_address=self._global_config.exchange.account_address,
-            private_key=self._global_config.exchange.api_secret,
-            network=self._global_config.exchange.network,
-        )
+        client = build_exchange_client(self._global_config.exchange)
 
         db = TradeDatabase(user_id=user_id, db_path=self._global_config.database.path)
 
