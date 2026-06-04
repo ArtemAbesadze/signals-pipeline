@@ -24,6 +24,76 @@ use it instead of HL testnet for all dev / testing.
 
 ---
 
+## 0. Demo validation results — CONFIRMED 2026-06-04
+
+Ran `scripts/blofin_demo_check.py` against the demo host with a real demo
+API key. **These supersede the endpoint guesses in the sections below** —
+several were wrong and the demo rejected them. Build `BlofinClient` against
+this table (D11: real exchange data, not assumptions).
+
+### Signing — CONFIRMED working
+
+HMAC-SHA256 → hexdigest → base64 of the hex STRING (the documented quirk).
+Headers: `ACCESS-KEY` / `ACCESS-SIGN` / `ACCESS-TIMESTAMP` (ms) /
+`ACCESS-NONCE` (uuid4) / `ACCESS-PASSPHRASE`. Prehash =
+`{path+query}{METHOD}{timestamp}{nonce}{body}` (body `""` for GET). A wrong
+signature returns `60009`; we never saw it. Lift the verified `sign()` from
+the harness straight into `blofin.py`.
+
+### Confirmed endpoint map (demo)
+
+| Need | Method + path | Notes |
+|---|---|---|
+| Balance (simple) | `GET /api/v1/asset/balances?accountType=futures` | per-currency: `balance`/`available`/`frozen`/`bonus` |
+| Balance (full equity) | `GET /api/v1/account/balance` | `totalEquity` + `details[].{equity,available,frozen,orderFrozen,equityUsd,bonus}` — preferred for port/guardrail math |
+| Positions | `GET /api/v1/account/positions` | **D10/D11 source of truth.** Under `/account/`, NOT `/trade/` |
+| Margin mode | `GET /api/v1/account/margin-mode` | demo default: `cross` |
+| Position mode | `GET /api/v1/account/position-mode` | demo default: `net_mode` (one-way) ✓ — no bootstrap needed |
+| Leverage info | `GET /api/v1/account/batch-leverage-info?instId=&marginMode=` | `{leverage,marginMode,instId,positionSide}` |
+| Instruments | `GET /api/v1/market/instruments[?instId=]` | `tickSize`/`lotSize`/`minSize`/`contractValue`/`maxLeverage` |
+| Tickers | `GET /api/v1/market/tickers[?instId=]` | `last`/`askPrice`/`bidPrice` (demo bid/ask *sizes* are absurdly large — ignore) |
+| Place order | `POST /api/v1/trade/order` | `data` is a **LIST**; item = `{orderId(str), clientOrderId, code, msg}` |
+| Cancel order | `POST /api/v1/trade/cancel-order` | `{instId, orderId\|clientOrderId}`. **NOT idempotent** |
+| Pending orders | `GET /api/v1/trade/orders-pending[?instId=]` | full resting-order shape (below) |
+
+### Corrections vs the original (guessed) endpoints
+
+- Cancel is **`POST /api/v1/trade/cancel-order`**, not `DELETE /api/v1/trade/order` (got HTTP 405).
+- Pending orders is **`/api/v1/trade/orders-pending`**, not `active-orders` (152404).
+- Positions / balance / modes live under **`/api/v1/account/`**, not `/api/v1/trade/` (152404 there).
+- Cancel is **NOT idempotent**: a second cancel returns `102068 "Cancel failed as the order has been filled, triggered, canceled or does not exist."` Treat 102068 as benign in orphan/cleanup logic. (HL was idempotent — different behavior.)
+- Order/cancel responses wrap `data` in a **LIST** (one item per order, each with its own `code`/`msg`); a single place/cancel still returns a 1-element list. Plan for batch from day 1.
+
+### BTC-USDT real metadata (demo)
+
+`contractValue` 0.001 (1 contract = 0.001 BTC), `minSize` 0.1, `lotSize` 0.1,
+`tickSize` 0.1, **`maxLeverage` 150** — validates the whole migration rationale.
+
+### Resting-order shape (`orders-pending`)
+
+`orderId, clientOrderId, instId, marginMode, positionSide, side, orderType,
+price, size, reduceOnly, leverage, state ("live"), filledSize, averagePrice,
+fee, pnl, createTime, updateTime, orderCategory, tpTriggerPrice,
+slTriggerPrice, ...`
+
+### Demo environment facts
+
+- **Production API keys do NOT work on demo** (`152401 "Access key does not
+  exist"`) — demo needs its own key created in the demo environment.
+- Demo account is **pre-funded (~500k USDT)**, in `cross` + `net_mode` by
+  default. `frozen` rises when an order rests (real margin behavior).
+
+### Still TBD (non-blocking — banked for later)
+
+- `demo-apply-money` body: returns `"Parameter toAccount cannot be empty"` —
+  the documented `{adjustType, demoApplyMoney[]}` shape is missing a
+  `toAccount` field. Demo is pre-funded so top-up isn't needed yet.
+- Not yet exercised on demo: `place-tpsl` / `cancel-tpsl`, `close-position`,
+  batch orders, and `trade-history` (real fills — needed for D11 once we have
+  an actual fill). Resolve these as we build the order builder / position mgr.
+
+---
+
 ## 1. Authentication & credential model
 
 ### What Blofin offers
@@ -1109,30 +1179,32 @@ Only THEN start writing the production `BlofinClient`.
 
 ## Quick reference — every Blofin surface we need, in one table
 
-Mirrors the HL doc's quick-reference table. File:line citations will
-be filled in as the `BlofinClient` lands.
+⚠️ **Authoritative paths are in [§ 0 (demo-confirmed)](#0-demo-validation-results--confirmed-2026-06-04).**
+This table is corrected to match; rows marked **(TBD)** were not yet
+exercised on demo — verify before relying on them.
 
 | What we need | Blofin endpoint | Method | Notes |
 |---|---|---|---|
-| Account config | `/api/v1/account/config` | GET | Detect position mode |
-| Set position mode | `/api/v1/trade/position-mode` | POST | Force `one-way` |
-| Set margin mode | `/api/v1/trade/margin-mode` | POST | Default `cross` per-coin |
-| Set leverage | `/api/v1/trade/leverage` | POST | Per-coin before order |
-| Balance | `/api/v1/asset/balances?accountType=futures` | GET | `available` is the buying power |
-| Positions | `/api/v1/trade/positions` | GET | Unsigned size + `side` |
-| Active orders | `/api/v1/trade/active-orders` | GET | Resting limit orders |
-| Active TP/SL | `/api/v1/trade/active-tpsl-orders` | GET | Resting TP/SL plans |
-| Place order | `/api/v1/trade/order` | POST | Single — for entry |
-| Place batch | `/api/v1/trade/multiple-orders` | POST | All 5 orders at once if practical |
-| Place TP/SL | `/api/v1/trade/tpsl-order` | POST | Native — better than HL's emulation |
-| Cancel order | `/api/v1/trade/order` | DELETE | By orderId or clientOrderId |
-| Cancel batch | `/api/v1/trade/multiple-orders` | DELETE | Whole-trade cleanup |
-| Close position | `/api/v1/trade/close-positions` | POST | True market — no spread tuning needed |
-| Instruments | `/api/v1/market/instruments` | GET | tickSize, lotSize, maxLeverage |
-| Tickers | `/api/v1/market/tickers` | GET | Mid/bid/ask for IOC math |
-| Demo funding | `/api/v1/asset/demo-apply-money` | POST | Top up demo balance |
-| WS — positions | `/ws/private` → subscribe `positions` | WS | Stage 2 optional |
-| WS — orders | `/ws/private` → subscribe `orders` | WS | Stage 2 optional |
+| Set position mode | `/api/v1/account/set-position-mode` | POST | demo already `net_mode` — likely no-op (TBD path) |
+| Set margin mode | `/api/v1/account/set-margin-mode` | POST | demo already `cross` (TBD path) |
+| Get margin/position mode | `/api/v1/account/margin-mode` · `/api/v1/account/position-mode` | GET | ✅ confirmed |
+| Set leverage | `/api/v1/account/set-leverage` | POST | per-coin before order (TBD path) |
+| Leverage info | `/api/v1/account/batch-leverage-info?instId=&marginMode=` | GET | ✅ confirmed |
+| Balance (full equity) | `/api/v1/account/balance` | GET | ✅ `totalEquity` + `details[].available/frozen` — port math |
+| Balance (per-currency) | `/api/v1/asset/balances?accountType=futures` | GET | ✅ confirmed |
+| Positions | `/api/v1/account/positions` | GET | ✅ D10/D11 source of truth (under `/account/`) |
+| Pending orders | `/api/v1/trade/orders-pending` | GET | ✅ full resting-order shape |
+| Place order | `/api/v1/trade/order` | POST | ✅ `data` is a LIST; orderId str |
+| Place batch | `/api/v1/trade/batch-orders` | POST | all 5 at once if practical (TBD path) |
+| Place TP/SL | `/api/v1/trade/place-tpsl` | POST | native (TBD — verify on demo) |
+| Cancel order | `/api/v1/trade/cancel-order` | POST | ✅ by orderId/clientOrderId; **NOT idempotent** (`102068`) |
+| Cancel TP/SL | `/api/v1/trade/cancel-tpsl` | POST | (TBD) |
+| Close position | `/api/v1/trade/close-position` | POST | true market — no spread tuning (TBD — verify) |
+| Instruments | `/api/v1/market/instruments` | GET | ✅ tickSize/lotSize/minSize/contractValue/maxLeverage |
+| Tickers | `/api/v1/market/tickers` | GET | ✅ last/bid/ask (demo sizes huge — ignore) |
+| Trade history (real fills) | `/api/v1/trade/fills` | GET | D11 real fill prices (TBD — verify path) |
+| Demo funding | `/api/v1/asset/demo-apply-money` | POST | needs a `toAccount` field (TBD body) |
+| WS — positions/orders | `/ws/private` → subscribe `positions`/`orders` | WS | Stage 2 optional |
 
 ---
 

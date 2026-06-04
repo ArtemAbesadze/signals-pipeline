@@ -116,6 +116,14 @@ def ok(result: dict) -> bool:
     return str(result.get("code")) == "0"
 
 
+def first(data) -> dict:
+    """Blofin returns ``data`` as a LIST for order endpoints (one item per
+    order, each with its own code/msg). Normalize to the first item."""
+    if isinstance(data, list):
+        return data[0] if data else {}
+    return data or {}
+
+
 # ---------------------------------------------------------------------------
 # The 6 validation steps
 # ---------------------------------------------------------------------------
@@ -133,9 +141,13 @@ def step1_signature_and_balance() -> bool:
     return str(r.get("code")) != "60009"
 
 
-def step2_account_balance() -> None:
-    print("\n[2/6] Futures account balance (margin/equity shape)")
-    request("GET", "/api/v1/trade/account-balance")
+def step2_positions() -> None:
+    # CONFIRMED on demo: account/position data lives under /api/v1/account/,
+    # NOT /api/v1/trade/ (the latter returns 152404 "not supported").
+    print("\n[2/6] Open positions — GET /api/v1/account/positions (D10/D11 + sync)")
+    request("GET", "/api/v1/account/positions")
+    print("  (balance: GET /api/v1/account/balance · modes: account/margin-mode,"
+          " account/position-mode — all confirmed working)")
 
 
 def step3_instruments() -> dict | None:
@@ -190,10 +202,10 @@ def step5_place_test_order(inst: dict | None) -> str | None:
         "clientOrderId": coid, "positionSide": "net",
     }
     r = request("POST", "/api/v1/trade/order", body)
-    if ok(r):
-        d = r.get("data") or {}
-        oid = d.get("orderId") or (d[0].get("orderId") if isinstance(d, list) and d else None)
-        print(f"  ✓ order placed: orderId={oid} clientOrderId={coid}")
+    item = first(r.get("data"))
+    if ok(r) and str(item.get("code", "0")) == "0":
+        oid = item.get("orderId")
+        print(f"  ✓ order placed: orderId={oid} clientOrderId={item.get('clientOrderId')}")
         return oid
     print("  ! order not placed — see response (mode/permission/param issue to learn from)")
     return None
@@ -205,22 +217,40 @@ def step6_cancel(order_id: str | None) -> None:
         print("  - skipped (no order placed)")
         return
     body = {"instId": "BTC-USDT", "orderId": order_id}
-    r1 = request("DELETE", "/api/v1/trade/order", body)
+    r1 = request("POST", "/api/v1/trade/cancel-order", body)
     if ok(r1):
         print("  ✓ canceled")
     print("  - second cancel (idempotency check):")
-    request("DELETE", "/api/v1/trade/order", body)
+    request("POST", "/api/v1/trade/cancel-order", body)
+
+
+def step7_active_orders_sweep() -> None:
+    """List resting orders (captures the active-orders shape for sync) and
+    cancel any leftover BTC-USDT demo orders so the harness self-cleans."""
+    print("\n[7] Pending orders — GET /api/v1/trade/orders-pending + sweep leftovers")
+    r = request("GET", "/api/v1/trade/orders-pending?instId=BTC-USDT")
+    orders = r.get("data") or []
+    if not orders:
+        print("  ✓ no resting orders")
+        return
+    for o in orders:
+        oid = o.get("orderId")
+        print(f"  - canceling leftover orderId={oid}")
+        request("POST", "/api/v1/trade/cancel-order", {"instId": "BTC-USDT", "orderId": oid})
+    after = request("GET", "/api/v1/trade/orders-pending?instId=BTC-USDT")
+    print("  ✓ clean" if not (after.get("data") or []) else "  ! still resting — check above")
 
 
 def main() -> None:
     print("Blofin DEMO validation —", DEMO_BASE_URL)
     if not step1_signature_and_balance():
         sys.exit("Signature failed — fix signing before continuing.")
-    step2_account_balance()
+    step2_positions()
     inst = step3_instruments()
     step4_topup_demo()
     oid = step5_place_test_order(inst)
     step6_cancel(oid)
+    step7_active_orders_sweep()
     print("\nDone. Review the responses above with Claude before writing BlofinClient.")
 
 

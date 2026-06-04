@@ -349,7 +349,7 @@ The two docs mirror each other section-by-section so they diff cleanly.
 | # | Task | What |
 |---|---|---|
 | 6.1 | Apply for Blofin "API Transaction" permission | Real-world dependency. Required before any code runs. |
-| 6.2 | Validate the demo environment | Six-step plan in `BLOFIN_INTEGRATION.md` § Demo Trading. Sign+send smoke test, top-up demo balance, place + cancel one tiny order. **Do not start client code until this validates.** |
+| 6.2 | Validate the demo environment ✅ (2026-06-04) | `scripts/blofin_demo_check.py` — signing CONFIRMED (base64-of-hex, no 60009), balance/positions/instruments/place/cancel/pending all working. Corrected several wrong endpoint guesses; results in `BLOFIN_INTEGRATION.md` § 0. Demo needs its own key (prod keys → 152401); pre-funded 500k, cross + net_mode. |
 | 6.3 | `src/exchange/blofin.py` — hand-rolled HTTP client | No SDK from Blofin. ~200 LOC. Surface mirrors `HyperliquidClient`. |
 | 6.4 | `src/exchange/blofin_order_builder.py` | Contract-value math, tickSize-based rounding, native TP/SL via `/api/v1/trade/tpsl-order` |
 | 6.5 | `src/exchange/blofin_position_manager.py` | submit_trade / cancel / close / sync. Use `/api/v1/trade/close-positions` (native market close — Bug #12 obviated). **D11**: on each CP-triggered event, re-read the trade's real state from Blofin (`trade-history` fills, `positions`) and persist the real values — never CP-target approximations; fall back to CP only on query failure and mark the row approximate. |
