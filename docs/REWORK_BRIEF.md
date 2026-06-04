@@ -50,7 +50,7 @@ and control via Telegram.
 | Field | Value |
 |---|---|
 | Branch | `rework/scope-v1` (default branch on GitHub) |
-| Test count | **766/766 passing** across 35 test files |
+| Test count | **808/808 passing** across 35 test files |
 | LOC | ~19,000 across `src/` + `scripts/` + `tests/` |
 | Users | Artem (Telegram `7441245554`, testnet, $500 port, auto_execute=ON) + swaag (Telegram `7375268438`, testnet, no port set) — third slot empty |
 | Exchange | Hyperliquid testnet (everyone). Mainnet promotion is gated by Phase 3.5 (typed `MAINNET` confirm + per-trade approval dialog). |
@@ -66,7 +66,7 @@ ongoing Phase 4.2 soak.
 
 ---
 
-## Locked design decisions (D1–D10)
+## Locked design decisions (D1–D11)
 
 Treat these as constraints, not suggestions. Order is historical; relevance
 is unchanged.
@@ -393,7 +393,7 @@ git log --oneline -5
 git status
 
 # 3. Tests pass
-python3 -m pytest tests/ -q | tail -2  # expect 766 passed
+python3 -m pytest tests/ -q | tail -2  # expect 808 passed
 
 # 4. Both launchd agents up
 launchctl print gui/$(id -u)/local.potion-perps-bot 2>&1 | grep state
@@ -479,7 +479,7 @@ These came up during the rework and are easy to forget:
 
 ## Tests
 
-**766/766 passing** as of HEAD on `rework/scope-v1`. 35 test files.
+**808/808 passing** as of HEAD on `rework/scope-v1`. 35 test files.
 Recent additions (last ~10 commits):
 
 - `tests/test_e2e_pipeline.py::TestPendingToOpenPromotion` — 5 tests on

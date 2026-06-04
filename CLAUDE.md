@@ -35,7 +35,7 @@ potion-perps-bot/
 │   ├── telethon_forwarder.py            # Phase 4.1 — user-account DM forwarder
 │   └── test_driver.py                   # Phase 4.3 — synthetic CP signal driver (test trade IDs 7_000_000+)
 ├── docs/
-│   ├── REWORK_BRIEF.md                  # master scope + phases + handoff (D1-D10)
+│   ├── REWORK_BRIEF.md                  # master scope + phases + handoff (D1-D11)
 │   ├── HYPERLIQUID_INTEGRATION.md       # what we do on HL today (15 sections + bugs)
 │   ├── BLOFIN_INTEGRATION.md            # what we'll do on Blofin (Phase 6 spec + demo)
 │   └── archive/                         # pre-rework SaaS docs (reversed in D4)
@@ -53,7 +53,7 @@ potion-perps-bot/
 │   ├── strategy/position_sizer.py       # sizing + pre-trade risk gate
 │   ├── telegram/                        # bot + handlers + notifications + monitors + confirmation_sweeper
 │   └── utils/                           # structlog setup, symbol mapper
-├── tests/                               # 766 tests across 35 files
+├── tests/                               # 808 tests across 35 files
 └── signals/
     ├── samples/                         # Real CP samples for parser tests (Discord format — still valid via forwarder)
     └── test/                            # E2E test fixtures
@@ -83,7 +83,7 @@ Key files when something breaks:
 5. **Per-user isolation.** Composite PK `(user_id, trade_id)` on `trades` and `orders`. All queries filter by `user_id`. One user's bug cannot touch another user's data.
 6. **DM-only for Telegram.** `dm_only_filter` middleware rejects group messages. Credential-collection messages are deleted on receipt.
 7. **No Discord edit handling.** CP sends all updates as new messages, never edits existing ones. `on_message` only — do not add `on_message_edit`.
-8. **Tests close behind code.** 766 tests today across `tests/`. New features land with tests, not after.
+8. **Tests close behind code.** 808 tests today across `tests/`. New features land with tests, not after.
 9. **Branch first during rework.** Active branch: `rework/scope-v1`. No commits to `main` until the rework is feature-complete.
 10. **README is current.** Phase 3.4 rewrote it for the private-tool scope. Keep it accurate as the codebase evolves — no longer frozen.
 11. **Test trade IDs live in `[7_000_000, 7_999_999]`.** Real CP IDs are 4 digits (max ~3000), so any 7-digit `trade_id` in `trades` / `orders` / `trade_events` is synthetic from `scripts/test_driver.py`. Bulk-delete with `python3 scripts/test_driver.py --cleanup`. Don't intermix this range with real CP trade IDs anywhere.
@@ -110,19 +110,30 @@ Key files when something breaks:
 
 ## Current phase
 
-**Phase 4.3 has shipped (synthetic test driver + the 4.x bug fix
-batch). Phase 4.2 (real CP soak) is ongoing in the background.
-Phase 6 (Blofin migration) is the next major effort.**
+**Phase 6 (Blofin migration) is underway. Stage 1 — the creds-independent
+foundation — has shipped (Commits 1–3 below). Stage 2 (the live BlofinClient)
+is blocked on Artem generating the Blofin "API Transaction" key. Phase 4.2
+(real CP soak) is paused — both agents are currently stopped.**
 
-Where we are today:
+Where we are today (2026-06-04):
 
 - **Branch**: `rework/scope-v1`. HEAD on GitHub matches local.
-- **Tests**: 766/766 across 35 files.
-- **Live state**: both launchd agents running, HL clean (no positions,
-  no orders), no test data in the DB, Phase 4.2 soak ongoing — bot
-  receiving real CP signals end-to-end through the
-  Telethon → mirror channel → bot pipeline.
-- **Two source-of-truth docs** for the next major move:
+- **Tests**: 808/808 across 35 files.
+- **Live state**: both launchd agents **STOPPED** this session (bot's
+  `/menu` was unresponsive; booted out cleanly, no lingering procs). Nothing
+  is consuming CP signals right now. Restart with
+  `deploy/launchd/install.sh all` when ready.
+- **DB migrated for multi-exchange** (Phase 6 Commit 1): `orders.oid`
+  INTEGER→TEXT, `user_credentials` +`exchange`/`passphrase_enc`. Both
+  existing users read as `exchange=hyperliquid`. Pre-migration snapshot at
+  `data/trades.db.pre-blofin-migration-20260604-212526`.
+- **Phase 6 Stage 1 shipped** (HL untouched, both exchanges will coexist):
+  - Commit 1 `7cd95c0` — schema + config foundation (D11-aligned).
+  - Commit 2 `9bdd6fa` — `potion_to_blofin` symbol-mapper scaffold.
+  - Commit 3 `1affd05` — `build_exchange_client` orchestrator dispatch seam
+    (HL branch live; Blofin raises NotImplementedError until Stage 2).
+- **Bug #20 fixed** (`73b20e4`): resting-entry trades now promote PENDING→OPEN.
+- **Two source-of-truth docs** for the migration:
   - [`docs/HYPERLIQUID_INTEGRATION.md`](docs/HYPERLIQUID_INTEGRATION.md) —
     full audit of every HL touchpoint (15 capability sections + every
     bug we've shipped).
@@ -248,7 +259,7 @@ git log --oneline -5
 git status
 
 # 3. Tests pass
-python3 -m pytest tests/ -q | tail -2  # expect 766 passed
+python3 -m pytest tests/ -q | tail -2  # expect 808 passed
 
 # 4. Both launchd agents up
 launchctl print gui/$(id -u)/local.potion-perps-bot 2>&1 | grep state
@@ -354,7 +365,7 @@ Phase 5 = parking lot (weekly performance report, VPS, CI/CD, backtest tooling).
 
 ## Tests
 
-**766/766 passing** across 35 files. Recent additions worth knowing about:
+**808/808 passing** across 35 files. Recent additions worth knowing about:
 
 - `tests/test_e2e_pipeline.py::TestPendingToOpenPromotion` (5 tests, Bug #20) — TRADE_LIVE/TP_HIT promote a resting-entry trade PENDING→OPEN (D10: HL-confirmed, falls back to CP fill on query failure); the core regression asserts TP1 on a still-PENDING trade fires the breakeven SL move.
 - `tests/test_test_driver.py` (41 tests) — scenarios, template fidelity (each event round-trips through classify+parse), scheduling determinism, cleanup, realistic-percentage math, orphan-order helper.
