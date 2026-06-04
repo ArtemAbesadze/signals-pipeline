@@ -58,6 +58,9 @@ the harness straight into `blofin.py`.
 | Set leverage | `POST /api/v1/account/set-leverage` | `{instId, leverage, marginMode, positionSide}` |
 | Close position | `POST /api/v1/trade/close-position` | `{instId, marginMode, positionSide}` — true market close, no spread tuning |
 | Real fills | `GET /api/v1/trade/fills-history[?instId=&limit=]` | **D11 real fill prices** (NOT `/trade/fills` → 152404) |
+| Place TP/SL | `POST /api/v1/trade/order-tpsl` | accepts partial `size`; tp-only & sl-only both OK; returns `data` **dict** with `tpslId` (NOT `place-tpsl` → 152404) |
+| Cancel TP/SL | `POST /api/v1/trade/cancel-tpsl` | body is a **LIST** `[{instId, tpslId}]` |
+| Pending TP/SL | `GET /api/v1/trade/orders-tpsl-pending[?instId=]` | resting conditionals (shape below) |
 
 ### Corrections vs the original (guessed) endpoints
 
@@ -96,6 +99,22 @@ so `get_open_positions` normalizes to signed size exactly like the HL client.
 fee, ts.` `fillPrice` is the real executed price that replaces CP's
 target-price approximation when reconciling (D11).
 
+### CP signal → 5 Blofin orders (the order builder's output)
+
+Mirrors HL's structure, demo-confirmed:
+- **Entry** → `POST /api/v1/trade/order` (limit, `side` buy/sell).
+- **SL** → `order-tpsl` with `slTriggerPrice`, `slOrderPrice=-1` (market on
+  trigger), full size, `reduceOnly`, `side` = close side.
+- **TP1/2/3** → `order-tpsl` each with `tpTriggerPrice`, `tpOrderPrice=-1`,
+  the split size (partial sizes confirmed accepted), `reduceOnly`.
+
+Resting tpsl shape (`orders-tpsl-pending`): `tpslId, instId, marginMode,
+positionSide, side, tpTriggerPrice, tpOrderPrice, slTriggerPrice,
+slOrderPrice, size, state, leverage, reduceOnly, clientOrderId, createTime,
+tpTriggerPriceType ("last"), slTriggerPriceType`. The `tpslId` is separate
+from a regular `orderId` — the orders table needs to track which kind each
+row is (Phase 6.5).
+
 ### Demo environment facts
 
 - **Production API keys do NOT work on demo** (`152401 "Access key does not
@@ -108,9 +127,10 @@ target-price approximation when reconciling (D11).
 - `demo-apply-money` body: returns `"Parameter toAccount cannot be empty"` —
   the documented `{adjustType, demoApplyMoney[]}` shape is missing a
   `toAccount` field. Demo is pre-funded so top-up isn't needed yet.
-- Not yet exercised on demo: native TP/SL (`place-tpsl` / `cancel-tpsl`) and
-  batch orders (`batch-orders`). Resolve these while building the order
-  builder (6.4) / position manager (6.5).
+- Batch orders (`batch-orders`) not yet exercised — sequential single
+  submits are fine for our cadence; batch is a rate-limit optimization for
+  later (§ 15). Native TP/SL is fully confirmed (`order-tpsl` /
+  `cancel-tpsl` / `orders-tpsl-pending`) and used by the order builder (6.4).
 
 ---
 
