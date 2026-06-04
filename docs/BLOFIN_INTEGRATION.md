@@ -55,6 +55,9 @@ the harness straight into `blofin.py`.
 | Place order | `POST /api/v1/trade/order` | `data` is a **LIST**; item = `{orderId(str), clientOrderId, code, msg}` |
 | Cancel order | `POST /api/v1/trade/cancel-order` | `{instId, orderId\|clientOrderId}`. **NOT idempotent** |
 | Pending orders | `GET /api/v1/trade/orders-pending[?instId=]` | full resting-order shape (below) |
+| Set leverage | `POST /api/v1/account/set-leverage` | `{instId, leverage, marginMode, positionSide}` |
+| Close position | `POST /api/v1/trade/close-position` | `{instId, marginMode, positionSide}` — true market close, no spread tuning |
+| Real fills | `GET /api/v1/trade/fills-history[?instId=&limit=]` | **D11 real fill prices** (NOT `/trade/fills` → 152404) |
 
 ### Corrections vs the original (guessed) endpoints
 
@@ -76,6 +79,23 @@ price, size, reduceOnly, leverage, state ("live"), filledSize, averagePrice,
 fee, pnl, createTime, updateTime, orderCategory, tpTriggerPrice,
 slTriggerPrice, ...`
 
+### Position shape (`/account/positions`) — CONFIRMED via open+close cycle
+
+`positionId, instId, instType, marginMode, positionSide ("net"), positions
+(SIGNED size — negative = short, like HL's szi), availablePositions,
+averagePrice (entry), markPrice, liquidationPrice ("" when none),
+breakEvenPrice, unrealizedPnl, unrealizedPnlRatio, initialMargin,
+maintenanceMargin, leverage, realizedPnl, createTime, updateTime.`
+
+Direction in `net_mode` is the **sign of `positions`**, NOT a `side` field —
+so `get_open_positions` normalizes to signed size exactly like the HL client.
+
+### Fill shape (`fills-history`) — the D11 real-fill source
+
+`instId, tradeId, orderId, fillPrice, fillSize, fillPnl, side, positionSide,
+fee, ts.` `fillPrice` is the real executed price that replaces CP's
+target-price approximation when reconciling (D11).
+
 ### Demo environment facts
 
 - **Production API keys do NOT work on demo** (`152401 "Access key does not
@@ -88,9 +108,9 @@ slTriggerPrice, ...`
 - `demo-apply-money` body: returns `"Parameter toAccount cannot be empty"` —
   the documented `{adjustType, demoApplyMoney[]}` shape is missing a
   `toAccount` field. Demo is pre-funded so top-up isn't needed yet.
-- Not yet exercised on demo: `place-tpsl` / `cancel-tpsl`, `close-position`,
-  batch orders, and `trade-history` (real fills — needed for D11 once we have
-  an actual fill). Resolve these as we build the order builder / position mgr.
+- Not yet exercised on demo: native TP/SL (`place-tpsl` / `cancel-tpsl`) and
+  batch orders (`batch-orders`). Resolve these while building the order
+  builder (6.4) / position manager (6.5).
 
 ---
 
