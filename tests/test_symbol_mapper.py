@@ -5,6 +5,7 @@ import pytest
 from src.utils.symbol_mapper import (
     HYPERLIQUID_COINS,
     potion_to_hyperliquid,
+    potion_to_blofin,
     get_all_mappings,
 )
 
@@ -174,3 +175,83 @@ class TestEdgeCases:
         assert len(mappings) > 100
         assert mappings["MATIC"] == "POL"
         assert mappings["BONK"] == "kBONK"
+
+
+# ==================================================================
+# Blofin mapping (Phase 6) — "BASE-QUOTE", no kilo prefix
+# ==================================================================
+
+class TestBlofinDirectMappings:
+
+    @pytest.mark.parametrize("pair,expected", [
+        ("BTC/USDT", "BTC-USDT"),
+        ("ETH/USDT", "ETH-USDT"),
+        ("SOL/USDT", "SOL-USDT"),
+        ("SUI/USDT", "SUI-USDT"),
+        ("OP/USDT", "OP-USDT"),
+        ("ADA/USDT", "ADA-USDT"),
+        ("XRP/USDT", "XRP-USDT"),   # listed on Blofin (unlike HL)
+        ("ZK/USDT", "ZK-USDT"),
+    ])
+    def test_direct(self, pair, expected):
+        assert potion_to_blofin(pair) == expected
+
+
+class TestBlofinNoKiloPrefix:
+    """Blofin keeps Binance-style symbols — no HL-style kilo transform."""
+
+    @pytest.mark.parametrize("pair,expected", [
+        ("1000BONK/USDT", "1000BONK-USDT"),
+        ("1000PEPE/USDT", "1000PEPE-USDT"),
+        ("1000SHIB/USDT", "1000SHIB-USDT"),
+        ("BONK/USDT", "BONK-USDT"),
+        ("PEPE/USDT", "PEPE-USDT"),
+    ])
+    def test_no_kilo(self, pair, expected):
+        assert potion_to_blofin(pair) == expected
+
+
+class TestBlofinRebrands:
+    """Chain-level token rebrands (exchange-independent facts)."""
+
+    @pytest.mark.parametrize("pair,expected", [
+        ("MATIC/USDT", "POL-USDT"),
+        ("RNDR/USDT", "RENDER-USDT"),
+        ("FTM/USDT", "S-USDT"),
+    ])
+    def test_rebrand(self, pair, expected):
+        assert potion_to_blofin(pair) == expected
+
+
+class TestBlofinValidation:
+
+    def test_valid_instrument_passes(self):
+        available = {"ETH-USDT": {}, "BTC-USDT": {}}
+        assert potion_to_blofin("ETH/USDT", available) == "ETH-USDT"
+
+    def test_invalid_instrument_raises(self):
+        available = {"ETH-USDT": {}, "BTC-USDT": {}}
+        with pytest.raises(ValueError, match="not listed on Blofin"):
+            potion_to_blofin("FAKECOIN/USDT", available)
+
+    def test_rebrand_validates_new_name(self):
+        available = {"POL-USDT": {}}
+        assert potion_to_blofin("MATIC/USDT", available) == "POL-USDT"
+
+
+class TestBlofinEdgeCases:
+
+    def test_lowercase_pair(self):
+        assert potion_to_blofin("eth/usdt") == "ETH-USDT"
+
+    def test_extra_whitespace(self):
+        assert potion_to_blofin("  ETH / USDT  ") == "ETH-USDT"
+
+    def test_bare_base_defaults_usdt_quote(self):
+        assert potion_to_blofin("BTC") == "BTC-USDT"
+
+    def test_non_usdt_quote_preserved(self):
+        assert potion_to_blofin("ETH/USDC") == "ETH-USDC"
+
+    def test_unknown_coin_passthrough(self):
+        assert potion_to_blofin("NEWCOIN/USDT") == "NEWCOIN-USDT"

@@ -253,3 +253,68 @@ def get_all_mappings() -> dict[str, str]:
     mappings = dict(COMMON_PAIRS)
     mappings.update(_OVERRIDES)
     return mappings
+
+
+# ---------------------------------------------------------------------------
+# Blofin symbol mapping (Phase 6)
+#
+# Blofin uses Binance-style instrument IDs: "{BASE}-{QUOTE}" (e.g. BTC-USDT).
+# Unlike Hyperliquid it does NOT use the kilo (k) prefix — CP's "1000BONK"
+# stays "1000BONK" per Blofin's own listing; there is deliberately no kilo
+# transform here. The exact form for each low-cap is verified against
+# /market/instruments during the demo soak (Phase 6.10); any mismatch gets
+# an override entry below.
+#
+# This table holds chain-level token REBRANDS only — facts independent of the
+# exchange. Exchange-specific naming quirks are added empirically during demo
+# validation, not assumed up front (D11: don't bake in unverified mappings).
+# ---------------------------------------------------------------------------
+_BLOFIN_OVERRIDES: dict[str, str] = {
+    "MATIC": "POL",      # Polygon token migration MATIC → POL (chain-level)
+    "RNDR": "RENDER",    # Render rebrand RNDR → RENDER (chain-level)
+    "FTM": "S",          # Fantom → Sonic (chain-level)
+}
+
+
+def potion_to_blofin(
+    pair: str, available_instruments: dict[str, Any] | None = None
+) -> str:
+    """Convert a Potion Perps pair to a Blofin instrument ID ("BASE-QUOTE").
+
+    Resolution order:
+      1. Chain-level rebrand overrides (``_BLOFIN_OVERRIDES``) on the base.
+      2. Naive ``"{BASE}-{QUOTE}"`` — Blofin uses Binance-style symbols and
+         does NOT apply HL's kilo prefix; ``1000BONK/USDT`` → ``1000BONK-USDT``.
+      3. Validate against live exchange instruments if provided.
+
+    Args:
+        pair: Pair string from a signal, e.g. ``"BTC/USDT"``, ``"1000BONK/USDT"``.
+            A bare base (no ``/``) defaults the quote to ``USDT``.
+        available_instruments: Optional dict keyed by instId (from
+            ``BlofinClient.get_instruments()``) used to validate the result.
+
+    Returns:
+        Blofin instrument ID, e.g. ``"BTC-USDT"``.
+
+    Raises:
+        ValueError: If the instrument is not listed on Blofin (when validated).
+
+    The override table is seeded with chain-level rebrands only and is
+    expanded empirically during the demo soak (Phase 6.10) — per D11 we
+    don't bake in unverified exchange-naming assumptions.
+    """
+    parts = [p.strip().upper() for p in pair.split("/")]
+    base = parts[0]
+    quote = parts[1] if len(parts) > 1 and parts[1] else "USDT"
+
+    base = _BLOFIN_OVERRIDES.get(base, base)
+    inst_id = f"{base}-{quote}"
+
+    if available_instruments is not None and inst_id not in available_instruments:
+        raise ValueError(
+            f"Instrument '{inst_id}' (from pair '{pair}') not listed on Blofin. "
+            f"The asset may not be available or may use a different symbol "
+            f"(add a _BLOFIN_OVERRIDES entry once confirmed on demo)."
+        )
+
+    return inst_id
