@@ -79,6 +79,11 @@ def order_id_of(result: dict) -> str | None:
     return first_item(result.get("data")).get("orderId")
 
 
+def tpsl_id_of(result: dict) -> str | None:
+    """order-tpsl returns ``data`` as a dict; cancel-tpsl as a list. Handle both."""
+    return first_item(result.get("data")).get("tpslId")
+
+
 def _f(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -242,6 +247,15 @@ class BlofinClient:
         return self._instruments_cache
 
     @retry_on_transient()
+    def get_open_tpsl_orders(self, inst_id: str | None = None) -> list[dict[str, Any]]:
+        """Resting TP/SL conditionals (algo orders), optionally by instrument.
+        Tracked separately from regular orders — needed for startup sync."""
+        path = "/api/v1/trade/orders-tpsl-pending"
+        if inst_id:
+            path += f"?instId={inst_id}"
+        return self._checked("GET", path).get("data") or []
+
+    @retry_on_transient()
     def get_fills(self, inst_id: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
         """Executed fills (real fill prices) — the D11 source for actual
         fill_price/PnL, replacing CP's target-price approximation."""
@@ -290,6 +304,39 @@ class BlofinClient:
         if client_order_id:
             body["clientOrderId"] = client_order_id
         return self._request("POST", "/api/v1/trade/cancel-order", body)
+
+    def place_tpsl(
+        self, *, inst_id: str, side: str, size: str | float,
+        tp_trigger_price: str | float | None = None,
+        sl_trigger_price: str | float | None = None,
+        order_price: str = "-1", margin_mode: str = "cross",
+        position_side: str = "net", reduce_only: bool = True,
+        client_order_id: str | None = None,
+    ) -> dict:
+        """Place a TP/SL conditional (``order-tpsl``). ``order_price='-1'`` =
+        market execution on trigger. tp-only and sl-only are both accepted.
+        Returns ``data`` as a dict with ``tpslId``."""
+        body: dict[str, Any] = {
+            "instId": inst_id, "marginMode": margin_mode,
+            "positionSide": position_side, "side": side, "size": str(size),
+            "reduceOnly": reduce_only,
+        }
+        if tp_trigger_price is not None:
+            body["tpTriggerPrice"] = str(tp_trigger_price)
+            body["tpOrderPrice"] = order_price
+        if sl_trigger_price is not None:
+            body["slTriggerPrice"] = str(sl_trigger_price)
+            body["slOrderPrice"] = order_price
+        if client_order_id:
+            body["clientOrderId"] = client_order_id
+        return self._request("POST", "/api/v1/trade/order-tpsl", body)
+
+    def cancel_tpsl(self, inst_id: str, tpsl_id: str) -> dict:
+        """Cancel a TP/SL conditional. The endpoint takes a LIST body."""
+        return self._request(
+            "POST", "/api/v1/trade/cancel-tpsl",
+            [{"instId": inst_id, "tpslId": str(tpsl_id)}],
+        )
 
     def close_position(
         self, inst_id: str, margin_mode: str = "cross", position_side: str = "net",

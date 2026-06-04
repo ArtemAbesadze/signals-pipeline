@@ -22,6 +22,7 @@ from src.exchange.blofin import (
     response_error,
     response_ok,
     sign,
+    tpsl_id_of,
 )
 
 
@@ -289,6 +290,56 @@ class TestWrites:
         body = json.loads(client._session.request.call_args[1]["data"])
         assert body == {"instId": "BTC-USDT", "marginMode": "cross",
                         "positionSide": "net"}
+
+
+# TP/SL ---------------------------------------------------------------------
+TPSL_OK = {"code": "0", "msg": "Order placed",
+           "data": {"tpslId": "10001386047", "clientOrderId": None, "code": "0", "msg": None}}
+CANCEL_TPSL_OK = {"code": "0", "msg": "Batch orders canceled",
+                  "data": [{"tpslId": "10001386047", "code": "0", "msg": None}]}
+TPSL_PENDING = {"code": "0", "msg": "success", "data": [{
+    "tpslId": "10001386127", "instId": "BTC-USDT", "side": "sell",
+    "slTriggerPrice": "40000", "slOrderPrice": "-1", "size": "0.1", "state": "live"}]}
+
+
+class TestTpsl:
+    def test_place_tpsl_sl_only_body(self, client):
+        client._session.request.return_value = _resp(TPSL_OK)
+        r = client.place_tpsl(inst_id="BTC-USDT", side="sell", size="0.1",
+                              sl_trigger_price="40000")
+        assert tpsl_id_of(r) == "10001386047"
+        assert client._session.request.call_args[0][1].endswith("/api/v1/trade/order-tpsl")
+        body = json.loads(client._session.request.call_args[1]["data"])
+        assert body["slTriggerPrice"] == "40000"
+        assert body["slOrderPrice"] == "-1"
+        assert "tpTriggerPrice" not in body
+        assert body["reduceOnly"] is True
+
+    def test_place_tpsl_tp_only_body(self, client):
+        client._session.request.return_value = _resp(TPSL_OK)
+        client.place_tpsl(inst_id="BTC-USDT", side="sell", size="0.05",
+                          tp_trigger_price="70000")
+        body = json.loads(client._session.request.call_args[1]["data"])
+        assert body["tpTriggerPrice"] == "70000"
+        assert body["tpOrderPrice"] == "-1"
+        assert "slTriggerPrice" not in body
+
+    def test_cancel_tpsl_list_body(self, client):
+        client._session.request.return_value = _resp(CANCEL_TPSL_OK)
+        client.cancel_tpsl("BTC-USDT", "10001386047")
+        assert client._session.request.call_args[0][1].endswith("/api/v1/trade/cancel-tpsl")
+        body = json.loads(client._session.request.call_args[1]["data"])
+        assert body == [{"instId": "BTC-USDT", "tpslId": "10001386047"}]
+
+    def test_get_open_tpsl_orders(self, client):
+        client._session.request.return_value = _resp(TPSL_PENDING)
+        orders = client.get_open_tpsl_orders("BTC-USDT")
+        assert orders[0]["tpslId"] == "10001386127"
+        assert "orders-tpsl-pending" in client._session.request.call_args[0][1]
+
+    def test_tpsl_id_of_dict_and_list(self):
+        assert tpsl_id_of(TPSL_OK) == "10001386047"        # data is a dict
+        assert tpsl_id_of(CANCEL_TPSL_OK) == "10001386047"  # data is a list
 
 
 # Helpers -------------------------------------------------------------------
