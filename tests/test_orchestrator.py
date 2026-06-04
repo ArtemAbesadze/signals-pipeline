@@ -90,10 +90,27 @@ class TestBuildExchangeClient:
         build_exchange_client(ExchangeConfig(account_address="0xM", api_secret="0xS"))
         assert MockHL.called
 
-    def test_blofin_not_implemented(self):
-        cfg = ExchangeConfig(exchange="blofin", account_address="KEY", api_secret="SEC")
-        with pytest.raises(NotImplementedError, match="Blofin"):
-            build_exchange_client(cfg)
+    @patch("src.orchestrator.BlofinClient")
+    def test_blofin_builds_client_demo(self, MockBlofin):
+        # testnet (or any non-mainnet) network maps to the Blofin demo env.
+        cfg = ExchangeConfig(
+            exchange="blofin", network="testnet",
+            account_address="KEY", api_secret="SEC", passphrase="PASS",
+        )
+        client = build_exchange_client(cfg)
+        MockBlofin.assert_called_once_with(
+            api_key="KEY", api_secret="SEC", passphrase="PASS", network="demo",
+        )
+        assert client is MockBlofin.return_value
+
+    @patch("src.orchestrator.BlofinClient")
+    def test_blofin_mainnet_maps_to_production(self, MockBlofin):
+        cfg = ExchangeConfig(
+            exchange="blofin", network="mainnet",
+            account_address="KEY", api_secret="SEC", passphrase="PASS",
+        )
+        build_exchange_client(cfg)
+        assert MockBlofin.call_args.kwargs["network"] == "production"
 
     def test_unknown_exchange_raises(self):
         cfg = ExchangeConfig(exchange="ftx")
@@ -164,7 +181,7 @@ class TestErrorIsolation:
 
 class TestActivateDeactivate:
     @patch("src.orchestrator.HyperliquidClient")
-    @patch("src.orchestrator.PositionManager")
+    @patch("src.orchestrator.build_position_manager")
     @patch("src.orchestrator.Pipeline")
     def test_activate_user(self, MockPipeline, MockPM, MockClient, global_config, user_db):
         MockClient.return_value = _mock_client()
@@ -181,7 +198,7 @@ class TestActivateDeactivate:
         MockPipeline.assert_called_once()
 
     @patch("src.orchestrator.HyperliquidClient")
-    @patch("src.orchestrator.PositionManager")
+    @patch("src.orchestrator.build_position_manager")
     @patch("src.orchestrator.Pipeline")
     def test_deactivate_user(self, MockPipeline, MockPM, MockClient, global_config, user_db):
         MockClient.return_value = _mock_client()
@@ -203,7 +220,7 @@ class TestActivateDeactivate:
         orch.deactivate_user("nobody")
 
     @patch("src.orchestrator.HyperliquidClient")
-    @patch("src.orchestrator.PositionManager")
+    @patch("src.orchestrator.build_position_manager")
     @patch("src.orchestrator.Pipeline")
     def test_activate_already_active_skips(self, MockPipeline, MockPM, MockClient, global_config, user_db):
         MockClient.return_value = _mock_client()
@@ -221,7 +238,7 @@ class TestActivateDeactivate:
 
 class TestEnvFallback:
     @patch("src.orchestrator.HyperliquidClient")
-    @patch("src.orchestrator.PositionManager")
+    @patch("src.orchestrator.build_position_manager")
     @patch("src.orchestrator.Pipeline")
     def test_fallback_to_single_user(self, MockPipeline, MockPM, MockClient, tmpdir):
         MockClient.return_value = _mock_client()
@@ -308,7 +325,7 @@ class TestKillSwitch:
             db=mock_db, pipeline=MagicMock(),
         )
 
-        with patch("src.orchestrator.PositionManager") as MockPM:
+        with patch("src.orchestrator.build_position_manager") as MockPM:
             results = orch.kill_all()
 
         assert results["u1"]["closed"] == 1
@@ -338,7 +355,7 @@ class TestKillSwitch:
             db=mock_db2, pipeline=MagicMock(),
         )
 
-        with patch("src.orchestrator.PositionManager") as MockPM:
+        with patch("src.orchestrator.build_position_manager") as MockPM:
             pm_instance = MockPM.return_value
             pm_instance.close_position.side_effect = RuntimeError("exchange down")
             results = orch.kill_all()
@@ -383,7 +400,7 @@ class TestRefreshUserConfig:
         assert orch.refresh_user_config("nobody") is False
 
     @patch("src.orchestrator.HyperliquidClient")
-    @patch("src.orchestrator.PositionManager")
+    @patch("src.orchestrator.build_position_manager")
     @patch("src.orchestrator.Pipeline")
     def test_refresh_updates_pipeline_and_ctx(
         self, MockPipeline, MockPM, MockClient, global_config, user_db,
@@ -414,7 +431,7 @@ class TestRefreshUserConfig:
         assert orch.pipelines["alice"].config is new_config
 
     @patch("src.orchestrator.HyperliquidClient")
-    @patch("src.orchestrator.PositionManager")
+    @patch("src.orchestrator.build_position_manager")
     @patch("src.orchestrator.Pipeline")
     def test_refresh_does_not_rebuild_client(
         self, MockPipeline, MockPM, MockClient, global_config, user_db,
@@ -440,7 +457,7 @@ class TestRefreshUserConfig:
         )
 
     @patch("src.orchestrator.HyperliquidClient")
-    @patch("src.orchestrator.PositionManager")
+    @patch("src.orchestrator.build_position_manager")
     @patch("src.orchestrator.Pipeline")
     def test_refresh_picks_up_port_changes(
         self, MockPipeline, MockPM, MockClient, global_config, user_db,

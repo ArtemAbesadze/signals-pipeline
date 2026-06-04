@@ -12,8 +12,9 @@ from dataclasses import dataclass
 from typing import Callable
 
 from src.config.settings import Config, ExchangeConfig
+from src.exchange.adapter import build_position_manager
+from src.exchange.blofin import BlofinClient
 from src.exchange.hyperliquid import HyperliquidClient
-from src.exchange.position_manager import PositionManager
 from src.health import HealthServer
 from src.pipeline import Pipeline
 from src.state.database import TradeDatabase
@@ -27,15 +28,16 @@ def build_exchange_client(exchange_config: ExchangeConfig):
     they're configured for (``exchange_config.exchange``).
 
     The single seam where the multi-exchange split happens: HL and Blofin
-    users coexist, each routed to their own client. Only Hyperliquid is
-    implemented today; the Blofin adapter lands in Phase 6 Stage 2 (this
-    raises a clear NotImplementedError until then rather than silently
-    mis-constructing an HL client for a Blofin user).
+    users coexist, each routed to their own client (Phase 6.8).
 
     The credential fields are intentionally neutral (see ``ExchangeConfig``):
     for HL ``account_address`` is the master address and ``api_secret`` the
-    API-wallet key; for Blofin ``account_address`` will hold the API key,
+    API-wallet key; for Blofin ``account_address`` holds the API key,
     ``api_secret`` the secret, and ``passphrase`` the third credential.
+
+    Network mapping: the per-user ``network`` is HL's vocabulary
+    (``testnet`` / ``mainnet``); Blofin's environments are ``demo`` /
+    ``production``, so ``mainnet → production`` and everything else → ``demo``.
     """
     exchange = (exchange_config.exchange or "hyperliquid").lower()
     if exchange == "hyperliquid":
@@ -45,9 +47,16 @@ def build_exchange_client(exchange_config: ExchangeConfig):
             network=exchange_config.network,
         )
     if exchange == "blofin":
-        raise NotImplementedError(
-            "Blofin exchange adapter is not implemented yet (Phase 6 Stage 2). "
-            "A user is configured for Blofin but BlofinClient does not exist."
+        network = (
+            "production"
+            if (exchange_config.network or "").lower() == "mainnet"
+            else "demo"
+        )
+        return BlofinClient(
+            api_key=exchange_config.account_address,
+            api_secret=exchange_config.api_secret,
+            passphrase=exchange_config.passphrase,
+            network=network,
         )
     raise ValueError(f"Unknown exchange '{exchange_config.exchange}'")
 
@@ -58,7 +67,7 @@ class UserPipelineContext:
 
     user_id: str
     config: Config
-    client: HyperliquidClient
+    client: HyperliquidClient | BlofinClient
     db: TradeDatabase
     pipeline: Pipeline
     paused: bool = False
@@ -129,8 +138,8 @@ class Orchestrator:
 
         db = TradeDatabase(user_id=user_id, db_path=self._global_config.database.path)
 
-        # Sync positions
-        pm = PositionManager(client, db)
+        # Sync positions (exchange-aware — Blofin users get BlofinPositionManager)
+        pm = build_position_manager(user_config.exchange.exchange, client, db)
         sync_result = pm.sync_positions()
         if sync_result["closed"] or sync_result["canceled"]:
             logger.warning(
@@ -260,7 +269,9 @@ class Orchestrator:
         for user_id, ctx in self._pipelines.items():
             user_result: dict = {"canceled": 0, "closed": 0, "errors": []}
             try:
-                pm = PositionManager(ctx.client, ctx.db)
+                pm = build_position_manager(
+                    ctx.config.exchange.exchange, ctx.client, ctx.db,
+                )
 
                 # Cancel all open orders for open trades
                 open_trades = ctx.db.get_open_trades()
@@ -304,7 +315,7 @@ class Orchestrator:
 
         db = TradeDatabase(user_id=user_id, db_path=self._global_config.database.path)
 
-        pm = PositionManager(client, db)
+        pm = build_position_manager(self._global_config.exchange.exchange, client, db)
         sync_result = pm.sync_positions()
         if sync_result["closed"] or sync_result["canceled"]:
             logger.warning(

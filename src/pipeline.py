@@ -17,10 +17,9 @@ if TYPE_CHECKING:
     from src.telegram.notifications import TelegramNotifier
 
 from src.config.settings import Config, StrategyPreset
+from src.exchange.adapter import build_adapter
 from src.exchange.hyperliquid import HyperliquidClient
-from src.exchange.order_builder import TradeOrderSet, build_orders
-from src.utils.symbol_mapper import potion_to_hyperliquid
-from src.exchange.position_manager import OrderSubmissionError, PositionManager
+from src.exchange.position_manager import OrderSubmissionError
 from src.parser.classifier import MessageType, classify
 from src.parser.signal_parser import ParsedSignal, SignalParseError, parse_signal
 from src.parser.update_parser import (
@@ -151,8 +150,14 @@ class Pipeline:
         self._client = client
         self._db = db
         self._user_db = user_db
-        self._pm = PositionManager(client, db)
-        self._asset_meta = client.get_asset_meta()
+        # Exchange seam (Phase 6.8): the adapter selects the right position
+        # manager, order builder, balance field and symbol map for this user's
+        # exchange. HL path is unchanged; a Blofin user routes through their own
+        # stack. The client passed in must already match config.exchange.exchange
+        # (build_exchange_client guarantees that pairing).
+        self._adapter = build_adapter(config.exchange.exchange, client, db)
+        self._pm = self._adapter.position_manager
+        self._asset_meta = self._adapter.asset_meta
         self._notifier = notifier
         # Bug #14 — pipeline-level dedup of @PotionScannerBot's two-variant
         # delivery. Keyed by (trade_id, msg_type), value is the monotonic
@@ -384,10 +389,9 @@ class Pipeline:
         # Build orders (needed for coin name, leverage capping, etc.)
         trade_set = None
         try:
-            trade_set = build_orders(
-                signal, max(position_size_usd, 10.0), self._asset_meta,
-                tp_split=preset.tp_split,
-                max_leverage=self._config.strategy.max_leverage,
+            trade_set = self._adapter.build_trade_set(
+                signal, position_size_usd, preset,
+                self._config.strategy.max_leverage,
             )
         except (ValueError, KeyError) as e:
             if auto_execute:
@@ -406,9 +410,9 @@ class Pipeline:
             logger.info("Trade #%d order build failed but recording as PENDING (auto_execute=OFF): %s", signal.trade_id, e)
 
         # Derive fields — use trade_set if available, fall back to signal data
-        coin = trade_set.coin if trade_set else potion_to_hyperliquid(signal.pair)
+        coin = trade_set.coin if trade_set else self._adapter.map_symbol(signal.pair)
         leverage = trade_set.leverage if trade_set else min(signal.leverage, self._config.strategy.max_leverage)
-        position_size_coin = trade_set.entry.sz if trade_set else 0.0
+        position_size_coin = self._adapter.entry_size(trade_set) if trade_set else 0.0
 
         # Build the decision snapshot (D3 — captures the inputs that
         # produced this trade for post-mortem auditing)
@@ -506,7 +510,7 @@ class Pipeline:
                 logger.info(
                     "Trade #%d submitted: %s %s %s @ %s (lev=%dx, size=$%.2f)",
                     signal.trade_id, trade_set.coin, signal.side.value,
-                    trade_set.entry.sz, signal.entry, trade_set.leverage, position_size_usd,
+                    self._adapter.entry_size(trade_set), signal.entry, trade_set.leverage, position_size_usd,
                 )
                 if self._notifier:
                     self._notify(self._notifier.notify_trade_opened(
@@ -976,9 +980,11 @@ class Pipeline:
             logger.debug("No event loop available for notification")
 
     def _get_wallet_balance_usd(self) -> float:
-        """Get current USDC wallet balance (used for the port-vs-wallet guardrail)."""
-        bal = self._client.get_balance()
-        return float(bal["usdc_balance"])
+        """Get current spendable wallet balance in USD (used for the
+        port-vs-wallet guardrail). Routed through the adapter — HL reads
+        ``usdc_balance`` (spot under portfolio margin), Blofin reads the
+        futures account ``available``."""
+        return self._adapter.wallet_balance_usd()
 
     def _get_port_state(self) -> dict:
         """Return the current {port_usd, port_mode, port_watermark} for the user.

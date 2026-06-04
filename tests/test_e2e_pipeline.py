@@ -199,6 +199,35 @@ def pipeline(config, client, db):
 
 
 # ====================================================================
+# Exchange dispatch (Phase 6.8)
+# ====================================================================
+
+class TestPipelineExchangeDispatch:
+    """The Pipeline picks its adapter from ``config.exchange.exchange`` — an
+    HL-configured pipeline routes to the HL stack, a Blofin one to Blofin."""
+
+    def test_hyperliquid_pipeline_routes_to_hl_stack(self, config, client, db):
+        from src.exchange.adapter import HyperliquidAdapter
+        from src.exchange.position_manager import PositionManager
+
+        pipeline = Pipeline(config=config, client=client, db=db)
+        assert isinstance(pipeline._adapter, HyperliquidAdapter)
+        assert isinstance(pipeline._pm, PositionManager)
+
+    def test_blofin_pipeline_routes_to_blofin_stack(self, config, db):
+        from src.exchange.adapter import BlofinAdapter
+        from src.exchange.blofin_position_manager import BlofinPositionManager
+
+        config.exchange.exchange = "blofin"
+        blofin_client = MagicMock()
+        blofin_client.get_asset_meta.return_value = {}
+
+        pipeline = Pipeline(config=config, client=blofin_client, db=db)
+        assert isinstance(pipeline._adapter, BlofinAdapter)
+        assert isinstance(pipeline._pm, BlofinPositionManager)
+
+
+# ====================================================================
 # Full signal lifecycle
 # ====================================================================
 
@@ -1690,7 +1719,7 @@ class TestOrchestratorE2E:
         mock_db.get_open_trades.return_value = []
         orch._pipelines["alice"].db = mock_db
 
-        with patch("src.orchestrator.PositionManager"):
+        with patch("src.orchestrator.build_position_manager"):
             orch.kill_all()
 
         orch.dispatch(_load("signal_alert_06.txt"))
