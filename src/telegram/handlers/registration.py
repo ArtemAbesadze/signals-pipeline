@@ -1,6 +1,9 @@
 """Registration flow — multi-step ConversationHandler.
 
-States: ACCOUNT_ADDRESS → API_WALLET → API_SECRET → NETWORK
+States (Phase 6.9 — exchange choice first):
+  EXCHANGE → (Hyperliquid)  ACCOUNT_ADDRESS → API_WALLET → API_SECRET → NETWORK
+           → (Blofin)       BLOFIN_KEY → BLOFIN_SECRET → BLOFIN_PASSPHRASE → NETWORK
+  NETWORK → [MAINNET_CONFIRM] → complete
 
 Each credential message is deleted immediately after reading.
 DM-only check rejects registration in group chats.
@@ -22,6 +25,7 @@ from telegram.ext import (
     filters,
 )
 
+from src.exchange.blofin import BlofinClient
 from src.exchange.hyperliquid import HyperliquidClient
 from src.state.user_db import UserDatabase
 from src.telegram.formatters import mask_address
@@ -29,7 +33,17 @@ from src.telegram.formatters import mask_address
 logger = logging.getLogger(__name__)
 
 # Conversation states
-ACCOUNT_ADDRESS, API_WALLET, API_SECRET, NETWORK, MAINNET_CONFIRM = range(5)
+(
+    EXCHANGE,
+    ACCOUNT_ADDRESS,
+    API_WALLET,
+    API_SECRET,
+    BLOFIN_KEY,
+    BLOFIN_SECRET,
+    BLOFIN_PASSPHRASE,
+    NETWORK,
+    MAINNET_CONFIRM,
+) = range(9)
 
 # Phase 3.5 — mainnet selection requires typing this exact word (case-insensitive)
 # as a small friction step. Inline-button-only would be too easy to fat-finger.
@@ -65,9 +79,53 @@ async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("✅ You're already registered. Use /menu to get started!")
         return ConversationHandler.END
 
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Hyperliquid", callback_data="exchange:hyperliquid"),
+            InlineKeyboardButton("Blofin", callback_data="exchange:blofin"),
+        ]
+    ])
     await update.message.reply_text(
         "🔑 *Registration*\n\n"
-        "Let's get you set up — I'll need your Hyperliquid API credentials.\n"
+        "Let's get you set up. First, which exchange is this account on?\n\n"
+        "🏦 Select your *exchange*:",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+    return EXCHANGE
+
+
+async def receive_exchange(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle exchange selection — branches into the matching credential flow.
+
+    Both exchanges store credentials in neutral user_data keys so
+    ``_complete_registration`` is uniform: ``account_address`` (HL master
+    address / Blofin API key), ``api_secret``, and — Blofin only —
+    ``passphrase``. ``api_wallet`` is HL-only.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    exchange = query.data.replace("exchange:", "")
+    if exchange not in ("hyperliquid", "blofin"):
+        await query.edit_message_text("❌ Invalid exchange. Please select Hyperliquid or Blofin.")
+        return EXCHANGE
+
+    context.user_data["exchange"] = exchange
+
+    if exchange == "blofin":
+        await query.edit_message_text(
+            "🟦 *Blofin* selected.\n\n"
+            "I'll need an *API Transaction* key (Read + Trade; **no** Withdraw).\n"
+            "Make sure you're in a private chat — I delete each message after reading.\n\n"
+            "🔑 Send your *API Key*:",
+            parse_mode="Markdown",
+        )
+        return BLOFIN_KEY
+
+    await query.edit_message_text(
+        "🟩 *Hyperliquid* selected.\n\n"
+        "I'll need your Hyperliquid API credentials.\n"
         "Make sure you're in a private chat.\n\n"
         "📋 Send your *Account Address* (0x...):",
         parse_mode="Markdown",
@@ -148,18 +206,112 @@ async def receive_api_secret(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return API_SECRET
 
     context.user_data["api_secret"] = text
+    await update.effective_chat.send_message("🔐 Private Key received.")
+    return await _prompt_network(update, context)
 
-    keyboard = InlineKeyboardMarkup([
-        [
+
+async def _prompt_network(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Send the network/environment selection keyboard. Labels adapt to the
+    exchange (HL: Testnet/Mainnet; Blofin: Demo/Live) but the callback values
+    stay ``testnet``/``mainnet`` so completion is uniform — and
+    ``build_exchange_client`` maps ``testnet→demo`` / ``mainnet→production``
+    for Blofin."""
+    exchange = context.user_data.get("exchange", "hyperliquid")
+    if exchange == "blofin":
+        buttons = [
+            InlineKeyboardButton("🧪 Demo", callback_data="network:testnet"),
+            InlineKeyboardButton("🌐 Live", callback_data="network:mainnet"),
+        ]
+        prompt = "🌐 Select environment:"
+    else:
+        buttons = [
             InlineKeyboardButton("🧪 Testnet", callback_data="network:testnet"),
             InlineKeyboardButton("🌐 Mainnet", callback_data="network:mainnet"),
         ]
-    ])
+        prompt = "🌐 Select network:"
     await update.effective_chat.send_message(
-        "🔐 Private Key encrypted.\n\n🌐 Select network:",
-        reply_markup=keyboard,
+        prompt, reply_markup=InlineKeyboardMarkup([buttons]),
     )
     return NETWORK
+
+
+# ------------------------------------------------------------------
+# Blofin credential collection (Phase 6.9)
+# ------------------------------------------------------------------
+
+# Blofin keys/secrets are alphanumeric (not 0x hex). Light format check only —
+# the authoritative validation is the live get_balance() call at completion.
+def _is_plausible_blofin_secret(text: str) -> bool:
+    return bool(text) and " " not in text and len(text) >= 8
+
+
+async def receive_blofin_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive the Blofin API key (stored in the neutral ``account_address``)."""
+    text = update.message.text.strip()
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    if not _is_plausible_blofin_secret(text):
+        await update.effective_chat.send_message(
+            "❌ That doesn't look like an API key (no spaces, ≥8 chars).\n\n"
+            "🔑 Send your *API Key*:",
+            parse_mode="Markdown",
+        )
+        return BLOFIN_KEY
+
+    context.user_data["account_address"] = text
+    await update.effective_chat.send_message(
+        "✅ API Key saved.\n\n🔒 Now send your *API Secret*:",
+        parse_mode="Markdown",
+    )
+    return BLOFIN_SECRET
+
+
+async def receive_blofin_secret(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive the Blofin API secret."""
+    text = update.message.text.strip()
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    if not _is_plausible_blofin_secret(text):
+        await update.effective_chat.send_message(
+            "❌ That doesn't look like an API secret (no spaces, ≥8 chars).\n\n"
+            "🔒 Send your *API Secret*:",
+            parse_mode="Markdown",
+        )
+        return BLOFIN_SECRET
+
+    context.user_data["api_secret"] = text
+    await update.effective_chat.send_message(
+        "✅ API Secret saved.\n\n"
+        "🗝 Now send your *Passphrase* (the one you set when creating the key):",
+        parse_mode="Markdown",
+    )
+    return BLOFIN_PASSPHRASE
+
+
+async def receive_blofin_passphrase(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive the Blofin passphrase, then prompt for environment."""
+    text = update.message.text.strip()
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    if not text:
+        await update.effective_chat.send_message(
+            "❌ Passphrase can't be empty.\n\n🗝 Send your *Passphrase*:",
+            parse_mode="Markdown",
+        )
+        return BLOFIN_PASSPHRASE
+
+    context.user_data["passphrase"] = text
+    await update.effective_chat.send_message("🔐 Passphrase received.")
+    return await _prompt_network(update, context)
 
 
 async def receive_network(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -174,16 +326,21 @@ async def receive_network(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     network = query.data.replace("network:", "")
     if network not in ("testnet", "mainnet"):
-        await query.edit_message_text("❌ Invalid network. Please select Testnet or Mainnet.")
+        await query.edit_message_text("❌ Invalid selection. Please choose again.")
         return NETWORK
+
+    exchange = context.user_data.get("exchange", "hyperliquid")
+    # mainnet == Blofin "production" (Live). Both are real money, so both go
+    # through the typed-token friction step.
+    env_word = "Live" if exchange == "blofin" else "Mainnet"
 
     if network == "mainnet":
         context.user_data["network"] = "mainnet"
         await query.edit_message_text(
-            "⚠️ *Mainnet registration — real-money trading.*\n\n"
-            "Mainnet accounts get stricter defaults applied automatically:\n"
+            f"⚠️ *{env_word} registration — real-money trading.*\n\n"
+            f"{env_word} accounts get stricter defaults applied automatically:\n"
             f"• Position cap: *${UserDatabase.MAINNET_DEFAULT_POSITION_CAP_USD:.0f}* "
-            "(testnet default: $500)\n"
+            "(default otherwise: $500)\n"
             "• Trades above this size require explicit confirmation per signal "
             "(see Phase 3.5 mainnet promotion gate)\n"
             "• Auto-execute stays OFF until you turn it on\n\n"
@@ -236,17 +393,33 @@ async def _complete_registration(
     await progress("🔄 Validating credentials...")
 
     user_db = _get_user_db(context)
+    exchange = context.user_data.get("exchange", "hyperliquid")
+    # Neutral credential keys (see receive_exchange): account_address holds the
+    # HL master address OR the Blofin API key; api_wallet is HL-only (empty for
+    # Blofin — the column is NOT NULL); passphrase is Blofin-only.
     account_address = context.user_data["account_address"]
-    api_wallet = context.user_data["api_wallet"]
     api_secret = context.user_data["api_secret"]
+    api_wallet = context.user_data.get("api_wallet", "")
+    passphrase = context.user_data.get("passphrase", "")
 
     try:
-        client = HyperliquidClient(
-            account_address=account_address,
-            private_key=api_secret,
-            network=network,
-        )
-        client.get_account_state()
+        if exchange == "blofin":
+            # testnet→demo, mainnet→production (same mapping as build_exchange_client).
+            blofin_network = "production" if network == "mainnet" else "demo"
+            client = BlofinClient(
+                api_key=account_address,
+                api_secret=api_secret,
+                passphrase=passphrase,
+                network=blofin_network,
+            )
+            client.get_balance()  # signed read — proves key+secret+passphrase
+        else:
+            client = HyperliquidClient(
+                account_address=account_address,
+                private_key=api_secret,
+                network=network,
+            )
+            client.get_account_state()
     except Exception as e:
         logger.warning("Credential validation failed for chat %d: %s", chat_id, e)
         await progress(
@@ -267,6 +440,8 @@ async def _complete_registration(
                 "api_wallet": api_wallet,
                 "api_secret": api_secret,
                 "network": network,
+                "exchange": exchange,
+                "passphrase": passphrase,
             },
         )
     except Exception as e:
@@ -297,12 +472,18 @@ async def _complete_registration(
         UserDatabase.MAINNET_DEFAULT_POSITION_CAP_USD
         if network == "mainnet" else 500.0
     )
-    network_label = "🌐 *Mainnet*" if network == "mainnet" else "🧪 *Testnet*"
+    if exchange == "blofin":
+        exchange_label = "🟦 *Blofin*"
+        network_label = "🌐 *Live*" if network == "mainnet" else "🧪 *Demo*"
+    else:
+        exchange_label = "🟩 *Hyperliquid*"
+        network_label = "🌐 *Mainnet*" if network == "mainnet" else "🧪 *Testnet*"
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🚀 Continue", callback_data="menu:main")],
     ])
     await progress(
         "🎉 *Registration Complete!*\n\n"
+        f"Exchange: {exchange_label}\n"
         f"Network: {network_label}\n"
         f"🎯 Strategy: `even_split` (33/33/34)\n"
         f"⚡ Auto-execute: OFF\n"
@@ -327,7 +508,10 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 def _clear_user_data(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Remove sensitive data from user_data."""
-    for key in ("account_address", "api_wallet", "api_secret", "network"):
+    for key in (
+        "account_address", "api_wallet", "api_secret",
+        "passphrase", "network", "exchange",
+    ):
         context.user_data.pop(key, None)
 
 
@@ -336,9 +520,16 @@ def build_registration_handler() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[CommandHandler("register", register_command)],
         states={
+            EXCHANGE: [CallbackQueryHandler(receive_exchange, pattern=r"^exchange:")],
+            # Hyperliquid credential path
             ACCOUNT_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_account_address)],
             API_WALLET: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_wallet)],
             API_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_secret)],
+            # Blofin credential path
+            BLOFIN_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_blofin_key)],
+            BLOFIN_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_blofin_secret)],
+            BLOFIN_PASSPHRASE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_blofin_passphrase)],
+            # Shared
             NETWORK: [CallbackQueryHandler(receive_network, pattern=r"^network:")],
             MAINNET_CONFIRM: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_mainnet_confirm),
