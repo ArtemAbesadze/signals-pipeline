@@ -829,8 +829,15 @@ Same three reconciliation paths as HL, mapped to Blofin endpoints:
 1. **Startup sync**: combine `GET /api/v1/trade/positions` +
    `GET /api/v1/trade/active-orders` + `GET /api/v1/trade/active-tpsl-orders`.
    Three calls vs HL's two.
-2. **CP-driven order reconciliation**: identical logic — CP events
-   drive `orders` table state in our DB.
+2. **CP-driven order reconciliation (D11 — read-back, not infer)**: a CP
+   event is the *trigger*, but the values we persist come from Blofin, not
+   from the CP text. On each event, re-read the trade's real state —
+   `GET /api/v1/trade/trade-history` for actual fill prices,
+   `GET /api/v1/trade/positions` / `positions-history` for size + realized
+   PnL — and write those real values to the `orders`/`trades` rows. Only if
+   the Blofin query fails do we fall back to the CP-reported value, and that
+   row is flagged approximate in the audit trail. This is the opposite of the
+   HL path, which approximates fills from the order's target price.
 3. **D10 source-of-truth check**: same — query `get_open_positions`
    before market-closing a "canceled" trade.
 
@@ -849,15 +856,17 @@ gives near-real-time fill awareness.
 ### Migration note
 
 - **Sync gets one extra call**, otherwise identical structure.
-- **Order ID column** in `orders` table should be TEXT, not INTEGER,
-  to accommodate Blofin's string-style IDs. Schema migration:
-  ```sql
-  -- existing: orders.oid INTEGER
-  -- migrate to: orders.oid TEXT
-  -- (SQLite is forgiving on type affinity, but be explicit)
-  ```
+- **Order ID column** — ✅ already done in Phase 6 Commit 1 (`7cd95c0`):
+  `orders.oid` migrated INTEGER→TEXT (explicit table rebuild, not relying on
+  affinity), DB layer normalizes oids to str, HL SDK cancel paths cast back
+  to int at the boundary.
 - **D10 check** — same logic, just call Blofin's positions endpoint
   instead of HL's. Adapter pattern keeps the pipeline code unchanged.
+- **D11 read-back** — the Blofin position manager persists real values from
+  `trade-history`/`positions` after every event (see path 2 above). A
+  Stage-2 enhancement wires WS `orders`/`positions` so fills are known
+  without polling. The `orders.fill_price` and `trades.pnl_pct` columns hold
+  Blofin's real numbers, not CP approximations.
 
 ---
 

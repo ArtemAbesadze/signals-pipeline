@@ -164,6 +164,44 @@ get migrated as we find them.
 Worth noting for Phase 6 (Blofin migration): D10 applies to any exchange.
 The Blofin equivalent will use Blofin's `GET /api/v1/trade/positions`.
 
+### D11. Exchange is the source of truth for recorded *and displayed* data
+
+**Extends D10 from decisions to data.** D10 says "query the exchange before
+*acting*." D11 says: also query the exchange before *recording* and before
+*showing*. The values we persist (fill prices, position size, realized PnL,
+order status) and the values we surface in Telegram (balance, positions,
+PnL) come from the **exchange**, not from inferring them off CP's message
+text.
+
+CP's role is **trigger + audit only**: a CP lifecycle message tells us
+*that* something happened on trade #X and is recorded verbatim in
+`trade_events` — but the **actual numbers** are read back from the exchange.
+The spine holds: "CryptoPrinter's calls should be the only possible source
+of fallacy" means our bot must not *add* fallacy by storing assumed values.
+
+**Why now**: the HL implementation only partially holds this. Live balance
+and positions display already read from HL, and decision gates query HL
+(D10), but persisted **fill prices and PnL are CP-derived approximations**
+— `_mark_order_filled` writes the order's *target price* as the fill (HL
+exposes no convenient fill-price API), and `pnl_pct` is CP's reported
+number. That's exactly the assumption-based path D11 forbids.
+
+**Why Blofin makes it real**: Blofin exposes what HL didn't —
+`GET /api/v1/trade/trade-history` (real fills), `GET /api/v1/trade/positions`
++ `positions-history` (real size/PnL/closed state),
+`GET /api/v1/trade/account-balance` (real balance), and WS `orders`/
+`positions` channels (push fills).
+
+**The rule (Blofin position manager + display)**: on each CP-triggered
+lifecycle event, re-read that trade's state from Blofin and write the real
+values; display reads Blofin directly. **Prefer exchange truth; fall back
+to the CP value only when the exchange query fails, and when you do, mark
+that row as approximate in the audit trail** — never silently mix the two,
+so a post-mortem can always tell a real value from a CP-derived fallback.
+
+Closing the HL gap retroactively is out of scope (HL lacks the endpoints);
+D11 is binding for all Blofin code and any future exchange adapter.
+
 ---
 
 ## Phase status
@@ -314,12 +352,12 @@ The two docs mirror each other section-by-section so they diff cleanly.
 | 6.2 | Validate the demo environment | Six-step plan in `BLOFIN_INTEGRATION.md` § Demo Trading. Sign+send smoke test, top-up demo balance, place + cancel one tiny order. **Do not start client code until this validates.** |
 | 6.3 | `src/exchange/blofin.py` — hand-rolled HTTP client | No SDK from Blofin. ~200 LOC. Surface mirrors `HyperliquidClient`. |
 | 6.4 | `src/exchange/blofin_order_builder.py` | Contract-value math, tickSize-based rounding, native TP/SL via `/api/v1/trade/tpsl-order` |
-| 6.5 | `src/exchange/blofin_position_manager.py` | submit_trade / cancel / close / sync. Use `/api/v1/trade/close-positions` (native market close — Bug #12 obviated). |
+| 6.5 | `src/exchange/blofin_position_manager.py` | submit_trade / cancel / close / sync. Use `/api/v1/trade/close-positions` (native market close — Bug #12 obviated). **D11**: on each CP-triggered event, re-read the trade's real state from Blofin (`trade-history` fills, `positions`) and persist the real values — never CP-target approximations; fall back to CP only on query failure and mark the row approximate. |
 | 6.6 | `src/utils/symbol_mapper.py` — `potion_to_blofin` | Parallel to `potion_to_hyperliquid`. Most coins map identically; build override table during demo testing. |
-| 6.7 | Schema migration | Add `exchange` + `passphrase_enc` columns to `user_credentials`. Existing HL users continue to work. |
-| 6.8 | `/register` flow — exchange choice | New users pick Blofin or HL at registration. |
+| 6.7 | Schema migration ✅ (Commit 1, `7cd95c0`) | Added `exchange` + `passphrase_enc` to `user_credentials` **and** migrated `orders.oid` INTEGER→TEXT (Blofin string IDs). `ExchangeConfig` carries `exchange` + `passphrase`. Existing HL users untouched. |
+| 6.8 | `/register` flow — exchange choice | New users pick Blofin or HL at registration. **D11**: Telegram menus read balance/positions/PnL from Blofin directly. |
 | 6.9 | Test driver wiring | Adapter-pattern dispatch so the existing driver works against either exchange. Add `--top-up-demo` helper. |
-| 6.10 | Soak on Blofin demo | Run all 5 test driver scenarios on Blofin demo; audit cleanly before any user moves to production Blofin. |
+| 6.10 | Soak on Blofin demo | Run all 5 test driver scenarios on Blofin demo; audit cleanly before any user moves to production Blofin. **D11 check**: persisted fills/PnL match Blofin's own `trade-history`/`positions-history`, not CP's numbers. |
 | 6.11 | Per-user migration | One user at a time. Keep HL pipeline alive as fallback. |
 
 **HL code stays in the repo permanently** as the fallback adapter — the
@@ -478,6 +516,10 @@ Recent additions (last ~10 commits):
 - **Per-user isolation stays.** Composite PK `(user_id, trade_id)`.
 - **HL is source of truth for position state (D10).** Same will apply
   to Blofin in Phase 6.
+- **Exchange is source of truth for recorded + displayed data (D11).**
+  On Blofin, persist real fills/PnL/state read back from the exchange,
+  not values inferred from CP text; fall back to CP only on query failure
+  and mark the row approximate. Binding for all Blofin code.
 - **Test trade IDs in `[7_000_000, 7_999_999]`** — never reuse this
   range for anything else.
 
