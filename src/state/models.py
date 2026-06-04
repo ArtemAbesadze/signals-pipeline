@@ -119,7 +119,7 @@ class OrderRecord:
     side: str                # "BUY" or "SELL"
     size: float              # Order quantity
     price: float             # Limit / trigger price
-    oid: int | None = None   # Hyperliquid order ID (set after submission)
+    oid: str | int | None = None  # Exchange order ID — HL int, or Blofin orderId/clientOrderId str (set after submission)
     status: OrderStatus = OrderStatus.PENDING
     fill_price: float | None = None
     created_at: datetime = field(default_factory=datetime.utcnow)

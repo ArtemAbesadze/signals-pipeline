@@ -152,9 +152,11 @@ class PositionManager:
         positions_by_coin: dict[str, dict] = {
             p["coin"]: p for p in exchange_positions
         }
-        # Collect all resting order oids
-        resting_oids: set[int] = {
-            int(o["oid"]) for o in exchange_orders if "oid" in o
+        # Collect all resting order oids. Compared as strings — DB oids are
+        # stored TEXT (HL ints round-trip as their string form, Blofin uses
+        # string IDs), so normalize the exchange side to match.
+        resting_oids: set[str] = {
+            str(o["oid"]) for o in exchange_orders if "oid" in o
         }
 
         # Load local open/pending trades
@@ -193,10 +195,10 @@ class PositionManager:
                     None,
                 )
 
-                if entry_order and entry_order.oid and entry_order.oid in resting_oids:
+                if entry_order and entry_order.oid and str(entry_order.oid) in resting_oids:
                     # Entry still resting, trade is still pending
                     logger.info(
-                        "Sync: trade #%d %s entry order still resting (oid=%d)",
+                        "Sync: trade #%d %s entry order still resting (oid=%s)",
                         trade.trade_id, trade.coin, entry_order.oid,
                     )
                     summary["verified"].append(trade.trade_id)
@@ -313,11 +315,12 @@ class PositionManager:
         for order in orders:
             if order.status in (OrderStatus.SUBMITTED,) and order.oid:
                 try:
-                    self._client.exchange.cancel(order.coin, order.oid)
+                    # HL SDK expects an int oid; DB stores it as TEXT.
+                    self._client.exchange.cancel(order.coin, int(order.oid))
                     self._db.update_order_status(order.oid, OrderStatus.CANCELED)
-                    logger.info("Canceled order oid=%d for trade #%d", order.oid, trade_id)
+                    logger.info("Canceled order oid=%s for trade #%d", order.oid, trade_id)
                 except Exception as e:
-                    logger.error("Failed to cancel oid=%d: %s", order.oid, e)
+                    logger.error("Failed to cancel oid=%s: %s", order.oid, e)
 
         self._db.update_trade_status(trade_id, TradeStatus.CANCELED, close_reason="canceled")
 
@@ -416,11 +419,12 @@ class PositionManager:
 
         # Cancel old SL
         try:
-            self._client.exchange.cancel(coin, sl_order.oid)
+            # HL SDK expects an int oid; DB stores it as TEXT.
+            self._client.exchange.cancel(coin, int(sl_order.oid))
             self._db.update_order_status(sl_order.oid, OrderStatus.CANCELED)
-            logger.info("Canceled old SL oid=%d for trade #%d", sl_order.oid, trade_id)
+            logger.info("Canceled old SL oid=%s for trade #%d", sl_order.oid, trade_id)
         except Exception as e:
-            logger.error("Failed to cancel old SL oid=%d: %s", sl_order.oid, e)
+            logger.error("Failed to cancel old SL oid=%s: %s", sl_order.oid, e)
             return False
 
         # Determine direction: if original SL was a BUY (closing a short), new one is also BUY

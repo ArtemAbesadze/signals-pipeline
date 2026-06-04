@@ -10,8 +10,14 @@ from pathlib import Path
 
 import pytest
 
-from src.state.database import TradeDatabase
-from src.state.models import EventType, TradeRecord, TradeStatus
+from src.state.database import TradeDatabase, _TRADES_DDL
+from src.state.models import (
+    EventType,
+    OrderStatus,
+    OrderType,
+    TradeRecord,
+    TradeStatus,
+)
 
 
 @pytest.fixture
@@ -109,6 +115,112 @@ class TestLegacyMigration:
         assert "raw_signal_text" in cols
         assert "decision_snapshot" in cols
         db.close()
+
+
+# ====================================================================
+# orders.oid TEXT migration (Blofin string IDs — Phase 6 Commit 1)
+# ====================================================================
+
+
+class TestOrderOidText:
+    def _col_type(self, db, table: str, col: str) -> str:
+        return next(
+            (row[2] or "").upper()
+            for row in db._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            if row[1] == col
+        )
+
+    def test_fresh_db_oid_is_text(self, db):
+        assert self._col_type(db, "orders", "oid") == "TEXT"
+
+    def test_string_oid_roundtrips(self, db):
+        """Blofin-style string clientOrderId stored + queried intact."""
+        db.create_trade(_trade(1))
+        row_id = db.record_order(1, OrderType.ENTRY, "BTC", "BUY", 0.1, 50000.0)
+        db.set_order_oid(row_id, "potion_1_entry")
+        orders = db.get_orders_for_trade(1)
+        assert orders[0].oid == "potion_1_entry"
+        assert orders[0].status == OrderStatus.SUBMITTED
+        # update by the string oid resolves the row
+        db.update_order_status("potion_1_entry", OrderStatus.FILLED, fill_price=50010.0)
+        assert db.get_orders_for_trade(1)[0].status == OrderStatus.FILLED
+
+    def test_int_oid_stored_as_string(self, db):
+        """HL int oids are normalized to their string form on write so
+        equality queries are consistent across exchanges."""
+        db.create_trade(_trade(2))
+        row_id = db.record_order(2, OrderType.ENTRY, "BTC", "BUY", 0.1, 50000.0)
+        db.set_order_oid(row_id, 53682280765)
+        oid = db.get_orders_for_trade(2)[0].oid
+        assert oid == "53682280765"
+        assert isinstance(oid, str)
+        # update_order_status accepts the int form and still resolves it
+        db.update_order_status(53682280765, OrderStatus.CANCELED)
+        assert db.get_orders_for_trade(2)[0].status == OrderStatus.CANCELED
+
+    def test_legacy_integer_oid_migrates_to_text(self, tmp_path):
+        """A pre-Blofin DB with orders.oid INTEGER rebuilds to TEXT,
+        preserving rows (oid coerced to its string form) and the FK."""
+        db_path = tmp_path / "legacy_oid.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(_TRADES_DDL)
+        conn.execute(
+            """CREATE TABLE orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id INTEGER NOT NULL, user_id TEXT NOT NULL,
+                order_type TEXT NOT NULL, coin TEXT NOT NULL, side TEXT NOT NULL,
+                size REAL NOT NULL, price REAL NOT NULL,
+                oid INTEGER, status TEXT NOT NULL DEFAULT 'pending',
+                fill_price REAL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                FOREIGN KEY (user_id, trade_id) REFERENCES trades (user_id, trade_id)
+            )"""
+        )
+        # Parent trade row (FK target) + one legacy order with an integer oid
+        conn.execute(
+            "INSERT INTO trades (trade_id, user_id, pair, coin, side, risk_level, "
+            "trade_type, size_hint, entry_price, stop_loss, tp1, tp2, tp3, leverage, "
+            "signal_leverage, position_size_usd, position_size_coin, status, "
+            "created_at, updated_at) VALUES "
+            "(1, 'alice', 'BTC/USDT', 'BTC', 'LONG', 'LOW', 'SWING', '1-4%', "
+            "50000, 49000, 51000, 52000, 55000, 10, 10, 100, 0.002, 'open', "
+            "'2026-01-01T00:00:00', '2026-01-01T00:00:00')"
+        )
+        conn.execute(
+            "INSERT INTO orders (trade_id, user_id, order_type, coin, side, size, "
+            "price, oid, status, created_at, updated_at) VALUES "
+            "(1, 'alice', 'entry', 'BTC', 'BUY', 0.1, 50000, 53682280765, "
+            "'submitted', '2026-01-01T00:00:00', '2026-01-01T00:00:00')"
+        )
+        conn.commit()
+        conn.close()
+
+        db = TradeDatabase(user_id="alice", db_path=db_path)
+        assert self._col_type(db, "orders", "oid") == "TEXT"
+        orders = db.get_orders_for_trade(1)
+        assert len(orders) == 1
+        assert orders[0].oid == "53682280765"  # integer coerced to text, preserved
+        # FK + indexes intact after the rebuild
+        assert db._conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        idx = {
+            r[0] for r in db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='orders'"
+            ).fetchall()
+        }
+        assert "idx_orders_oid" in idx and "idx_orders_trade" in idx
+        db.close()
+
+    def test_migration_is_idempotent(self, tmp_path):
+        """Opening an already-migrated DB a second time leaves oid TEXT and
+        does not rebuild/duplicate anything."""
+        db_path = tmp_path / "idem.db"
+        d1 = TradeDatabase(user_id="alice", db_path=db_path)
+        d1.create_trade(_trade(1))
+        d1.record_order(1, OrderType.ENTRY, "BTC", "BUY", 0.1, 50000.0)
+        d1.close()
+        d2 = TradeDatabase(user_id="alice", db_path=db_path)
+        assert self._col_type(d2, "orders", "oid") == "TEXT"
+        assert len(d2.get_orders_for_trade(1)) == 1
+        d2.close()
 
 
 # ====================================================================

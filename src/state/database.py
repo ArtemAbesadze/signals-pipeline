@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS orders (
     side        TEXT    NOT NULL,
     size        REAL    NOT NULL,
     price       REAL    NOT NULL,
-    oid         INTEGER,
+    oid         TEXT,
     status      TEXT    NOT NULL DEFAULT 'pending',
     fill_price  REAL,
     created_at  TEXT    NOT NULL,
@@ -136,8 +136,6 @@ class TradeDatabase:
             self._conn.execute(_TRADES_DDL)
             self._conn.execute(_ORDERS_DDL)
             self._conn.execute(_TRADE_EVENTS_DDL)
-            for idx in _INDEXES_DDL:
-                self._conn.execute(idx)
             # Migrations for existing DBs — each ALTER is wrapped to ignore
             # "duplicate column" errors when the column already exists.
             for sql in (
@@ -150,6 +148,69 @@ class TradeDatabase:
                     self._conn.execute(sql)
                 except sqlite3.OperationalError:
                     pass  # Column already exists
+            # orders.oid INTEGER → TEXT rebuild (Blofin order IDs are strings;
+            # HL int oids round-trip as their string form). Runs before index
+            # creation so the indexes always land on the final table shape.
+            self._migrate_orders_oid_to_text()
+            for idx in _INDEXES_DDL:
+                self._conn.execute(idx)
+
+    def _migrate_orders_oid_to_text(self) -> None:
+        """Rebuild ``orders`` with ``oid TEXT`` if it's still ``INTEGER``.
+
+        SQLite can't ALTER a column's type, so we rebuild the table. The
+        column had INTEGER affinity, which silently stored HL's integer
+        oids fine — but Blofin order IDs / clientOrderIds are strings, and
+        INTEGER affinity would coerce a numeric-looking string back to an
+        int. TEXT affinity stores everything verbatim. Idempotent: returns
+        early once ``oid`` is already TEXT (or the table doesn't exist yet,
+        i.e. a fresh DB created from the TEXT DDL above).
+
+        Runs inside the caller's ``with self._conn`` transaction. No other
+        table has a foreign key *to* ``orders``, so the drop/rename is safe.
+        """
+        cols = {
+            row[1]: (row[2] or "").upper()
+            for row in self._conn.execute("PRAGMA table_info(orders)").fetchall()
+        }
+        if "oid" not in cols or cols["oid"] == "TEXT":
+            return
+        logger.info("Migrating orders.oid %s → TEXT", cols["oid"] or "INTEGER")
+        self._conn.execute(
+            """
+            CREATE TABLE orders_new (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id    INTEGER NOT NULL,
+                user_id     TEXT    NOT NULL,
+                order_type  TEXT    NOT NULL,
+                coin        TEXT    NOT NULL,
+                side        TEXT    NOT NULL,
+                size        REAL    NOT NULL,
+                price       REAL    NOT NULL,
+                oid         TEXT,
+                status      TEXT    NOT NULL DEFAULT 'pending',
+                fill_price  REAL,
+                created_at  TEXT    NOT NULL,
+                updated_at  TEXT    NOT NULL,
+                FOREIGN KEY (user_id, trade_id) REFERENCES trades (user_id, trade_id)
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            INSERT INTO orders_new (
+                id, trade_id, user_id, order_type, coin, side, size, price,
+                oid, status, fill_price, created_at, updated_at
+            )
+            SELECT id, trade_id, user_id, order_type, coin, side, size, price,
+                   CASE WHEN oid IS NULL THEN NULL ELSE CAST(oid AS TEXT) END,
+                   status, fill_price, created_at, updated_at
+            FROM orders
+            """
+        )
+        self._conn.execute("DROP TABLE orders")
+        self._conn.execute("ALTER TABLE orders_new RENAME TO orders")
+        logger.info("orders.oid migration complete")
 
     @property
     def user_id(self) -> str:
@@ -317,10 +378,15 @@ class TradeDatabase:
         side: str,
         size: float,
         price: float,
-        oid: int | None = None,
+        oid: str | int | None = None,
         status: OrderStatus = OrderStatus.PENDING,
     ) -> int:
-        """Insert an order record. Returns the auto-generated row ID."""
+        """Insert an order record. Returns the auto-generated row ID.
+
+        ``oid`` is the exchange order ID — an int on HL, a string
+        (orderId / clientOrderId) on Blofin. Stored as TEXT so both fit;
+        we normalize to ``str`` on write for consistent equality queries.
+        """
         now = _now()
         with self._conn:
             cursor = self._conn.execute(
@@ -330,7 +396,8 @@ class TradeDatabase:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     trade_id, self._user_id, order_type.value, coin, side,
-                    size, price, oid, status.value, now, now,
+                    size, price, None if oid is None else str(oid),
+                    status.value, now, now,
                 ),
             )
         row_id = cursor.lastrowid
@@ -340,25 +407,25 @@ class TradeDatabase:
         )
         return row_id
 
-    def update_order_status(self, oid: int, status: OrderStatus, fill_price: float | None = None) -> None:
-        """Update an order's status by its Hyperliquid oid."""
+    def update_order_status(self, oid: str | int, status: OrderStatus, fill_price: float | None = None) -> None:
+        """Update an order's status by its exchange oid (HL int or Blofin str)."""
         now = _now()
         with self._conn:
             self._conn.execute(
                 """UPDATE orders
                    SET status = ?, updated_at = ?, fill_price = COALESCE(?, fill_price)
                    WHERE oid = ? AND user_id = ?""",
-                (status.value, now, fill_price, oid, self._user_id),
+                (status.value, now, fill_price, str(oid), self._user_id),
             )
 
-    def set_order_oid(self, row_id: int, oid: int) -> None:
-        """Set the Hyperliquid oid after an order is submitted."""
+    def set_order_oid(self, row_id: int, oid: str | int) -> None:
+        """Set the exchange oid after an order is submitted (stored as TEXT)."""
         now = _now()
         with self._conn:
             self._conn.execute(
                 "UPDATE orders SET oid = ?, status = 'submitted', updated_at = ? "
                 "WHERE id = ? AND user_id = ?",
-                (oid, now, row_id, self._user_id),
+                (str(oid), now, row_id, self._user_id),
             )
 
     def get_orders_for_trade(self, trade_id: int) -> list[OrderRecord]:

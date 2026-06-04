@@ -33,12 +33,24 @@ class ConfigError(Exception):
 
 @dataclass
 class ExchangeConfig:
-    """Hyperliquid connection settings. Credentials come from .env."""
+    """Per-user exchange connection settings. Credentials come from .env
+    (single-user fallback) or the encrypted ``user_credentials`` table.
+
+    ``exchange`` selects the adapter (``hyperliquid`` | ``blofin``). The
+    credential fields are deliberately neutral so both exchanges fit one
+    shape:
+      - HL    → account_address (master) + api_wallet + api_secret; no passphrase.
+      - Blofin → account_address holds the API key; api_secret holds the
+        secret; ``passphrase`` is the third credential. api_wallet is unused.
+    ``network`` means testnet/mainnet on HL and demo/production on Blofin.
+    """
 
     network: str = "testnet"
     account_address: str = ""
     api_wallet: str = ""
     api_secret: str = ""
+    exchange: str = "hyperliquid"
+    passphrase: str = ""
 
 
 @dataclass
@@ -371,6 +383,8 @@ def load_config(
             account_address=os.getenv("HL_ACCOUNT_ADDRESS", ""),
             api_wallet=os.getenv("HL_API_WALLET", ""),
             api_secret=os.getenv("HL_API_SECRET", ""),
+            exchange=exchange_yaml.get("exchange", "hyperliquid"),
+            passphrase=os.getenv("BLOFIN_PASSPHRASE", ""),
         ),
         input=_build_dataclass(InputConfig, yaml_data.get("input", {})),
         strategy=strategy_config,

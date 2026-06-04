@@ -923,6 +923,61 @@ class TestPendingToOpenPromotion:
         client.get_open_positions.assert_not_called()
 
 
+class TestSyncPositionsOidMatching:
+    """Phase 6 Commit 1 regression: orders.oid is now TEXT. ``sync_positions``
+    builds its resting-oid set from the exchange (HL returns int oids) and
+    compares against the DB oid (now a string). Both sides must be normalized
+    to str or a still-resting HL entry would be wrongly marked CANCELED.
+    """
+
+    def _seed_pending_with_entry_oid(self, tmpdir, oid, name="oidsync"):
+        from src.state.models import TradeRecord
+        db = TradeDatabase(user_id="test_user", db_path=tmpdir / f"{name}.db")
+        trade = TradeRecord(
+            trade_id=4242, user_id="test_user", pair="ETH/USDT", coin="ETH",
+            side="LONG", risk_level="LOW", trade_type="SWING", size_hint="1-4%",
+            entry_price=3000.0, stop_loss=2900.0,
+            tp1=3050.0, tp2=3100.0, tp3=3200.0,
+            leverage=10, signal_leverage=10,
+            position_size_usd=300.0, position_size_coin=0.1,
+        )
+        db.create_trade(trade)  # PENDING by default
+        row_id = db.record_order(4242, OrderType.ENTRY, "ETH", "BUY", 0.1, 3000.0)
+        db.set_order_oid(row_id, oid)  # stored as TEXT
+        return db
+
+    def test_resting_entry_matched_despite_int_vs_text_oid(self, tmpdir, client):
+        """DB oid stored as text "777"; HL returns int oid 777. The pending
+        entry must be recognized as still resting (verified), NOT canceled."""
+        db = self._seed_pending_with_entry_oid(tmpdir, 777)
+        client.get_open_positions.return_value = []
+        client.get_open_orders.return_value = [{"oid": 777, "coin": "ETH"}]
+        from src.exchange.position_manager import PositionManager
+        pm = PositionManager(client, db)
+
+        summary = pm.sync_positions()
+
+        assert 4242 in summary["verified"]
+        assert 4242 not in summary["canceled"]
+        assert db.get_trade(4242).status == TradeStatus.PENDING
+        db.close()
+
+    def test_pending_with_no_resting_order_and_no_position_is_canceled(self, tmpdir, client):
+        """Sanity: when the entry is neither resting nor filled, sync still
+        cancels it (unchanged behavior, exercised through the new oid path)."""
+        db = self._seed_pending_with_entry_oid(tmpdir, 888)
+        client.get_open_positions.return_value = []
+        client.get_open_orders.return_value = []  # nothing resting
+        from src.exchange.position_manager import PositionManager
+        pm = PositionManager(client, db)
+
+        summary = pm.sync_positions()
+
+        assert 4242 in summary["canceled"]
+        assert db.get_trade(4242).status == TradeStatus.CANCELED
+        db.close()
+
+
 class TestPipelineDedup:
     """Bug #14 — @PotionScannerBot delivers each CP signal as two variants
     (base + summary-prefixed). The forwarder correctly forwards both as

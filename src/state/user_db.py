@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS user_credentials (
     api_wallet_enc      TEXT NOT NULL,
     api_secret_enc      TEXT NOT NULL,
     network             TEXT NOT NULL DEFAULT 'testnet',
+    exchange            TEXT NOT NULL DEFAULT 'hyperliquid',
+    passphrase_enc      TEXT,
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL
 );
@@ -131,6 +133,7 @@ class UserDatabase:
             self._conn.execute(_TELEGRAM_ADMINS_DDL)
             self._migrate_user_config()
             self._migrate_drop_saas_columns()
+            self._migrate_user_credentials()
 
     # ------------------------------------------------------------------
     # User CRUD
@@ -149,7 +152,9 @@ class UserDatabase:
             user_id: Unique identifier for the user.
             display_name: Human-readable name.
             credentials: Must contain 'account_address', 'api_wallet', 'api_secret'.
-                         Optional: 'network' (default 'testnet').
+                         Optional: 'network' (default 'testnet'),
+                         'exchange' (default 'hyperliquid'),
+                         'passphrase' (Blofin only; encrypted, NULL otherwise).
             config: Optional dict of config overrides (keys match user_config columns).
 
         Returns:
@@ -157,6 +162,7 @@ class UserDatabase:
         """
         now = _now()
         config = config or {}
+        passphrase = credentials.get("passphrase")
 
         with self._conn:
             # Insert user
@@ -169,14 +175,17 @@ class UserDatabase:
             # Insert encrypted credentials
             self._conn.execute(
                 "INSERT INTO user_credentials "
-                "(user_id, account_address_enc, api_wallet_enc, api_secret_enc, network, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "(user_id, account_address_enc, api_wallet_enc, api_secret_enc, "
+                "network, exchange, passphrase_enc, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     user_id,
                     encrypt(credentials["account_address"]),
                     encrypt(credentials["api_wallet"]),
                     encrypt(credentials["api_secret"]),
                     credentials.get("network", "testnet"),
+                    credentials.get("exchange", "hyperliquid"),
+                    encrypt(passphrase) if passphrase else None,
                     now,
                     now,
                 ),
@@ -279,11 +288,15 @@ class UserDatabase:
         ).fetchone()
         if not row:
             return None
+        keys = row.keys()
+        passphrase_enc = row["passphrase_enc"] if "passphrase_enc" in keys else None
         return {
             "account_address": decrypt(row["account_address_enc"]),
             "api_wallet": decrypt(row["api_wallet_enc"]),
             "api_secret": decrypt(row["api_secret_enc"]),
             "network": row["network"],
+            "exchange": row["exchange"] if "exchange" in keys else "hyperliquid",
+            "passphrase": decrypt(passphrase_enc) if passphrase_enc else "",
         }
 
     def update_user_credentials(self, user_id: str, **kwargs: str) -> None:
@@ -294,14 +307,15 @@ class UserDatabase:
 
         enc_fields = {"account_address": "account_address_enc",
                        "api_wallet": "api_wallet_enc",
-                       "api_secret": "api_secret_enc"}
+                       "api_secret": "api_secret_enc",
+                       "passphrase": "passphrase_enc"}
 
         for key, value in kwargs.items():
             if key in enc_fields:
                 updates.append(f"{enc_fields[key]} = ?")
                 params.append(encrypt(value))
-            elif key == "network":
-                updates.append("network = ?")
+            elif key in ("network", "exchange"):
+                updates.append(f"{key} = ?")
                 params.append(value)
 
         if not updates:
@@ -565,6 +579,8 @@ class UserDatabase:
                 account_address=user_creds["account_address"],
                 api_wallet=user_creds["api_wallet"],
                 api_secret=user_creds["api_secret"],
+                exchange=user_creds.get("exchange", "hyperliquid"),
+                passphrase=user_creds.get("passphrase", ""),
             ),
             input=global_config.input,
             strategy=StrategyConfig(
@@ -612,6 +628,25 @@ class UserDatabase:
                 logger.info("Migrated user_config: added column %s", col)
 
         self._migrate_active_preset()
+
+    def _migrate_user_credentials(self) -> None:
+        """Add multi-exchange columns to user_credentials for existing DBs.
+
+        ``exchange`` discriminates the adapter (defaults to 'hyperliquid' so
+        every pre-Blofin user keeps working). ``passphrase_enc`` holds the
+        Fernet-encrypted Blofin passphrase (NULL for HL users). Idempotent
+        ALTER-if-missing, matching ``_migrate_user_config``.
+        """
+        cursor = self._conn.execute("PRAGMA table_info(user_credentials)")
+        existing = {row[1] for row in cursor.fetchall()}
+        migrations = {
+            "exchange": "ALTER TABLE user_credentials ADD COLUMN exchange TEXT NOT NULL DEFAULT 'hyperliquid'",
+            "passphrase_enc": "ALTER TABLE user_credentials ADD COLUMN passphrase_enc TEXT",
+        }
+        for col, sql in migrations.items():
+            if col not in existing:
+                self._conn.execute(sql)
+                logger.info("Migrated user_credentials: added column %s", col)
 
     def _migrate_drop_saas_columns(self) -> None:
         """One-shot D4 migration: drop the SaaS-era invite_codes table and

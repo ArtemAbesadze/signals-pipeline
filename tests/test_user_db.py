@@ -8,8 +8,10 @@ from unittest.mock import patch
 import pytest
 from cryptography.fernet import Fernet
 
+import sqlite3
+
 from src.config.settings import Config
-from src.crypto import reset_fernet
+from src.crypto import encrypt, reset_fernet
 from src.state.user_db import UserDatabase
 
 
@@ -149,6 +151,96 @@ class TestCredentials:
         assert creds["network"] == "mainnet"
         # Unchanged fields stay the same
         assert creds["api_secret"] == "0xSECRET789"
+
+
+BLOFIN_CREDS = {
+    "account_address": "BLOFIN_API_KEY",   # repurposed: holds the API key
+    "api_wallet": "",                       # unused on Blofin
+    "api_secret": "blofin_secret",
+    "network": "demo",
+    "exchange": "blofin",
+    "passphrase": "my-pass-phrase",
+}
+
+
+class TestExchangeCredentials:
+    """Phase 6 Commit 1 — multi-exchange columns on user_credentials."""
+
+    def test_default_exchange_is_hyperliquid(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        creds = db.get_user_credentials_decrypted("alice")
+        assert creds["exchange"] == "hyperliquid"
+        assert creds["passphrase"] == ""
+
+    def test_create_blofin_user_with_passphrase(self, db):
+        db.create_user("bob", "Bob", BLOFIN_CREDS)
+        creds = db.get_user_credentials_decrypted("bob")
+        assert creds["exchange"] == "blofin"
+        assert creds["passphrase"] == "my-pass-phrase"
+        assert creds["api_secret"] == "blofin_secret"
+
+    def test_passphrase_encrypted_at_rest(self, db):
+        db.create_user("bob", "Bob", BLOFIN_CREDS)
+        row = db._conn.execute(
+            "SELECT passphrase_enc FROM user_credentials WHERE user_id='bob'"
+        ).fetchone()
+        assert row["passphrase_enc"] not in (None, "my-pass-phrase")
+
+    def test_hl_user_has_null_passphrase_at_rest(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        row = db._conn.execute(
+            "SELECT passphrase_enc FROM user_credentials WHERE user_id='alice'"
+        ).fetchone()
+        assert row["passphrase_enc"] is None
+
+    def test_update_exchange_and_passphrase(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        db.update_user_credentials("alice", exchange="blofin", passphrase="pp")
+        creds = db.get_user_credentials_decrypted("alice")
+        assert creds["exchange"] == "blofin"
+        assert creds["passphrase"] == "pp"
+        assert creds["api_secret"] == "0xSECRET789"  # untouched
+
+    def test_config_build_carries_exchange_fields(self, db):
+        db.create_user("bob", "Bob", BLOFIN_CREDS)
+        cfg = db.get_user_config_as_config("bob", Config())
+        assert cfg.exchange.exchange == "blofin"
+        assert cfg.exchange.passphrase == "my-pass-phrase"
+        assert cfg.exchange.network == "demo"
+
+    def test_legacy_credentials_migration_defaults_to_hyperliquid(self, tmp_path):
+        """A pre-Blofin user_credentials table (no exchange/passphrase_enc)
+        gains the columns on open; existing rows default to hyperliquid."""
+        db_path = tmp_path / "legacy_creds.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE users (user_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, "
+            "status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE user_credentials (user_id TEXT PRIMARY KEY REFERENCES users(user_id), "
+            "account_address_enc TEXT NOT NULL, api_wallet_enc TEXT NOT NULL, "
+            "api_secret_enc TEXT NOT NULL, network TEXT NOT NULL DEFAULT 'testnet', "
+            "created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO users VALUES ('alice', 'Alice', 'active', 'x', 'x')"
+        )
+        conn.execute(
+            "INSERT INTO user_credentials VALUES ('alice', ?, ?, ?, 'testnet', 'x', 'x')",
+            (encrypt("0xMASTER"), encrypt("0xWALLET"), encrypt("0xSECRET")),
+        )
+        conn.commit()
+        conn.close()
+
+        udb = UserDatabase(db_path=db_path)
+        cols = {r[1] for r in udb._conn.execute("PRAGMA table_info(user_credentials)").fetchall()}
+        assert "exchange" in cols and "passphrase_enc" in cols
+        creds = udb.get_user_credentials_decrypted("alice")
+        assert creds["exchange"] == "hyperliquid"  # legacy default
+        assert creds["passphrase"] == ""
+        assert creds["account_address"] == "0xMASTER"  # existing creds still decrypt
+        udb.close()
 
 
 class TestUserConfig:
