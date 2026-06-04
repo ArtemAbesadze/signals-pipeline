@@ -874,6 +874,20 @@ approach. Easy to write wrong, hard to debug (looks like 60009 bad
 creds). **Verify against Blofin's example signature in the docs
 before going live.**
 
+### Resting-entry PENDING→OPEN promotion (carry over Bug #20)
+
+HL Bug #20 (see HL doc § 14): no live handler promoted a resting-entry
+trade from PENDING→OPEN, so the breakeven-after-TP1 move silently
+no-opped. The fix (`_promote_to_open_if_filled`) lives in the shared
+pipeline, but it queries the *exchange* — the Blofin
+`PositionManager`/client must implement `get_open_positions()` against
+`GET /api/v1/trade/positions` (with the unsigned-`size`+`side`
+normalization from § 6) so the promotion path works identically on
+Blofin. Without it, Blofin resting entries hit the same bug. Bonus: if
+we wire the orders WebSocket (`positions`/`orders` channels), entry
+fills become push-events and promotion can happen on the fill rather
+than waiting for CP's `TRADE_LIVE`.
+
 ### Position mode bootstrap
 
 If a Blofin account defaults to `hedge` mode and we send orders

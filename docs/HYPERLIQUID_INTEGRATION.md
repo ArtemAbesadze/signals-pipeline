@@ -716,7 +716,7 @@ fill notifications from HL:
 
 | Event | Handler effect on orders table |
 |---|---|
-| `TRADE_LIVE` | entry → FILLED |
+| `TRADE_LIVE` | entry → FILLED; trade PENDING→OPEN if HL confirms the position (Bug #20) |
 | `TP_HIT n` | TP{n} → FILLED |
 | `BREAKEVEN` | move SL (cancel old, place new at entry price) |
 | `ALL_TP_HIT` | all 3 TPs → FILLED, SL → CANCELED |
@@ -814,6 +814,41 @@ figs naturally produces 7 decimals → "Order has invalid price".
 `_round_price` in both `order_builder.py` and `position_manager.py`
 applies sig-figs round THEN `round(..., 6)`. The two copies must
 agree — sentinel test in `TestPricePrecisionForTightTickCoins`.
+
+### Bug #20: Resting-entry trades stuck PENDING (commit `73b20e4`)
+
+`TradeStatus.OPEN` was only ever written in two places, both in
+`position_manager.py`: at submit time when the entry **fills
+immediately** (line 292), and by startup `sync_positions` when HL shows
+a position for a PENDING trade (line 209). No *live* lifecycle handler
+promoted PENDING→OPEN. A resting limit entry that filled later (the
+common case — CP sends `TRADE_LIVE`, which is not an immediate fill)
+therefore stayed PENDING in the running pipeline. Every handler gated on
+`status == OPEN` then silently no-opped: the breakeven-after-TP1 SL move
+(`pipeline.py:571`), the standalone breakeven handler (`:650`), the D10
+cancel/close routing (`:758`), and manual SL updates (`:910`).
+
+`_handle_trade_live` had a comment claiming "we already know via the
+exchange order-fill event" — but there is **no fill-polling mechanism**,
+so the assumption was structurally false for resting entries.
+
+Real case: ADA #2184 on the 2026-06-01 soak. Entry rested then filled;
+`orders.entry=FILLED` (reconciled by `_mark_order_filled`) but
+`trades.status` stuck at PENDING. TP1 hit → BE move skipped ("trade not
+open") → the ADA short kept its original SL on HL instead of being moved
+to entry. A faithfulness violation: the preset said move-SL-to-BE, the
+bot silently didn't.
+
+Fix: `_promote_to_open_if_filled` — D10-style, queries
+`get_open_positions()` and promotes only if HL confirms the position;
+on query failure it trusts CP's explicit fill confirmation and promotes
+anyway (staying PENDING is the harmful outcome). Called from both
+`_handle_trade_live` and `_handle_tp_hit` (a TP can't hit on an unfilled
+entry). Sibling local-vs-exchange drift (#2200 OP, #2188 RENDER — local
+`open` but gone from HL) is the *milder inverse*: those self-heal via
+`sync_positions` on the next restart (`sync_no_position` → CLOSED).
+Migration note: the same gap would exist on Blofin — `_handle_trade_live`
+on the Blofin path must promote via `GET /api/v1/trade/positions`.
 
 ### Channel post visibility (test driver, commit `37a0454`)
 

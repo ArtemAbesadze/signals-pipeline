@@ -53,7 +53,7 @@ potion-perps-bot/
 │   ├── strategy/position_sizer.py       # sizing + pre-trade risk gate
 │   ├── telegram/                        # bot + handlers + notifications + monitors + confirmation_sweeper
 │   └── utils/                           # structlog setup, symbol mapper
-├── tests/                               # 761 tests across 35 files
+├── tests/                               # 766 tests across 35 files
 └── signals/
     ├── samples/                         # Real CP samples for parser tests (Discord format — still valid via forwarder)
     └── test/                            # E2E test fixtures
@@ -83,7 +83,7 @@ Key files when something breaks:
 5. **Per-user isolation.** Composite PK `(user_id, trade_id)` on `trades` and `orders`. All queries filter by `user_id`. One user's bug cannot touch another user's data.
 6. **DM-only for Telegram.** `dm_only_filter` middleware rejects group messages. Credential-collection messages are deleted on receipt.
 7. **No Discord edit handling.** CP sends all updates as new messages, never edits existing ones. `on_message` only — do not add `on_message_edit`.
-8. **Tests close behind code.** 761 tests today across `tests/`. New features land with tests, not after.
+8. **Tests close behind code.** 766 tests today across `tests/`. New features land with tests, not after.
 9. **Branch first during rework.** Active branch: `rework/scope-v1`. No commits to `main` until the rework is feature-complete.
 10. **README is current.** Phase 3.4 rewrote it for the private-tool scope. Keep it accurate as the codebase evolves — no longer frozen.
 11. **Test trade IDs live in `[7_000_000, 7_999_999]`.** Real CP IDs are 4 digits (max ~3000), so any 7-digit `trade_id` in `trades` / `orders` / `trade_events` is synthetic from `scripts/test_driver.py`. Bulk-delete with `python3 scripts/test_driver.py --cleanup`. Don't intermix this range with real CP trade IDs anywhere.
@@ -116,7 +116,7 @@ Phase 6 (Blofin migration) is the next major effort.**
 Where we are today:
 
 - **Branch**: `rework/scope-v1`. HEAD on GitHub matches local.
-- **Tests**: 761/761 across 35 files.
+- **Tests**: 766/766 across 35 files.
 - **Live state**: both launchd agents running, HL clean (no positions,
   no orders), no test data in the DB, Phase 4.2 soak ongoing — bot
   receiving real CP signals end-to-end through the
@@ -164,6 +164,7 @@ Other Bug fixes across Phase 4.x:
 | #17 | `37a0454` | Test driver Telethon posting (see 4.3b above) |
 | #18 | `e351b6f` | Decimal cap in _round_price (see 4.3c above) |
 | #19 | `7807123` | /positions slash command close buttons (see 4.3f above) |
+| #20 | `73b20e4` | **Resting-entry trades stuck PENDING.** No live handler promoted a trade PENDING→OPEN — only submit-time immediate fill or startup `sync_positions` did. A resting limit entry that filled later (TRADE_LIVE from CP, not an immediate fill) stayed PENDING, so every handler gated on `status==OPEN` silently no-opped — notably the breakeven-after-TP1 SL move. Real case: ADA #2184 (2026-06-01 soak) hit TP1 but its SL was never moved to entry on HL. Fix: `_promote_to_open_if_filled` (D10 — confirms position on HL, falls back to trusting CP's explicit fill on query failure) called from `_handle_trade_live` and `_handle_tp_hit`. |
 
 Phase 4.1 — wiring (sessions 2026-05-24 → 2026-05-25):
 
@@ -246,7 +247,7 @@ git log --oneline -5
 git status
 
 # 3. Tests pass
-python3 -m pytest tests/ -q | tail -2  # expect 761 passed
+python3 -m pytest tests/ -q | tail -2  # expect 766 passed
 
 # 4. Both launchd agents up
 launchctl print gui/$(id -u)/local.potion-perps-bot 2>&1 | grep state
@@ -352,8 +353,9 @@ Phase 5 = parking lot (weekly performance report, VPS, CI/CD, backtest tooling).
 
 ## Tests
 
-**761/761 passing** across 35 files. Recent additions worth knowing about:
+**766/766 passing** across 35 files. Recent additions worth knowing about:
 
+- `tests/test_e2e_pipeline.py::TestPendingToOpenPromotion` (5 tests, Bug #20) — TRADE_LIVE/TP_HIT promote a resting-entry trade PENDING→OPEN (D10: HL-confirmed, falls back to CP fill on query failure); the core regression asserts TP1 on a still-PENDING trade fires the breakeven SL move.
 - `tests/test_test_driver.py` (41 tests) — scenarios, template fidelity (each event round-trips through classify+parse), scheduling determinism, cleanup, realistic-percentage math, orphan-order helper.
 - `tests/test_positions_keyboard.py` (9 tests, Bug #19) — locks the slash-command ↔ menu-path keyboard parity contract via static import check + behavioural assertions.
 - `tests/test_text_handler_guards.py` (4 tests, Bug #15) — DM text handlers no-op cleanly on channel_post.

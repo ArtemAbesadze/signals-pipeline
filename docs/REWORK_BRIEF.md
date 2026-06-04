@@ -50,7 +50,7 @@ and control via Telegram.
 | Field | Value |
 |---|---|
 | Branch | `rework/scope-v1` (default branch on GitHub) |
-| Test count | **761/761 passing** across 35 test files |
+| Test count | **766/766 passing** across 35 test files |
 | LOC | ~19,000 across `src/` + `scripts/` + `tests/` |
 | Users | Artem (Telegram `7441245554`, testnet, $500 port, auto_execute=ON) + swaag (Telegram `7375268438`, testnet, no port set) — third slot empty |
 | Exchange | Hyperliquid testnet (everyone). Mainnet promotion is gated by Phase 3.5 (typed `MAINNET` confirm + per-trade approval dialog). |
@@ -269,6 +269,7 @@ Other Phase 4.x bugs fixed in the same window (chronological):
 | #17 test driver posting | `37a0454` | (See Phase 4.3b above.) |
 | #18 price precision | `e351b6f` | (See Phase 4.3c above.) |
 | #19 positions slash command | `7807123` | (See Phase 4.3f above.) |
+| #20 resting-entry stuck PENDING | `73b20e4` | No live handler promoted a trade PENDING→OPEN — only submit-time immediate fill or startup `sync_positions`. A resting limit entry that filled *later* (CP's TRADE_LIVE, not an immediate fill) stayed PENDING, so every `status==OPEN`-gated handler silently no-opped — notably the BE-after-TP1 SL move. ADA #2184 (2026-06-01 soak) hit TP1 but its SL was never moved to entry on HL. Fix: `_promote_to_open_if_filled` (D10 — HL-confirmed, falls back to trusting CP's explicit fill on query failure) from `_handle_trade_live` + `_handle_tp_hit`. |
 
 ### Phase 5 — Post-launch (parking lot)
 
@@ -354,7 +355,7 @@ git log --oneline -5
 git status
 
 # 3. Tests pass
-python3 -m pytest tests/ -q | tail -2  # expect 761 passed
+python3 -m pytest tests/ -q | tail -2  # expect 766 passed
 
 # 4. Both launchd agents up
 launchctl print gui/$(id -u)/local.potion-perps-bot 2>&1 | grep state
@@ -440,9 +441,13 @@ These came up during the rework and are easy to forget:
 
 ## Tests
 
-**761/761 passing** as of HEAD on `rework/scope-v1`. 35 test files.
+**766/766 passing** as of HEAD on `rework/scope-v1`. 35 test files.
 Recent additions (last ~10 commits):
 
+- `tests/test_e2e_pipeline.py::TestPendingToOpenPromotion` — 5 tests on
+  Bug #20: TRADE_LIVE/TP_HIT promote a resting-entry trade PENDING→OPEN
+  (D10 HL-confirmed, CP-fallback on query failure); regression asserts
+  TP1 on a still-PENDING trade fires the breakeven SL move.
 - `tests/test_test_driver.py` — 41 tests covering scenarios, template
   fidelity, scheduling, cleanup, realistic-percentage math, orphan-order
   helper.
