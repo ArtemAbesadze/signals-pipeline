@@ -560,6 +560,12 @@ class Pipeline:
         if _tp_type is not None:
             self._mark_order_filled(tp.trade_id, _tp_type)
 
+        # A TP cannot hit on an unfilled entry — promote PENDING→OPEN if a
+        # TRADE_LIVE was missed, so the breakeven move below isn't skipped.
+        # Bug #20. Refresh the in-memory trade to see the new status.
+        if self._promote_to_open_if_filled(tp.trade_id, trade.coin):
+            trade = self._db.get_trade(tp.trade_id) or trade
+
         # Check if we should move SL to breakeven
         preset = self._config.get_active_preset()
         be_after = preset.move_sl_to_breakeven_after
@@ -872,11 +878,19 @@ class Pipeline:
         # TRADE_LIVE).
         self._mark_order_filled(tl.trade_id, OrderType.ENTRY)
 
+        # Promote PENDING→OPEN so downstream handlers (BE move, manual SL,
+        # D10 routing) act. A resting entry that fills later would otherwise
+        # stay PENDING in the live pipeline. Bug #20.
+        promoted = self._promote_to_open_if_filled(tl.trade_id, trade.coin)
+
+        action = "CP confirms entry filled (exchange is authoritative)"
+        if promoted:
+            action += "; promoted PENDING→OPEN"
         self._record_event(
             trade_id=tl.trade_id,
             event_type=EventType.TRADE_LIVE,
             raw_text=raw,
-            action_taken="CP confirms entry filled (exchange is authoritative)",
+            action_taken=action,
         )
 
         if self._notifier:
@@ -1059,6 +1073,55 @@ class Pipeline:
                     )
                     return False
         return False
+
+    def _promote_to_open_if_filled(self, trade_id: int, coin: str) -> bool:
+        """Promote a PENDING trade to OPEN once its entry has filled.
+
+        Called from lifecycle handlers (TRADE_LIVE, TP_HIT) that imply
+        the entry filled. Without this, a resting-entry trade that fills
+        *later* (the entry limit wasn't crossed at submit time) stays
+        PENDING in the live pipeline forever — status is only promoted to
+        OPEN at submit time (immediate fill) or by startup ``sync_positions``.
+        Every handler gated on ``status == OPEN`` then silently no-ops:
+        the breakeven-after-TP1 SL move, the standalone breakeven handler,
+        the D10 cancel/close routing, and manual SL updates. Bug #20 —
+        ADA #2184 on the 2026-06-01 soak: entry rested then filled, status
+        stuck at PENDING, TP1 hit but BE move was skipped ("trade not
+        open"), so the SL was never moved to entry on the exchange.
+
+        D10: confirm against the exchange rather than trusting CP. On
+        query failure, trust the explicit CP fill confirmation (the caller
+        only invokes this on TRADE_LIVE / TP_HIT) and promote anyway —
+        staying PENDING is the demonstrably harmful outcome.
+
+        Returns True if the trade was promoted.
+        """
+        trade = self._db.get_trade(trade_id)
+        if not trade or trade.status != TradeStatus.PENDING:
+            return False
+        try:
+            positions = self._client.get_open_positions()
+            has_position = any(
+                p.get("coin") == coin and float(p.get("size", 0) or 0) != 0
+                for p in positions
+            )
+        except Exception:
+            logger.exception(
+                "Could not query HL to promote #%d to OPEN; trusting the "
+                "CP fill confirmation and promoting anyway",
+                trade_id,
+            )
+            has_position = True
+        if not has_position:
+            logger.warning(
+                "CP signaled a fill for #%d %s but HL shows no position; "
+                "leaving status=%s",
+                trade_id, coin, trade.status.value,
+            )
+            return False
+        self._db.update_trade_status(trade_id, TradeStatus.OPEN)
+        logger.info("Promoted #%d %s PENDING→OPEN (entry filled)", trade_id, coin)
+        return True
 
     def _cancel_remaining_orders_of_types(
         self,

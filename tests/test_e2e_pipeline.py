@@ -806,6 +806,123 @@ class TestOrderStatusReconciliation:
         assert pipeline._mark_order_filled(5001, OrderType.TP1) is False
 
 
+class TestPendingToOpenPromotion:
+    """Bug #20 from the 2026-06-01 soak: a resting-entry trade that fills
+    *later* (its entry limit wasn't crossed at submit) stayed PENDING in
+    the live pipeline forever. Status was only ever promoted to OPEN at
+    submit time (immediate fill) or by startup ``sync_positions`` — no
+    live handler did it. Every step gated on ``status == OPEN`` then
+    silently no-opped.
+
+    Real case: ADA #2184 — entry rested then filled, TRADE_LIVE arrived
+    but left status=PENDING, TP1 hit but the breakeven move was skipped
+    ("trade not open"), so the SL was never moved to entry on HL.
+
+    Post-fix contract (D10 — confirm against the exchange):
+      - TRADE_LIVE / TP_HIT promote PENDING→OPEN when HL has the position
+      - no promotion (status stays) when HL shows no position
+      - on HL query failure, trust the explicit CP fill and promote
+    """
+
+    def _seed_pending_trade_with_orders(self, db, trade_id=5002):
+        """Create a PENDING trade (resting entry) with all 5 order rows
+        in SUBMITTED state — the state a not-yet-filled limit entry is in."""
+        from src.state.models import TradeRecord
+        trade = TradeRecord(
+            trade_id=trade_id, user_id="test_user", pair="ETH/USDT", coin="ETH",
+            side="LONG", risk_level="LOW", trade_type="SWING", size_hint="1-4%",
+            entry_price=3000.0, stop_loss=2900.0,
+            tp1=3050.0, tp2=3100.0, tp3=3200.0,
+            leverage=10, signal_leverage=10,
+            position_size_usd=300.0, position_size_coin=0.1,
+        )
+        db.create_trade(trade)  # defaults to PENDING; deliberately not promoted
+        oid = 9100
+        for ot, side, sz, px in [
+            (OrderType.ENTRY, "BUY", 0.1, 3000.0),
+            (OrderType.STOP_LOSS, "SELL", 0.1, 2900.0),
+            (OrderType.TP1, "SELL", 0.033, 3050.0),
+            (OrderType.TP2, "SELL", 0.033, 3100.0),
+            (OrderType.TP3, "SELL", 0.034, 3200.0),
+        ]:
+            row_id = db.record_order(trade_id, ot, "ETH", side, sz, px)
+            db.set_order_oid(row_id, oid)
+            oid += 1
+        return trade_id
+
+    def _eth_position(self):
+        return [{
+            "coin": "ETH", "size": 0.1, "entry_price": "3000.0",
+            "unrealized_pnl": "0", "leverage": "10", "liquidation_price": "2700.0",
+        }]
+
+    def _trade_live_msg(self, trade_id=5002):
+        return (
+            "LIVE ETH\n"
+            "**TRADE IS LIVE** ✅\n\n"
+            f"**PAIR:** ETH/USDT #{trade_id}"
+        )
+
+    def _tp_msg(self, n, trade_id=5002, pct=5.0):
+        return (
+            f"✅ **TP TARGET {n} HIT**\n\n"
+            f"**📝PAIR:** ETH/USDT #{trade_id}\n\n"
+            f"**💰PROFIT:** +{pct:.2f}% 📈\n"
+            f"**⏳PERIOD:** 10 Minutes"
+        )
+
+    def test_trade_live_promotes_pending_to_open(self, pipeline, db, client):
+        self._seed_pending_trade_with_orders(db)
+        client.get_open_positions.return_value = self._eth_position()
+
+        pipeline.process_message(self._trade_live_msg())
+
+        assert db.get_trade(5002).status == TradeStatus.OPEN
+
+    def test_trade_live_no_promotion_when_hl_has_no_position(self, pipeline, db, client):
+        """D10: don't trust CP over HL. If HL shows nothing, leave PENDING."""
+        self._seed_pending_trade_with_orders(db)
+        client.get_open_positions.return_value = []
+
+        pipeline.process_message(self._trade_live_msg())
+
+        assert db.get_trade(5002).status == TradeStatus.PENDING
+
+    def test_trade_live_promotes_on_hl_query_failure(self, pipeline, db, client):
+        """When HL can't be reached, trust the explicit CP fill confirmation
+        rather than leaving the trade stuck PENDING (the harmful outcome)."""
+        self._seed_pending_trade_with_orders(db)
+        client.get_open_positions.side_effect = ConnectionError("HL down")
+
+        pipeline.process_message(self._trade_live_msg())
+
+        assert db.get_trade(5002).status == TradeStatus.OPEN
+
+    def test_tp_hit_promotes_then_moves_breakeven(self, pipeline, db, client):
+        """The core Bug #20 regression: TP1 on a still-PENDING trade must
+        promote it to OPEN *and* fire the breakeven SL move (even_split
+        preset = BE after TP1). Pre-fix, the BE move was skipped."""
+        self._seed_pending_trade_with_orders(db)
+        client.get_open_positions.return_value = self._eth_position()
+        pipeline._pm.move_sl_to_breakeven = MagicMock(return_value=True)
+
+        pipeline.process_message(self._tp_msg(1))
+
+        assert db.get_trade(5002).status == TradeStatus.OPEN
+        pipeline._pm.move_sl_to_breakeven.assert_called_once_with(
+            5002, "ETH", 3000.0,
+        )
+
+    def test_promote_helper_noop_for_already_open(self, pipeline, db, client):
+        """Helper is idempotent: an already-OPEN trade isn't re-promoted
+        and never queries HL."""
+        self._seed_pending_trade_with_orders(db)
+        db.update_trade_status(5002, TradeStatus.OPEN)
+
+        assert pipeline._promote_to_open_if_filled(5002, "ETH") is False
+        client.get_open_positions.assert_not_called()
+
+
 class TestPipelineDedup:
     """Bug #14 — @PotionScannerBot delivers each CP signal as two variants
     (base + summary-prefixed). The forwarder correctly forwards both as
