@@ -175,6 +175,7 @@ __marimo__/
 
 # Config (active, not example)
 config/config.yaml
+config/test_driver.yaml
 
 # Database
 *.db
