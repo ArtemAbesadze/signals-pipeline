@@ -35,9 +35,10 @@ potion-perps-bot/
 │   ├── telethon_forwarder.py            # Phase 4.1 — user-account DM forwarder
 │   └── test_driver.py                   # Phase 4.3 — synthetic CP signal driver (test trade IDs 7_000_000+)
 ├── docs/
-│   ├── REWORK_BRIEF.md                  # full rework spec (D1–D9 + phases)
-│   ├── telegram-bot-plan.md             # legacy SaaS design — reversed in D4
-│   └── telegram-implementation-steps.md # legacy SaaS plan — reversed in D4
+│   ├── REWORK_BRIEF.md                  # master scope + phases + handoff (D1-D10)
+│   ├── HYPERLIQUID_INTEGRATION.md       # what we do on HL today (15 sections + bugs)
+│   ├── BLOFIN_INTEGRATION.md            # what we'll do on Blofin (Phase 6 spec + demo)
+│   └── archive/                         # pre-rework SaaS docs (reversed in D4)
 ├── src/
 │   ├── orchestrator.py                  # Multi-user fan-out
 │   ├── pipeline.py                      # Per-user signal processor; mainnet gate lives here
@@ -52,7 +53,7 @@ potion-perps-bot/
 │   ├── strategy/position_sizer.py       # sizing + pre-trade risk gate
 │   ├── telegram/                        # bot + handlers + notifications + monitors + confirmation_sweeper
 │   └── utils/                           # structlog setup, symbol mapper
-├── tests/                               # 718 tests across 34 files
+├── tests/                               # 761 tests across 35 files
 └── signals/
     ├── samples/                         # Real CP samples for parser tests (Discord format — still valid via forwarder)
     └── test/                            # E2E test fixtures
@@ -82,7 +83,7 @@ Key files when something breaks:
 5. **Per-user isolation.** Composite PK `(user_id, trade_id)` on `trades` and `orders`. All queries filter by `user_id`. One user's bug cannot touch another user's data.
 6. **DM-only for Telegram.** `dm_only_filter` middleware rejects group messages. Credential-collection messages are deleted on receipt.
 7. **No Discord edit handling.** CP sends all updates as new messages, never edits existing ones. `on_message` only — do not add `on_message_edit`.
-8. **Tests close behind code.** 718 tests today across `tests/`. New features land with tests, not after.
+8. **Tests close behind code.** 761 tests today across `tests/`. New features land with tests, not after.
 9. **Branch first during rework.** Active branch: `rework/scope-v1`. No commits to `main` until the rework is feature-complete.
 10. **README is current.** Phase 3.4 rewrote it for the private-tool scope. Keep it accurate as the codebase evolves — no longer frozen.
 11. **Test trade IDs live in `[7_000_000, 7_999_999]`.** Real CP IDs are 4 digits (max ~3000), so any 7-digit `trade_id` in `trades` / `orders` / `trade_events` is synthetic from `scripts/test_driver.py`. Bulk-delete with `python3 scripts/test_driver.py --cleanup`. Don't intermix this range with real CP trade IDs anywhere.
@@ -108,16 +109,27 @@ Key files when something breaks:
 
 ## Current phase
 
-**Phase 4.1 has shipped its first real CP signals and survived a
-six-bug debugging round.** Branch `rework/scope-v1`, HEAD is the
-CLAUDE.md commit immediately following `bc80fbd`. The first signal day
-(2026-05-25) put two real CP trades through the pipeline (NEAR #2126,
-IMX #2127), surfaced six bugs across the stack, and all six were fixed
-in session 3. Ready for soak round 2 with the fixes in place; once
-those are observed on a fresh CP signal day, Phase 4.1 officially
-closes.
+**Phase 4.3 has shipped (synthetic test driver + the 4.x bug fix
+batch). Phase 4.2 (real CP soak) is ongoing in the background.
+Phase 6 (Blofin migration) is the next major effort.**
 
-Shipped (Phase 1–3.5):
+Where we are today:
+
+- **Branch**: `rework/scope-v1`. HEAD on GitHub matches local.
+- **Tests**: 761/761 across 35 files.
+- **Live state**: both launchd agents running, HL clean (no positions,
+  no orders), no test data in the DB, Phase 4.2 soak ongoing — bot
+  receiving real CP signals end-to-end through the
+  Telethon → mirror channel → bot pipeline.
+- **Two source-of-truth docs** for the next major move:
+  - [`docs/HYPERLIQUID_INTEGRATION.md`](docs/HYPERLIQUID_INTEGRATION.md) —
+    full audit of every HL touchpoint (15 capability sections + every
+    bug we've shipped).
+  - [`docs/BLOFIN_INTEGRATION.md`](docs/BLOFIN_INTEGRATION.md) — mirror
+    structure for Blofin including the demo trading environment we'll
+    use instead of HL testnet during the migration.
+
+Shipped (Phase 1–4.3):
 
 | # | Commit | What |
 |---|---|---|
@@ -134,6 +146,24 @@ Shipped (Phase 1–3.5):
 | 3.3 | `b897d8d` | Log rotation polish — launchd files bounded, per-library level overrides for httpx/discord.gateway/etc., sustained-load test for `RotatingFileHandler` |
 | 3.4 | `747eaeb` | README rewrite — operator's manual for the private-tool scope; full inventory of what's on disk, DB inspection recipes, cleanup commands, VPS migration playbook |
 | 3.5 | `0ee481f` | Mainnet promotion gate — typed `MAINNET` confirmation in `/register` + `/promote_to_mainnet`, big-trade Telegram confirmation dialog ($100 / 5-min defaults), ConfirmationSweeper background task |
+| 4.3a | `05ea9c1` | Synthetic test driver — replaces real forwarder, generates CP-format signals for all 5 lifecycle scenarios; test trade IDs in [7_000_000, 7_999_999] |
+| 4.3b | `37a0454` | Test driver posts via Telethon (bots don't see their own channel posts) |
+| 4.3c | `e351b6f` | **Bug #18 fix** — `_round_price` ≤6 decimals AND ≤5 sig figs (kBONK/kSHIB/kPEPE class) |
+| 4.3d | `07d3ae1` | Realistic test driver percentages (price × leverage, not random) |
+| 4.3e | `0d49f8e` | `--cleanup` cancels orphan HL orders alongside DB delete |
+| 4.3f | `7807123` | **Bug #19 fix** — /positions slash command keyboard parity with menu path |
+
+Other Bug fixes across Phase 4.x:
+
+| Bug | Commit | What |
+|---|---|---|
+| #13 | `ca072ee` + `3160bf6` | Verify HL fill before claiming close succeeded; surface HL error verbatim |
+| #14 | `9db341c` | Pipeline-level dedup of @PotionScannerBot's two-variant delivery (60s window on (trade_id, msg_type)) |
+| #15 | `7ea9aa3` | DM text handlers no-op on channel_post (filters.ChatType.PRIVATE + defense-in-depth guards) |
+| #16 | `53d7210` | Escape Markdown specials in `action_taken` rendering — broke /menu when dedup audit rows contained `(trade_closed)` |
+| #17 | `37a0454` | Test driver Telethon posting (see 4.3b above) |
+| #18 | `e351b6f` | Decimal cap in _round_price (see 4.3c above) |
+| #19 | `7807123` | /positions slash command close buttons (see 4.3f above) |
 
 Phase 4.1 — wiring (sessions 2026-05-24 → 2026-05-25):
 
@@ -203,204 +233,96 @@ classify; ..."` on a real forwarded breakeven message in 2026-05-24
 session — `classify` returns `breakeven`, `parse_breakeven` returns the
 expected `Breakeven(pair='ETH/USDT', trade_id=2096, tp_secured=2)`.
 
-### Phase 4.1 — where we left off (end of 2026-05-29 session)
-
-**Status: six bugs from first signal day fixed; ready for soak round 2.**
-
-State of the world at session end:
-
-- ✅ All six bugs from the 2026-05-25 first signal day fixed (see commit table above).
-- ✅ 671 tests passing, including specific regression tests for the six bugs.
-- ✅ D10 codified: HL is source of truth for position state.
-- ✅ Artem registered on testnet, port $500 / withdraw, auto_execute=ON, master `0x274d87Ba5a72C322B8233a9dD30Aaba6500716DF`, api_wallet `0x9cbF9865652Aec91031cB339dc2de72a226dEdA7`.
-- ✅ Both launchd agents reinstalled at session end (this CLAUDE.md commit is followed by `deploy/launchd/install.sh all`).
-- ⏳ Next CP signal day will verify the six fixes hold end-to-end. The chain that needs to flow cleanly: forwarder serialised → channel post in receive order → bot parses → testnet floor sizes if needed → submit to HL → CP lifecycle events arrive → orders table reconciles to FILLED → close on TP3 or SL or cancel works without leaving a hanging position.
-
-**One outstanding artefact from session 1's soak**: NEAR #2126 position
-still open on HL testnet (entry filled silently on 2026-05-25, our DB
-says canceled, the cancel-handler bug let it slip through). HL's UI
-also can't close it under testnet oracle conditions (rejected with the
-same "Price too far from oracle" error the bot was hitting). Leave it
-until testnet resets or until the orderbook improves; no real-money
-risk, doesn't affect the Phase 4.2 testing path.
-
-### Picking up next session — concrete steps
-
-#### Step 0 — Sanity check
+### Picking up — first 10 minutes for a new session
 
 ```bash
-git branch --show-current                  # rework/scope-v1
-git log --oneline -8                       # HEAD = this CLAUDE.md commit, then 016d57e / d4d427e / 18d475e / 381bbc2 / e68122a / 60deedc / 1d1a196 / 82be37f
-git status                                 # clean
-python3 -m pytest tests/ 2>&1 | tail -2    # 650 passed
+cd ~/ClaudeProjects/potion-perps-bot
+
+# 1. Right branch
+git branch --show-current             # rework/scope-v1
+git log --oneline -5
+
+# 2. Tree clean
+git status
+
+# 3. Tests pass
+python3 -m pytest tests/ -q | tail -2  # expect 761 passed
+
+# 4. Both launchd agents up
+launchctl print gui/$(id -u)/local.potion-perps-bot 2>&1 | grep state
+launchctl print gui/$(id -u)/local.potion-perps-forwarder 2>&1 | grep state
+
+# 5. Any real CP trades fire while you were away?
+sqlite3 -header -column data/trades.db \
+  "SELECT trade_id, coin, side, status, close_reason, pnl_pct, created_at
+   FROM trades WHERE user_id='7441245554' AND trade_id < 80000
+   ORDER BY trade_id DESC LIMIT 5;"
+
+# 6. Any test trades in the DB?
+sqlite3 data/trades.db \
+  "SELECT COUNT(*) FROM trades WHERE trade_id BETWEEN 7000000 AND 7999999;"
+# 0 = clean. Non-zero = `python3 scripts/test_driver.py --cleanup`.
 ```
 
 If any of these are off, stop and investigate.
 
-#### Step 1 — Are both launchd agents still running?
+If forwarder is in a respawn loop, it probably can't open
+`data/.telethon_session.session` — re-run interactively
+(`python3 scripts/telethon_forwarder.py`) to refresh the session, then
+`deploy/launchd/install.sh forwarder`.
 
-```bash
-launchctl print gui/$(id -u)/local.potion-perps-bot 2>&1 | grep -E 'state|last exit|pid' | head -3
-launchctl print gui/$(id -u)/local.potion-perps-forwarder 2>&1 | grep -E 'state|last exit|pid' | head -3
-ps aux | grep -E 'main\.py|telethon_forwarder' | grep -v grep | wc -l   # expect 4 (2 procs + 2 caffeinate wrappers)
-```
+### Where to go next — two parallel tracks
 
-If `state=running` for both → good. If anything else, `deploy/launchd/install.sh all` re-bootstraps.
+#### Track A: Phase 4.2 soak (passive, observation)
 
-If the forwarder is in respawn-loop, it probably can't open `data/.telethon_session.session` — re-run interactively (`python3 scripts/telethon_forwarder.py`) to refresh the session, then reinstall.
+Watch real CP signals flow through and audit closed trades with the
+README's "Inspecting a single trade end-to-end" recipe. We have one
+confirmed real CP signal through the new pipeline (#2177 ETH breakeven
+on 2026-05-29). Phase 4.2 closes when we've seen a full day's worth
+of real signals process cleanly.
 
-#### Step 2 — Did any real CP signals fire while you were away?
+#### Track B: Phase 6 — Blofin migration (active, big effort)
 
-```bash
-# CP trade_ids are < 80000; synthetic /inject IDs are 80000-89999.
-sqlite3 -header -column data/trades.db \
-  "SELECT trade_id, coin, side, status, close_reason, pnl_pct, created_at
-   FROM trades WHERE user_id='7441245554' AND trade_id < 80000
-   ORDER BY trade_id DESC LIMIT 10;"
-```
+**This is the main upcoming work.** Why we're migrating:
 
-Any rows here = **Phase 4.1 is officially closed** (real CP → live trade chain validated). Audit one of them end-to-end per the README's recipe to be thorough, then move to step 4.
+- HL doesn't offer the leverage CP signals routinely call for.
+- CP's signal calibration assumes Blofin as the trading terminal.
+- Several HL gotchas (Bug #9 portfolio margin, Bug #12 oracle distance,
+  Bug #18 decimal cap) are solved by Blofin's API design (published
+  per-asset metadata, dedicated close-positions and tpsl-order endpoints).
 
-No rows = keep waiting. While you wait, optionally do step 3 (polish backlog).
+Two source-of-truth docs ready:
 
-#### Step 3 — Polish backlog (do anytime; not blocking)
+- [`docs/HYPERLIQUID_INTEGRATION.md`](docs/HYPERLIQUID_INTEGRATION.md)
+  — every HL touchpoint, 15 capability sections + every bug.
+- [`docs/BLOFIN_INTEGRATION.md`](docs/BLOFIN_INTEGRATION.md) — mirror
+  structure for Blofin; includes a dedicated Demo Trading section we
+  use instead of HL testnet.
 
-These came up during 4.1 but aren't worth interrupting flow for. Pick when you've got 15 minutes between signals:
+Implementation order (3–4 focused sessions estimated, see
+`REWORK_BRIEF.md` § Phase 6):
 
-- **Drop XRP from `_INJECT_COINS`** in `src/telegram/handlers/admin.py` (or filter against `client.get_asset_meta()` at startup) — `/inject` shouldn't pick coins that aren't on the user's network. Bit us once on 2026-05-25; harmless skip but ugly.
-- **Add an HL-side wallet-authorization check to `/register`.** `client.get_account_state()` (the current validation) is a read op that passes even if the API wallet isn't authorized for trading. A no-op write attempt (e.g. `cancel_all_orders` on a coin that has no orders) would surface "API Wallet does not exist" at registration time instead of first-trade time. Bit us on 2026-05-25.
-- **Update `.env`** to match the in-DB Artem credentials so single-user fallback isn't stale. Doesn't affect normal operation (multi-user mode reads from DB), but worth keeping in sync.
-- **Memory-only:** could add a test that exercises the `start_polling(allowed_updates=Update.ALL_TYPES)` choice. The existing channel adapter test passes even if updates aren't subscribed, because PTB handler dispatch is mocked. The bug at `381bbc2` would not have been caught by tests.
+1. **Apply for Blofin "API Transaction" permission** (Artem on the
+   Blofin website). Real-world blocker. No code runs without this.
+2. **Run the 6-step demo validation** from
+   `BLOFIN_INTEGRATION.md` § "Demo Trading — validation plan when we
+   start". Do not write client code until demo validates.
+3. `src/exchange/blofin.py` — hand-rolled HTTP client (~200 LOC, no SDK).
+4. `src/exchange/blofin_order_builder.py` — contract-value math,
+   tickSize-based rounding, native TP/SL.
+5. `src/exchange/blofin_position_manager.py` — uses
+   `POST /api/v1/trade/close-positions` (true market close — Bug #12
+   workaround obviated).
+6. `src/utils/symbol_mapper.py` gets a `potion_to_blofin` function.
+7. Schema migration: add `exchange` + `passphrase_enc` columns to
+   `user_credentials`. Existing HL users keep working.
+8. `/register` flow grows an exchange-choice step.
+9. Test driver — adapter-pattern dispatch + `--top-up-demo` helper.
+10. Demo soak → per-user migration. Keep HL adapter as fallback.
 
-#### Step 4 — Phase 4.2 proper (real signal soak day)
+**HL code stays in the repo permanently** as the fallback adapter.
 
-Once Step 2 has even one real CP trade, you're in 4.2. The mechanics are identical to what `/inject` produced — same pipeline, same auto_execute, same manual-close flow. Goal of 4.2 = **observe** rather than build.
-
-#### Step 5 — Phase 4.3 synthetic test driver (`scripts/test_driver.py`)
-
-For end-to-end testing without waiting on real CP, Phase 4.3 added a
-third process that replaces the real forwarder during test runs. It
-generates synthetic CP-format messages and walks each through its full
-lifecycle (all five scenarios — `all_tp_hit`, `stop_hit`,
-`tp1_then_stop`, `cancel_pending`, `cancel_after_fill`). Posts to the
-same mirror channel via `TELEGRAM_BOT_TOKEN`, so everything downstream
-runs unmodified.
-
-Test trade IDs in `[7_000_000, 7_999_999]` — 7 digits vs real CP's
-4 digits make them unmistakable in the DB. Bulk inspect or delete:
-
-```bash
-python3 scripts/test_driver.py --dry-run         # print plan, post nothing
-python3 scripts/test_driver.py                   # live run, posts to mirror channel
-python3 scripts/test_driver.py --cleanup         # delete WHERE trade_id BETWEEN 7M and 7.999M
-```
-
-Config: `config/test_driver.example.yaml`. Tunables: trade_count,
-duration_minutes, scenario list (default = all five uniformly), per-event
-timing windows, coin pool exclusions, side/risk distributions.
-
-Critical behaviour to remember: the driver **stops the real
-forwarder on startup** (via `launchctl bootout`) and does **NOT
-restart it on exit**. After a test run, manually
-`launchctl kickstart -k gui/$(id -u)/local.potion-perps-forwarder`
-to resume normal operation. This is intentional — overlapping real
-CP signals with synthetic ones during a test would confuse the
-audit trail.
-
-What the driver does NOT test: real market behaviour (orders
-filling, slippage), real exchange rejections beyond submit time, the
-Telethon forwarder itself (it's stopped). Closes happen because we
-*send* the close-event message, not because the market moved.
-
-Soak target: at least one full CP signal day. Specifically want to see:
-- Multiple `signal_alert` opens that fire as auto-execute on Artem
-- At least one `tp_hit` event (CP hits a TP)
-- At least one `breakeven` event (CP moves SL to BE after TP1)
-- At least one closure — either `all_tp_hit` (profit), `stop_hit` (loss), or `cancel`
-
-Audit every closed trade with the README's "Inspecting a single trade end-to-end" recipe. Look for:
-- `decision_snapshot` reflects current Config (preset, size_pct_applied, port at open)
-- Chronological `trade_events` cleanly tells the story
-- `orders` table shows the expected 5 orders (entry + SL + TP1/2/3) with the right statuses
-
-#### Fixed Phase 4.3 production bugs
-
-##### Bug #18 — Price precision exceeds HL's max-decimals cap on tight-tick coins (✅ fixed `e351b6f`)
-
-Surfaced 2026-06-01 during the first Telethon-fixed test driver run on
-kBONK (synthetic trade #7000001). HL rejected SL + TP2 + TP3 with
-"Order has invalid price"; entry + TP1 were accepted by coincidence.
-
-Root cause: `src/exchange/order_builder.py::_round_price` rounds to 5
-significant figures but does **not** cap decimal places. HL perps
-enforce TWO constraints on order prices simultaneously: at most 5 sig
-figs AND at most 6 decimal places. For coins priced below ~$0.01, 5
-sig figs naturally produces 7+ decimals → exceeds HL's decimal cap →
-"Order has invalid price".
-
-Example from the test (kBONK SHORT, entry 0.005393):
-
-| Order | Price | Decimals | Sig figs | HL verdict |
-|---|---|---|---|---|
-| entry | 0.005393 | 6 | 4 | OK |
-| SL | 0.0055009 | 7 | 5 | REJECTED |
-| TP1 | 0.005366 | 6 | 4 | OK (lucky) |
-| TP2 | 0.0053391 | 7 | 5 | REJECTED |
-| TP3 | 0.0052851 | 7 | 5 | REJECTED |
-
-Affected coins on the bot's existing pool: `kBONK`, `kSHIB`, `kPEPE`,
-`kDOGS`, `kLUNC`, `kNEIRO`, plus any other base coin priced below
-~$0.01. Real CP signals on these would silently lose orders the same
-way — TP1 might land OK but SL almost certainly won't.
-
-**D10 implication — the dangerous part.** A rejected SL means the
-position is left **uncovered** on HL. The pipeline marks the trade as
-opened locally (entry fills) but only entry + TP1 actually exist on
-the exchange. When CP later sends `stop_hit`, the bot reconciles SL
-as FILLED in the DB even though no SL was ever submitted — the DB
-lies, the position runs. Same risk class as NEAR #2126.
-
-**Empirically confirmed on 2026-06-01 during test driver run #2**:
-test #7000001 (kBONK SHORT 3708 @ 0.005393) followed the
-``stop_hit`` scenario. After the synthetic stop_hit event:
-- DB: ``status=closed, close_reason=stop_hit``
-- HL: position still open, **no SL anywhere**, unrealized
-  -$0.06 and drifting. Only the reduceOnly TP1 buy remained.
-Direct query: ``client.get_open_positions()`` returned the kBONK
-position; ``client.get_open_orders()`` returned only the TP1.
-
-**Fix landed at `e351b6f`** (2026-06-01):
-
-1. `_round_price` in both `src/exchange/order_builder.py:38` and
-   `src/exchange/position_manager.py:40` now enforces both constraints
-   simultaneously — sig-figs round first, then `round(..., max_decimals=6)`.
-2. New `TestPricePrecisionForTightTickCoins` class in
-   `tests/test_e2e_pipeline.py` — 23 parametrized cases covering low-priced
-   coins, sig-figs preservation, high-priced no-op, and a sentinel
-   verifying the two duplicated copies agree on every test price.
-3. Confirmed in production: after the fix, /positions → Close kBONK
-   succeeded (where it previously got "Order has invalid price"). All
-   subsequent test runs on DOGE/ADA passed Bug #18 cleanly.
-
-**Audit query for historical victims** (run if you want to find any real
-CP trades on low-priced coins that may have been left uncovered before
-the fix):
-
-```sql
-SELECT t.trade_id, t.coin, t.status,
-       SUM(CASE WHEN o.order_type='stop_loss' AND o.status='pending' THEN 1 ELSE 0 END) AS sl_unsubmitted
-FROM trades t LEFT JOIN orders o
-  ON t.trade_id = o.trade_id AND t.user_id = o.user_id
-WHERE t.coin LIKE 'k%' OR t.coin IN ('PEPE','SHIB','BONK','DOGS','LUNC','NEIRO')
-GROUP BY t.trade_id
-HAVING sl_unsubmitted > 0;
-```
-
-**Open follow-up**: long-term, consolidate the two `_round_price` copies
-into a shared utility (e.g. `src/utils/hl_price.py`). For now the
-sentinel test catches drift; refactor when there's a third caller.
-
-#### Operational notes — what we learned
+### Operational notes — what we learned
 
 - **swaag (`7375268438`) is a real user on a SEPARATE testnet account** (master `0x8fd9888fB9ad93A968aB9C2e4eA12036C286BC98`). Not just a test fixture. She's active, has credentials, no port set. Every CP signal flowing through the pipeline currently produces a `skipped: port not configured` event + Telegram DM to her. Either ask her to set a port, or temporarily deactivate via admin API if she'd be annoyed.
 - **Artem's `auto_execute=ON` is a deliberate choice for 4.2 testnet testing.** CLAUDE.md historically recommended OFF for first signal day; user overrode. On testnet this is fine (no real-money risk); on mainnet the gate at $100 would catch big trades anyway. **Don't quietly toggle back to OFF without asking.**
@@ -430,7 +352,15 @@ Phase 5 = parking lot (weekly performance report, VPS, CI/CD, backtest tooling).
 
 ## Tests
 
-**718/718 passing** (up from 671 at end of Phase 4.1's session-3 bug-fix run; +34 tests in Phase 4.3 for `tests/test_test_driver.py` — template fidelity round-trips through classify+parse for every event type, price level math, schedule generation determinism, scenario assignment, coin pool filtering, trade-ID allocation, and cleanup safety; +13 additional tests across Bug #13 (close-result verification), Bug #14 (pipeline dedup), Bug #15 (channel-post text-handler guards) that landed in the same window).
+**761/761 passing** across 35 files. Recent additions worth knowing about:
+
+- `tests/test_test_driver.py` (41 tests) — scenarios, template fidelity (each event round-trips through classify+parse), scheduling determinism, cleanup, realistic-percentage math, orphan-order helper.
+- `tests/test_positions_keyboard.py` (9 tests, Bug #19) — locks the slash-command ↔ menu-path keyboard parity contract via static import check + behavioural assertions.
+- `tests/test_text_handler_guards.py` (4 tests, Bug #15) — DM text handlers no-op cleanly on channel_post.
+- `TestPricePrecisionForTightTickCoins` in `test_e2e_pipeline.py` (23 tests, Bug #18) — both `_round_price` copies agree, sig-figs + decimal cap enforced for every low-priced coin in the pool.
+- `TestPipelineDedup` (5 tests, Bug #14) — same `(trade_id, msg_type)` within 60s gets suppressed; different keys pass; window expiry; cache pruning.
+- `TestClosePositionResponseHandling` (4 tests, Bug #13) — close honestly reports filled / error / no-fill IOC.
+- Markdown-escape regression test in `test_formatters.py` (Bug #16).
 
 ---
 

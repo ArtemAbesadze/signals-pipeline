@@ -1,254 +1,519 @@
 # Rework Brief
 
-The verbatim spec for the rework session that started 2026-05-19, captured here so future sessions don't depend on transient prompt context.
+The master spec for the rework branch `rework/scope-v1` (cut from `main` at
+commit `170abbd` on 2026-05-19). This document is the **source of truth** for
+project scope, design decisions, phase status, and handoff between sessions
+or collaborators.
 
-Branch: `rework/scope-v1` (off `main` at commit `170abbd`).
+**Read this first.** Then [`../CLAUDE.md`](../CLAUDE.md) for codebase
+orientation, [`HYPERLIQUID_INTEGRATION.md`](HYPERLIQUID_INTEGRATION.md) for the
+exchange we use today, and [`BLOFIN_INTEGRATION.md`](BLOFIN_INTEGRATION.md)
+for the exchange we're migrating to in Phase 6.
 
 ---
 
 ## Project reframing
 
-**What this project was:** a marketable SaaS for automating CryptoPrinter (CP) Discord trade calls onto Hyperliquid perps. Built with invite codes, subscription expiry, admin broadcast, billing-shaped UX — all designed for selling access to strangers.
+**What this project was**: a marketable SaaS for automating CryptoPrinter (CP)
+trade calls on Hyperliquid perps. Built with invite codes, subscription
+expiry, admin broadcast, billing-shaped UX — designed for selling access.
 
-**What it now is:** a private automation tool for Artem and 2 friends. Three users total, all known to each other, no paying customers, no subscriptions. Multi-user support stays because we each have our own Hyperliquid account, but the customer-facing SaaS layer is being ripped out.
+**What it now is**: a private automation tool for Artem and 2 friends. Three
+users total, all known to each other, no paying customers, no subscriptions.
+Multi-user support stays because each user has their own exchange account,
+but the customer-facing SaaS layer is gone (ripped in commit `c366c55` —
+Phase 2.1).
 
-**Core purpose:** faithfully automate CryptoPrinter's Discord-bot calls (entry + full lifecycle: TP hits, breakeven moves, stop hits, cancels, manual SL/TP amendments) onto each user's Hyperliquid account, with monitoring and control via Telegram.
+**Core purpose**: faithfully automate CryptoPrinter's Discord bot calls
+(entry + full lifecycle: TP hits, breakeven moves, stop hits, cancels,
+manual SL/TP amendments) onto each user's exchange account, with monitoring
+and control via Telegram.
 
-**Underlying design goal — the spine of every decision:**
+**Underlying design goal — the spine of every decision**:
 
-> CryptoPrinter calls should be the only possible source of fallacy. The bot itself must be reliable, deterministic, and auditable. If a trade goes wrong, I should be able to answer in 30 seconds:
+> CryptoPrinter calls should be the only possible source of fallacy.
+> The bot itself must be reliable, deterministic, and auditable. If a trade
+> goes wrong, I should be able to answer in 30 seconds:
 >
 > - What was the original signal text?
 > - What did our parser extract?
 > - What strategy + port + risk-level decided the size?
 > - What orders did we place?
 > - What lifecycle events happened?
-> - Was the loss caused by CP being wrong, or by our bot doing something the signal didn't say?
+> - Was the loss caused by CP being wrong, or by our bot doing something
+>   the signal didn't say?
 
 ---
 
-## Current state of the codebase (as of 2026-05-19, commit `170abbd`)
+## Current state of the codebase (as of HEAD on `rework/scope-v1`)
 
-- ~15,100 LOC, ~370 tests across 24 test files.
-- Multi-user orchestrator (`src/orchestrator.py`) — N user pipelines, isolated, hot-add/remove, kill switch.
-- Encrypted credential storage (`src/crypto.py`) — Fernet symmetric, key from `ENCRYPTION_KEY` env or `data/.encryption_key` file.
-- Admin REST API (`src/api/admin.py`) — aiohttp, X-API-Key, full user CRUD + kill/resume.
-- Real Discord adapter (`src/input/discord_adapter.py`) — `discord.py`, filters by channel + source-bot display name.
-- Full SaaS-flavored Telegram bot (`src/telegram/`, ~3000 LOC) — invite codes, registration, per-user config, trade approval flow, ~20 user commands + ~10 admin commands, PnL monitor, expiry checker.
-- 6 strategy presets, sizing per signal risk level (`size_by_risk`), full lifecycle parsing for 10 message types.
-- Health server on :8080, structured JSON logging, graceful SIGTERM/SIGINT, Docker + docker-compose.
+| Field | Value |
+|---|---|
+| Branch | `rework/scope-v1` (default branch on GitHub) |
+| Test count | **761/761 passing** across 35 test files |
+| LOC | ~19,000 across `src/` + `scripts/` + `tests/` |
+| Users | Artem (Telegram `7441245554`, testnet, $500 port, auto_execute=ON) + swaag (Telegram `7375268438`, testnet, no port set) — third slot empty |
+| Exchange | Hyperliquid testnet (everyone). Mainnet promotion is gated by Phase 3.5 (typed `MAINNET` confirm + per-trade approval dialog). |
+| Signal source | CP Discord channel → Railway's `@PotionScannerBot` DMs → Artem's TG account → Telethon forwarder → private "Potion Signals Mirror" channel → bot's `TelegramChannelAdapter` |
+| Deployment | macOS `launchd` on Artem's laptop, 24/7. Two agents (bot + forwarder), both wrapped in `caffeinate -i`. |
+| Database | SQLite at `data/trades.db`, WAL mode. 6 tables: `users`, `user_credentials`, `user_config`, `telegram_admins`, `trades`, `orders`, `trade_events`. |
+| Encryption | Fernet symmetric, master key at `data/.encryption_key`. All HL credentials encrypted at rest. |
+
+**Live system state right now**: both launchd agents running, HL clean (0
+positions / 0 orders), no test data polluting the DB (last `--cleanup` ran
+2026-06-04), bot has received and processed real CP signals during the
+ongoing Phase 4.2 soak.
 
 ---
 
-## Locked design decisions
+## Locked design decisions (D1–D10)
 
-Treat these as constraints, not suggestions.
+Treat these as constraints, not suggestions. Order is historical; relevance
+is unchanged.
 
 ### D1. Port/wallet separation
 
-Position sizing is currently % of total Hyperliquid wallet balance. Change to % of "port" — a user-configured subset of the wallet.
+Position sizing uses a user-configured "port" — a subset of the exchange
+wallet — not the full wallet balance.
 
-- New columns:
-  - `user_config.port_usd` (REAL)
-  - `user_config.port_mode` (TEXT, one of `'withdraw' | 'compound' | 'watermark'`)
-- Position sizing uses `port_usd`, not wallet.
-- Three modes (user-selectable in Telegram):
+- New columns: `user_config.port_usd` (REAL), `user_config.port_mode` (TEXT)
+- Three port modes (user picks in Telegram):
   - **`withdraw`** — profits stay in wallet; port stays at the configured value.
   - **`compound`** — port = port + cumulative P&L (both directions).
-  - **`watermark`** — profits push the port up; the new value becomes the new floor. Losses can pull port down but never below the highest floor ever reached. Floor = best historical port value.
+  - **`watermark`** — profits push the port up and the new value becomes
+    the new floor; losses can pull port down but never below the highest
+    floor ever reached.
 - Guardrails:
-  - If `port > wallet`: halt new trades immediately and notify the user.
+  - If `port > wallet`: halt new trades immediately, notify the user.
   - If `port > wallet × 0.95`: warn but continue.
-  - Open positions are **never auto-closed** by this rule. The bot does not impose its own exit logic.
+  - **Open positions are never auto-closed.** The bot does not impose its
+    own exit logic — the active preset is the only authority.
 
-### D2. Strategy presets rebuilt to mirror CryptoPrinter's report
+### D2. Strategy presets mirror CP's report rows
 
-Drop the current 6 presets (`runner`, `conservative`, `tp2_exit`, `tp3_hold`, `breakeven_filter`, `small_runner`). Replace with:
+Seven presets, one per row of CP's weekly performance report (so our weekly
+report lines up directly with CP's):
 
-| Name          | tp_split   | SL→BE       | CP report label         |
-|---------------|------------|-------------|-------------------------|
-| `tp1_only`    | 100/0/0    | never       | TP1 Only (Safe Way)     |
-| `tp2_only`    | 0/100/0    | never       | TP2 Only                |
-| `tp3_only`    | 0/0/100    | never       | TP3 Only                |
-| `tp2_be`      | 0/100/0    | after TP1   | TP2 + BE                |
-| `tp3_be`      | 0/0/100    | after TP1   | TP3 + BE                |
-| `hybrid`      | 10/70/20   | after TP1   | Hybrid 10/70/20         |
-| `even_split`  | 33/33/34   | after TP1   | (our addition — default)|
+| Name | tp_split | SL → BE | CP report row |
+|---|---|---|---|
+| `tp1_only` | 100/0/0 | never | TP1 Only (Safe Way) |
+| `tp2_only` | 0/100/0 | never | TP2 Only |
+| `tp3_only` | 0/0/100 | never | TP3 Only |
+| `tp2_be` | 0/100/0 | after TP1 | TP2 + BE |
+| `tp3_be` | 0/0/100 | after TP1 | TP3 + BE |
+| `hybrid` | 10/70/20 | after TP1 | Hybrid 10/70/20 |
+| **`even_split`** | 33/33/34 | after TP1 | (default for new users) |
 
-**Default preset for new users: `even_split`.**
+### D3. Audit trail (everything reconstructable)
 
-Our weekly per-user performance report should have rows that line up with CP's own report rows for direct comparison.
+- `trades.raw_signal_text` — verbatim message that opened the trade.
+- `trades.decision_snapshot` — JSON captured at open with preset, sizing,
+  port state, risk gate verdict, leverage caps applied.
+- `trade_events` table — append-only log of every lifecycle event with
+  `raw_text` + `action_taken`. Dedup-suppressed messages also land here so
+  post-mortems can find what was caught.
 
-### D3. Audit trail (minimal-but-sophisticated)
+### D4. No SaaS layer in Telegram
 
-Add to `trades`:
-- `raw_signal_text TEXT` — the verbatim Discord message that opened the trade.
-- `decision_snapshot TEXT` — JSON, captured at trade open:
-  ```json
-  {
-    "preset": "even_split",
-    "size_pct_applied": 2.0,
-    "port_usd_at_open": 1000.0,
-    "risk_level": "MEDIUM",
-    "exposure_used_pct": 14.5,
-    "leverage_applied": 14,
-    "why": "size_by_risk[MEDIUM]=2.0; clamped to max_position_size=500"
-  }
-  ```
-
-New table `trade_events`:
-```sql
-CREATE TABLE trade_events (
-    id INTEGER PRIMARY KEY,
-    trade_id INTEGER,
-    user_id TEXT,
-    occurred_at TEXT,
-    event_type TEXT,    -- signal_alert | tp_hit | breakeven | stop_hit
-                        -- | sl_move | trade_closed | cancel | error
-    raw_text TEXT,      -- verbatim message that triggered this
-    action_taken TEXT,  -- "moved SL to 1985" / "closed 33% at TP1" / etc.
-    FOREIGN KEY (trade_id) REFERENCES trades(trade_id)
-);
-```
-
-Use for weekly reports + post-mortem debugging.
-
-### D4. No more SaaS layer in Telegram
-
-Telegram bot is being redesigned. Most customer-facing infrastructure goes.
-
-**Remove or simplify drastically:**
-- Subscription expiry / `access_expires_at` logic.
-- Expiry warnings (3d, 1d notifications).
-- `ExpiryChecker` background task.
-- `/generate_code`, `/generate_codes`, `/list_codes`, `/revoke_code`.
-- `/extend`, `/revoke` (subscription lifecycle).
-- `/broadcast` (3 users — pointless).
-- Most of `handlers/admin.py`.
-- Probably the entire `invite_codes` table (or simplify to one shared access code, no expiry).
-
-**Keep:**
-- Registration with creds-in-DM (self-deleting messages).
-- Encrypted credential storage (Fernet) — never downgrade.
-- Trade notifications.
-- Trade view, positions view, history view.
-- Config view + strategy selection.
-- DM-only enforcement.
-- `/kill` and `/resume` per user.
-- Per-user isolation.
-
-**Add (after menu redesign):**
-- Port management UI (set port amount, select mode, view current state, view port vs wallet).
-- Audit/explain view for a given trade.
-- Weekly performance report trigger or auto-send.
-
-The menu structure will be redesigned **interactively** during Phase 2. Do not propose final menu shapes ahead of that.
+Customer-facing SaaS infrastructure is gone. **Kept**: registration,
+encrypted creds, trade notifications, trade views, config, DM-only,
+per-user `/kill` + `/resume`. **Removed**: invite codes, subscription
+expiry, broadcast, `/extend`, `/revoke`, `ExpiryChecker`, most of admin
+sprawl. Menu structure was redesigned interactively in Phase 2.2.
 
 ### D5. No Discord message-edit handling
 
-CryptoPrinter sends all updates as new messages — never edits. Do not add `on_message_edit` handling. Current `on_message`-only behavior is correct.
+CP sends all updates as new messages — never edits. Do not add
+`on_message_edit` handling.
 
 ### D6. Defensive parsing
 
-The bot must never crash on malformed CP messages. Every parse error logs to `trade_events` and skips the message safely. The pipeline keeps running.
+The bot must never crash on malformed CP messages. Parse errors log to
+`trade_events.event_type='error'` and skip safely. The pipeline keeps
+running. The defensive boundary is `pipeline.process_message`.
 
 ### D7. Testnet / mainnet onboarding
 
-Current flow stays — user picks network at registration. No forced testnet period.
+User picks network at registration. No forced testnet period. Mainnet
+requires typed `MAINNET` confirmation (Phase 3.5).
 
-### D8. Deployment target
+### D8. Local laptop deployment
 
-Designed to run locally on Artem's laptop, 24/7. Server migration comes later. Keep the design portable (env vars, file-based config) but don't optimize for k8s/cloud infra.
+Designed to run on Artem's laptop, 24/7. Server migration deferred to
+Phase 5.2. Design stays portable (env vars, file config) but doesn't
+optimize for cloud infra.
 
-### D9. Backups — in scope
+### D9. Daily backups
 
-Lightweight daily SQLite backup (`sqlite3 .backup`, dump to a local `backups/` directory with date-stamped filenames, prune older than 30 days). Schedule via a background asyncio task in `main.py` or cron.
+`sqlite3.Connection.backup()` (stdlib, server-portable) to `backups/`
+at 06:00 UTC, mtime-based 30-day prune.
 
-### D10. Hyperliquid is the source of truth for position state (Phase 4.1)
+### D10. Exchange is the source of truth for position state
 
-Before decisions that act on a trade (cancel, close, modify SL), query HL directly rather than trusting the cached local `trade.status`. CP's lifecycle messages (`TRADE_LIVE`, `TP_HIT`, `STOP_HIT`, `ALL_TP_HIT`) remain the **audit signal** and drive the orders-table reconcile (Bug #3 fix from the 2026-05-25 soak) — but they can be missed, delayed, or sent in a format our parser misses. HL is the only place that knows what's actually on the exchange.
+**Forced by**: 2026-05-25 NEAR/#2126 — entry filled silently on HL,
+no `TRADE_LIVE` from CP, cancel handler trusted local `status=PENDING`
+and left the position uncovered.
 
-**Forced by:** 2026-05-25 NEAR/#2126. Entry resting order filled silently on HL; CP never sent a `TRADE_LIVE` event; `trade.status` stayed `PENDING`. When the cancel arrived, the handler took the `cancel_trade` branch (orders only, no market close) based on the stale status. Position remained open on HL, our DB said canceled — discovered when the user checked HL directly.
+Before decisions that act on a trade (cancel, close, modify SL), query
+the exchange directly rather than the cached `trade.status`. CP lifecycle
+messages drive the audit trail and reconcile the orders table, but they
+can be missed/mangled/delayed. **HL is authoritative for what's actually
+on the books.** Applied today in `_handle_canceled`; other call sites
+get migrated as we find them.
 
-**Application:** `_handle_canceled` calls `get_open_positions()` and dispatches to `close_position` (cancel orders + market-close) when HL has a position, `cancel_trade` (orders only) when it doesn't. Other handlers that read `trade.status` to make exchange-affecting decisions will be migrated as we find them.
+Worth noting for Phase 6 (Blofin migration): D10 applies to any exchange.
+The Blofin equivalent will use Blofin's `GET /api/v1/trade/positions`.
 
 ---
 
-## Phase plan
+## Phase status
 
-Status legend: ✅ shipped on `rework/scope-v1` · ⏳ next · ◻ pending
+Status legend: ✅ shipped · 🟡 in progress · ◻ later
 
-### Phase 1 — Development & validation (no live trades; sample-driven)
-
-| # | Status | Commit | Task |
-|---|---|---|---|
-| 1.1 | ✅ | `df5fb90` | **Shadow mode** — capture-only Discord adapter mode that listens to a channel and logs every message verbatim, without executing. The form factor; live wiring is Phase 4.1. |
-| 1.2 | ✅ | `8717f8b` + `e96219d` | **Sample corpus expansion** — adopted new CP format (mentions, prev URLs, footer, signed profits, POSITION type), added ORDER_PENDING + TRADE_LIVE message types, +50 signal samples, classifier + parser hardened. |
-| 1.3 | ✅ | `b210903` | **Port/wallet architecture (D1)** — schema, sizing, three modes (withdraw/compound/watermark), guardrails. |
-| 1.4 | ✅ | `055029c` | **Strategy preset overhaul (D2)** — 7 new presets matching CP's report rows, `even_split` default, idempotent migration from old names. |
-| 1.5 | ✅ | `1158a4c` | **Audit-log plumbing (D3)** — `trades.raw_signal_text` + `trades.decision_snapshot` + new `trade_events` table; every handler writes events. |
-| 1.6 | ✅ | `7bbc3a4` | **Defensive parsing (D6)** — typed parser errors, classifier never crashes, action_taken truncation, submission-failure event. |
-
-### Phase 2 — Telegram rework (interactive design)
+### Phase 1 — Development & validation (no live trades)
 
 | # | Status | Commit | Task |
 |---|---|---|---|
-| 2.1 | ✅ | `c366c55` | Rip SaaS layer (D4) — invite codes / expiry / broadcast / users / extend / revoke / renew flow removed. −1737 LOC. |
-| 2.2 | ✅ | `80320b3` + `d772548` | Interactive menu redesign — condensed main dashboard, 4 drill-downs (Calls / Trading / Port / Config), Pause toggle on main. Port screen (state + history). Per-trade Audit Trail. |
-| 2.3 | (folded into 2.2) | | Port management UI. |
-| 2.4 | (folded into 2.2) | | Audit/explain views. |
-| 2.5 | ◻ | | Update notifications to surface port-vs-wallet status and mode-relevant info. (Deferred — may roll into Phase 4 polish.) |
+| 1.1 | ✅ | `df5fb90` | Shadow-mode capture (no live trades) |
+| 1.2 | ✅ | `8717f8b` + `e96219d` | Sample corpus expansion, CP format adoption, ORDER_PENDING + TRADE_LIVE |
+| 1.3 | ✅ | `b210903` | Port/wallet architecture (D1) |
+| 1.4 | ✅ | `055029c` | 7 strategy presets (D2), even_split default |
+| 1.5 | ✅ | `1158a4c` | Audit-log plumbing (D3) |
+| 1.6 | ✅ | `7bbc3a4` | Defensive parsing (D6) |
+
+### Phase 2 — Telegram rework
+
+| # | Status | Commit | Task |
+|---|---|---|---|
+| 2.1 | ✅ | `c366c55` | SaaS layer ripped (D4) — −1737 LOC |
+| 2.2 | ✅ | `80320b3` + `d772548` | Condensed dashboard, Port screen, per-trade Audit Trail |
 
 ### Phase 3 — Pre-launch
 
-| # | Status | Task |
-|---|---|---|
-| 3.1 | ✅ | `a3770a8` | **Backups (D9)** — daily SQLite backup via `sqlite3.Connection.backup()` (stdlib, server-portable) to `backups/`, mtime-based 30-day prune, 06:00 UTC default, no catch-up on miss, asyncio task wired into `main.py` with shared `shutdown_event`. |
-| 3.2 | ⏳ | | **Local deployment setup** — `launchd` plist for macOS so the bot runs 24/7. SIGTERM/SIGINT already wired. Must address laptop-sleep (CP signals during sleep are lost — `caffeinate -i` in `ExecStart` or "prevent sleep when plugged in"). |
-| 3.3 | ◻ | **Log rotation polish** — confirm the existing rotating-file handler (10 MB × 5) caps correctly under sustained load. Tune if needed. |
-| 3.4 | ◻ | **README rewrite** — the README is frozen during the rework. This is the slot for the full rewrite. |
-| 3.5 | ◻ | **Mainnet promotion gate** — conservative defaults, big-trade confirmation dialog in Telegram, etc. |
+| # | Status | Commit | Task |
+|---|---|---|---|
+| 3.1 | ✅ | `a3770a8` | Daily SQLite backups (D9) |
+| 3.2 | ✅ | `59ccc25` | launchd agent for 24/7 local deployment |
+| 3.3 | ✅ | `b897d8d` | Log rotation polish |
+| 3.4 | ✅ | `747eaeb` | README rewrite |
+| 3.5 | ✅ | `0ee481f` | Mainnet promotion gate — typed `MAINNET` confirm + big-trade approval dialog |
 
 ### Phase 4 — GO LIVE
 
-| # | Status | Task |
+#### Phase 4.1 — Real signal wiring (✅ shipped)
+
+| # | Commit | What |
 |---|---|---|
-| 4.1 | ◻ | Wire the real Discord adapter to CP's channel (channel ID + bot or selfbot auth). |
-| 4.2 | ◻ | Artem onboards as the first user on testnet, runs ~5 live signals end-to-end, validates audit log + Telegram UI. |
-| 4.3 | ◻ | Add the 2 friends as users. |
-| 4.4 | ◻ | Move to mainnet (per-user choice). |
+| 4.1a | `82be37f` | Markdown escape in preset/display names; orchestrator startup tracebacks |
+| 4.1b | `1d1a196` | Pin `hyperliquid-python-sdk >= 0.23.0` |
+| 4.1c | `60deedc` | `TelegramChannelAdapter` — listens for `channel_post`, dm_only_filter passthrough |
+| 4.1d | `e68122a` | Telethon forwarder + second launchd agent |
+| 4.1e | `381bbc2` | `start_polling(allowed_updates=Update.ALL_TYPES)` — channel posts excluded by default |
+| 4.1f | `18d475e` | Hot-reload pipeline Config after Telegram setting edits |
+| 4.1g | `d4d427e` + `016d57e` | Testnet position floor — bump sub-min sizes to $15 instead of skipping |
+
+Then the **first-signal-day post-mortem** (session 2026-05-29) which
+surfaced and fixed six bugs:
+
+| Bug | Commit | Summary |
+|---|---|---|
+| #1 forwarder race | `b45c068` | `asyncio.Lock` around send; preserves receive order |
+| #3 + #8 orders table stale | `12354c1` | Pipeline lifecycle handlers reconcile orders table |
+| #9 portfolio margin balance | `6c0e661` | Show spot USDC + perp account value separately |
+| #4 cancel-parser noise | `66b9f84` | Strip @PotionScannerBot wrapper before extracting reason |
+| #11 D10 case | `3ca1402` | Cancel handler queries HL position before deciding close vs cancel-orders |
+| #12 close-spread oracle | `bc80fbd` | 10% → 3% IOC close spread |
+
+#### Phase 4.2 — Real CP signal soak (🟡 ongoing)
+
+**Goal**: observe real CP signals flowing end-to-end. Mechanics identical
+to what `/inject` produced; the goal is *observation*, not building.
+
+Want to see, across one full CP signal day:
+- Multiple `signal_alert` opens that fire as auto-execute
+- At least one `tp_hit` event with the auto-BE-after-TP1 move
+- At least one closure (`all_tp_hit`, `stop_hit`, or `cancel`)
+
+All audit-trail integrity per the README's "Inspecting a single trade
+end-to-end" recipe.
+
+First confirmed real CP trade through the new pipeline: **#2177 ETH
+breakeven on 2026-05-29** (the dedup gate caught the @PotionScannerBot
+duplicate cleanly). Phase 4.1 considered closed at that moment.
+
+#### Phase 4.3 — Synthetic test driver (✅ shipped)
+
+Built so we can validate the full pipeline without waiting on real CP.
+
+| # | Commit | What |
+|---|---|---|
+| 4.3a | `05ea9c1` | `scripts/test_driver.py` — replaces real forwarder, posts CP-format synthetic signals to mirror channel, runs all 5 lifecycle scenarios concurrently |
+| 4.3b | `37a0454` | Test driver posts via Telethon (Artem's user account), not the bot token — bots don't see their own channel posts |
+| 4.3c | `e351b6f` | **Bug #18 fix** — `_round_price` enforces ≤6 decimals AND ≤5 sig figs. Surfaced on kBONK test trade, confirmed in production. |
+| 4.3d | `07d3ae1` | Realistic test driver percentages — TP/SL %s derived from signal prices × leverage (not random) |
+| 4.3e | `0d49f8e` | `--cleanup` also cancels orphan HL orders so test runs don't accumulate residue |
+| 4.3f | `7807123` | **Bug #19 fix** — `/positions` slash command was missing per-coin close buttons; shared helper with the Trading-menu path |
+
+Test trade IDs occupy `[7_000_000, 7_999_999]` — 7-digit IDs vs real CP's
+4-digit IDs make them trivially distinguishable. `--cleanup` deletes the
+range from DB AND cancels matching open orders on HL.
+
+Other Phase 4.x bugs fixed in the same window (chronological):
+
+| Bug | Commit | Summary |
+|---|---|---|
+| #13 honest close-result | `ca072ee` + `3160bf6` | Close handlers verify HL response (filled vs error vs no-fill IOC) before claiming success. Surface HL's error text verbatim. |
+| #14 pipeline dedup | `9db341c` | @PotionScannerBot delivers each signal as two variants. Pipeline now dedups on `(trade_id, msg_type)` within a 60s window. |
+| #15 channel-post text-handler crash | `7ea9aa3` | DM text handlers (`config_text_handler`, etc.) crashed on channel_post updates because `context.user_data` is None there. Added `filters.ChatType.PRIVATE` to the registrations + defense-in-depth guards. |
+| #16 Markdown escape in `action_taken` | `53d7210` | Dedup audit rows contained text like `(trade_closed)`; the underscore opened a Markdown italic entity, broke /menu rendering. Escape at the interpolation site. |
+| #17 test driver posting | `37a0454` | (See Phase 4.3b above.) |
+| #18 price precision | `e351b6f` | (See Phase 4.3c above.) |
+| #19 positions slash command | `7807123` | (See Phase 4.3f above.) |
 
 ### Phase 5 — Post-launch (parking lot)
 
-| # | Task |
-|---|------|
-| 5.1 | Weekly performance report (Sheets or PDF). Row labels already match CP's report (per D2). |
-| 5.2 | VPS migration if needed. |
-| 5.3 | CI/CD (lint + tests on push). |
-| 5.4 | Backtest tooling for strategy A/B once enough live data exists. |
+| # | Status | Task |
+|---|---|---|
+| 5.1 | ◻ | Weekly performance report (Sheets or PDF). Row labels already match CP's report (per D2). |
+| 5.2 | ◻ | VPS migration. Three structural fixes called out in README § "Moving to a remote server": bind `127.0.0.1` on admin ports, offsite backup step, systemd unit. |
+| 5.3 | ◻ | CI/CD (lint + tests on push). |
+| 5.4 | ◻ | Backtest tooling for strategy A/B once enough live data exists. |
+| 5.5 | ◻ | Long-running polish: consolidate `_round_price` (two copies), add HL-side wallet-authorization check at `/register` time, sync `.env` defaults with in-DB Artem creds. |
+
+### Phase 6 — Blofin migration (🟡 next major effort)
+
+**Why migrating off HL**:
+- HL doesn't offer the leverage CP signals routinely call for (25–50x on
+  small-caps is normal in CP; HL caps at 20–50x with low caps on the
+  smaller coins).
+- CP's signal calibration assumes Blofin as the trading terminal —
+  matching the platform CP is tuned for is straightforward upside.
+- HL had several gotchas (Bug #9 portfolio margin, Bug #12 oracle
+  distance, Bug #18 decimal cap) that Blofin's API design avoids by
+  having dedicated endpoints (close-positions, tpsl-order) and
+  published per-asset metadata (tickSize, lotSize).
+
+**Two source-of-truth docs** capture the spec, written 2026-06-03 and
+2026-06-04 respectively:
+
+- [`HYPERLIQUID_INTEGRATION.md`](HYPERLIQUID_INTEGRATION.md) — every HL
+  touchpoint in the bot today, 15 capability sections + bug history.
+- [`BLOFIN_INTEGRATION.md`](BLOFIN_INTEGRATION.md) — Blofin's answer to
+  each of those sections + deltas + new capabilities + migration notes.
+  Includes a dedicated **Demo Trading** section that documents how the
+  demo environment replaces HL testnet.
+
+The two docs mirror each other section-by-section so they diff cleanly.
+
+**Implementation order** (estimate: 3–4 focused sessions):
+
+| # | Task | What |
+|---|---|---|
+| 6.1 | Apply for Blofin "API Transaction" permission | Real-world dependency. Required before any code runs. |
+| 6.2 | Validate the demo environment | Six-step plan in `BLOFIN_INTEGRATION.md` § Demo Trading. Sign+send smoke test, top-up demo balance, place + cancel one tiny order. **Do not start client code until this validates.** |
+| 6.3 | `src/exchange/blofin.py` — hand-rolled HTTP client | No SDK from Blofin. ~200 LOC. Surface mirrors `HyperliquidClient`. |
+| 6.4 | `src/exchange/blofin_order_builder.py` | Contract-value math, tickSize-based rounding, native TP/SL via `/api/v1/trade/tpsl-order` |
+| 6.5 | `src/exchange/blofin_position_manager.py` | submit_trade / cancel / close / sync. Use `/api/v1/trade/close-positions` (native market close — Bug #12 obviated). |
+| 6.6 | `src/utils/symbol_mapper.py` — `potion_to_blofin` | Parallel to `potion_to_hyperliquid`. Most coins map identically; build override table during demo testing. |
+| 6.7 | Schema migration | Add `exchange` + `passphrase_enc` columns to `user_credentials`. Existing HL users continue to work. |
+| 6.8 | `/register` flow — exchange choice | New users pick Blofin or HL at registration. |
+| 6.9 | Test driver wiring | Adapter-pattern dispatch so the existing driver works against either exchange. Add `--top-up-demo` helper. |
+| 6.10 | Soak on Blofin demo | Run all 5 test driver scenarios on Blofin demo; audit cleanly before any user moves to production Blofin. |
+| 6.11 | Per-user migration | One user at a time. Keep HL pipeline alive as fallback. |
+
+**HL code stays in the repo permanently** as the fallback adapter — the
+work is to add Blofin alongside, not to replace.
+
+---
+
+## Handoff — picking up from this point
+
+If you're a new model / collaborator picking up this branch, read these
+documents in order:
+
+1. **This file** — project scope, design decisions, phase status.
+2. **[`../CLAUDE.md`](../CLAUDE.md)** — codebase orientation, conventions,
+   operational notes, "where things live".
+3. **[`HYPERLIQUID_INTEGRATION.md`](HYPERLIQUID_INTEGRATION.md)** — the
+   exchange we use today, all 15 capability sections.
+4. **[`BLOFIN_INTEGRATION.md`](BLOFIN_INTEGRATION.md)** — the exchange
+   we're migrating to. Phase 6 specs.
+5. **[`../README.md`](../README.md)** — operator's manual (laptop deploy,
+   DB inspection, cleanup recipes, VPS playbook).
+
+### First 10 minutes — sanity checks
+
+```bash
+cd ~/ClaudeProjects/potion-perps-bot
+
+# 1. On the right branch
+git branch --show-current             # rework/scope-v1
+git log --oneline -5
+
+# 2. Tree clean
+git status
+
+# 3. Tests pass
+python3 -m pytest tests/ -q | tail -2  # expect 761 passed
+
+# 4. Both launchd agents up
+launchctl print gui/$(id -u)/local.potion-perps-bot 2>&1 | grep state
+launchctl print gui/$(id -u)/local.potion-perps-forwarder 2>&1 | grep state
+
+# 5. Any real CP trades fire while you were away?
+sqlite3 -header -column data/trades.db \
+  "SELECT trade_id, coin, side, status, close_reason, pnl_pct, created_at
+   FROM trades WHERE user_id='7441245554' AND trade_id < 80000
+   ORDER BY trade_id DESC LIMIT 5;"
+
+# 6. Any test trades left lying around in the DB?
+sqlite3 data/trades.db \
+  "SELECT COUNT(*) FROM trades WHERE trade_id BETWEEN 7000000 AND 7999999;"
+# 0 = clean. Non-zero = `python3 scripts/test_driver.py --cleanup`.
+```
+
+### What you'd do next, by branch
+
+#### If continuing Phase 4.2 soak (low-effort, observation mode):
+
+- Watch `logs/bot.log` for `Classified message as:` lines indicating real CP signals.
+- Audit any closed trade with the README's "Inspecting a single trade end-to-end" recipe.
+- Phase 4.2 closes when we have a full day's worth of real signals
+  through the pipeline cleanly. Phase 6 work can happen in parallel.
+
+#### If starting Phase 6 (Blofin migration, big effort):
+
+- Read [`BLOFIN_INTEGRATION.md`](BLOFIN_INTEGRATION.md) end-to-end.
+- The first blocker is **applying for Blofin "API Transaction"
+  permission** — Artem has to do this on the Blofin website. Without
+  that permission the API key can't be created.
+- After approval, generate the API key with: **Permissions = Read + Trade only**
+  (NO Withdraw, NO Transfer). Save the passphrase securely.
+- Run the **6-step demo validation** before writing the BlofinClient
+  (see `BLOFIN_INTEGRATION.md` § "Demo Trading — validation plan when we start").
+
+### Operational notes for new sessions
+
+These came up during the rework and are easy to forget:
+
+- **Don't suggest Discord-direct.** The constraint is documented in
+  `CLAUDE.md`. Railway already runs `@PotionScannerBot`; sharing the
+  token kills their service for paying users.
+- **Don't quietly toggle Artem's `auto_execute` to OFF.** It's ON
+  deliberately on testnet. Mainnet has its own gate.
+- **Don't commit to `main` during rework.** Active branch is
+  `rework/scope-v1`. The merge happens later when the full transition
+  is feature-complete and we're ready.
+- **swaag is a real user**, not a fixture. She's active with no port
+  configured, so every CP signal posts a "skipped: port not configured"
+  audit row + Telegram DM to her. Either ask her to set a port or
+  temporarily deactivate via the admin API. Don't delete.
+- **Test trade IDs ≥ 7_000_000.** Real CP IDs are < 80,000. If you see
+  a 7-digit trade_id, it's synthetic from `scripts/test_driver.py`.
+  Bulk-clean with `--cleanup` (which also cancels matching open orders
+  on HL).
+- **`Update.ALL_TYPES` in `start_polling` is load-bearing.** If channel
+  adapter ever stops working, check this first.
+
+### When to ask vs decide
+
+- **Ask** for: anything that touches real money (mainnet promotion, big
+  trade sizes, changes to credential storage, withdrawing funds).
+- **Ask** for: scope changes — anything that affects the design
+  decisions D1–D10 above.
+- **Decide** (and document): refactors that don't change external
+  behavior, test additions, comment/doc edits, internal naming.
+- **Decide** (and surface): bugs and weak spots you see while reading.
+  Document, don't fix unilaterally; let Artem prioritize.
+
+### Files that grow stale fastest
+
+- `CLAUDE.md` § "Current phase" — needs an update after every major
+  shipped phase or significant bug. The phase status table in
+  `REWORK_BRIEF.md` (this file) is the master; CLAUDE.md is the
+  operational mirror.
+- `README.md` § "Current configuration" + "Phase status" — needs an
+  update when users / port / network state changes meaningfully.
+- Bug history tables in both files — append, don't rewrite.
 
 ---
 
 ## Tests
 
-**560/560 passing** as of `a3770a8` (the baseline at `170abbd` was 414).
+**761/761 passing** as of HEAD on `rework/scope-v1`. 35 test files.
+Recent additions (last ~10 commits):
+
+- `tests/test_test_driver.py` — 41 tests covering scenarios, template
+  fidelity, scheduling, cleanup, realistic-percentage math, orphan-order
+  helper.
+- `tests/test_positions_keyboard.py` — 9 tests locking the slash-command
+  ↔ menu-path keyboard parity contract (Bug #19).
+- `tests/test_text_handler_guards.py` — 4 tests on channel-post text
+  handler defense (Bug #15).
+- `tests/test_e2e_pipeline.py::TestPricePrecisionForTightTickCoins` —
+  23 tests on the Bug #18 decimal-cap fix.
+- `tests/test_e2e_pipeline.py::TestPipelineDedup` — 5 tests on Bug #14
+  pipeline-level dedup.
+- `tests/test_e2e_pipeline.py::TestClosePositionResponseHandling` — 4
+  tests on Bug #13 honest close result.
+- `tests/test_formatters.py::TestFormatMainMenu::test_recent_event_action_taken_underscores_are_escaped`
+  — Bug #16 regression.
 
 ---
 
 ## Constraints / guardrails
 
-- **Auditability is the spine.** Every trade open writes a `decision_snapshot`. Every lifecycle event writes a `trade_events` row. If a column would make debugging easier, default to adding it.
-- The bot **never imposes its own exit logic** beyond what the active preset encodes. No surprise position closures, no "smart" overrides. Source bot says X, we do X.
-- The bot **never crashes on bad input.** Parse errors are logged and skipped.
-- Encrypted credential storage stays Fernet. Don't downgrade.
-- Per-user isolation stays. Composite PK `(user_id, trade_id)` everywhere. One user's bug can't touch another user's data.
-- **Don't update the README** during the rework — it's stale, it'll be rewritten in Phase 3.4 as a final polish step.
+- **Auditability is the spine.** Every trade open writes a
+  `decision_snapshot`. Every lifecycle event writes a `trade_events`
+  row. If a column would make debugging easier, default to adding it.
+- **The bot never imposes its own exit logic** beyond what the active
+  preset encodes. No surprise position closures, no "smart" overrides.
+- **Never crash on bad input.** Parse errors logged + skipped.
+- **Encrypted credential storage stays Fernet.** Don't downgrade.
+- **Per-user isolation stays.** Composite PK `(user_id, trade_id)`.
+- **HL is source of truth for position state (D10).** Same will apply
+  to Blofin in Phase 6.
+- **Test trade IDs in `[7_000_000, 7_999_999]`** — never reuse this
+  range for anything else.
 
 ---
 
 ## Working style
 
-- Create a git branch immediately (`rework/scope-v1` — done 2026-05-19). Do not commit to `main` during rework. Commit small, commit often.
-- Propose plans before writing code. Be opinionated. Push back on anything that violates the design goals (auditability, no surprise behavior, never crashes).
-- When unsure about a design tradeoff, ask. Better to answer one question now than untangle a wrong assumption later.
-- If something contradicts the design goals during reading (a place where the bot crashes, surprises the user, drops audit information), flag it even if it's not in scope for the current phase.
+- **Branch first, commit small, commit often.** Active rework branch is
+  `rework/scope-v1`. No commits to `main` during rework.
+- **Propose plans before writing code.** Files touched, design choices,
+  tests added, LOC estimate. Wait for explicit approval on anything
+  that touches mainnet, credentials, schema, or design decisions.
+- **Be opinionated; push back.** If something violates auditability,
+  introduces surprise behavior, or risks crashes, say so directly.
+- **Ask when a tradeoff is genuinely ambiguous.** One question now
+  beats untangling a wrong assumption later.
+- **Flag issues seen during reading.** Even out-of-scope contradictions
+  to the design goals get surfaced — document, don't fix unilaterally.
+- **Phase 4 was operational, not architectural.** Less code, more
+  careful flipping of real-world switches. Phase 6 is the opposite —
+  a real architectural shift to Blofin. Plan accordingly.
+
+---
+
+## Documentation map
+
+```
+docs/
+├── REWORK_BRIEF.md                  ← you are here. Master scope + phases + handoff.
+├── HYPERLIQUID_INTEGRATION.md       ← what we do on HL today (15 capability sections).
+├── BLOFIN_INTEGRATION.md            ← what we'll do on Blofin (mirror structure + demo).
+└── archive/
+    ├── README.md                     ← explains the archive
+    ├── telegram-bot-plan.md          ← pre-rework SaaS design — REVERSED in D4
+    └── telegram-implementation-steps.md  ← same; superseded.
+
+CLAUDE.md                            ← project orientation for future AI sessions.
+README.md                            ← operator's manual (laptop deploy, DB recipes, etc.)
+```
+
+Anything not on this list is either application code, tests, or
+generated artifacts. Code citations to specific files / line numbers
+are scattered throughout the docs above; trust the docs more than
+half-remembered codebase state.

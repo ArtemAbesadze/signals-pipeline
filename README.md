@@ -28,7 +28,7 @@ pip install -r requirements.txt
 cp .env.example .env                        # add HL creds + Telegram tokens
 cp config/config.example.yaml config/config.yaml
 
-python3 -m pytest tests/                    # 684 should pass
+python3 -m pytest tests/                    # 761 should pass
 python3 main.py                             # foreground; Ctrl-C to stop
 ```
 
@@ -107,7 +107,7 @@ State as of the most recent commit on `rework/scope-v1`:
 | Default auto-execute | `false` | `config/config.yaml`; per-user override |
 | Mainnet confirm threshold | $100 (size above this requires Telegram approval) | `config/config.example.yaml::risk.mainnet_confirm_above_usd` |
 | Mainnet confirm timeout | 5 minutes | `config/config.example.yaml::risk.mainnet_confirm_timeout_min` |
-| Tests | 684 passing | `tests/` |
+| Tests | 761 passing | `tests/` |
 | Users registered | 2 of 3 slots — both on testnet | `users` + `user_config` tables |
 
 **Per-user state right now:**
@@ -822,6 +822,9 @@ git checkout -b feature/<name>            # branch from rework/scope-v1
 
 Project structure: see [`CLAUDE.md`](CLAUDE.md) (kept current, indexed for
 future sessions). The rework spine: [`docs/REWORK_BRIEF.md`](docs/REWORK_BRIEF.md).
+Exchange integration specs: [`docs/HYPERLIQUID_INTEGRATION.md`](docs/HYPERLIQUID_INTEGRATION.md)
+(today) + [`docs/BLOFIN_INTEGRATION.md`](docs/BLOFIN_INTEGRATION.md) (Phase 6
+migration spec).
 
 Conventions enforced across the codebase:
 
@@ -830,7 +833,7 @@ Conventions enforced across the codebase:
 - **No bot-imposed exit logic.** The active preset is the only authority on exits.
 - **Per-user isolation.** Composite PK `(user_id, trade_id)`. All queries filter by user.
 - **HL is source of truth for state** (D10). Local DB drives the audit story; HL drives action decisions.
-- **Tests close behind code.** 718 tests across `tests/`. New features land with tests, not after.
+- **Tests close behind code.** 761 tests across `tests/`. New features land with tests, not after.
 
 ---
 
@@ -845,9 +848,10 @@ Conventions enforced across the codebase:
 | 3.3 | Log rotation polish | ✅ shipped |
 | 3.4 | README rewrite | ✅ shipped |
 | 3.5 | Mainnet promotion gate (confirmation dialog) | ✅ shipped |
-| 4.1 | Telegram channel adapter + Telethon forwarder + D10 + bugs #1, #3, #8, #9, #4, #11, #12, #13, #14, #15 | ✅ shipped |
-| 4.2 | Real CP signal soak — observe & fix | ⏳ in progress |
-| 4.3 | Synthetic test driver (`scripts/test_driver.py`) — full-lifecycle integration tests via the mirror channel | ✅ shipped |
-| 5 | Parking lot — weekly perf report, VPS, CI/CD, backtest tooling | ⏳ later |
+| 4.1 | Telegram channel adapter + Telethon forwarder + D10 + bugs #1, #3, #4, #8, #9, #11, #12 | ✅ shipped |
+| 4.2 | Real CP signal soak — observe & fix | 🟡 ongoing |
+| 4.3 | Synthetic test driver + bugs #13–19 (close-honesty, dedup, channel-post guards, markdown escape, decimal cap, /positions parity) | ✅ shipped |
+| 5 | Parking lot — weekly perf report, VPS, CI/CD, backtest tooling | ◻ later |
+| **6** | **Blofin migration — HL → Blofin transition. See `docs/BLOFIN_INTEGRATION.md`.** | 🟡 **next major effort** |
 
-Full phase breakdown: [`docs/REWORK_BRIEF.md`](docs/REWORK_BRIEF.md).
+Full phase breakdown: [`docs/REWORK_BRIEF.md`](docs/REWORK_BRIEF.md). Exchange-specific specs: [`docs/HYPERLIQUID_INTEGRATION.md`](docs/HYPERLIQUID_INTEGRATION.md) and [`docs/BLOFIN_INTEGRATION.md`](docs/BLOFIN_INTEGRATION.md).
