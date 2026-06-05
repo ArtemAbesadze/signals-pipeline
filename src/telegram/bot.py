@@ -173,6 +173,10 @@ class TelegramBot:
         from src.telegram.handlers.promotion import build_promotion_handler
         self._app.add_handler(build_promotion_handler())
 
+        # Exchange/network switch conversation (Phase 6.12)
+        from src.telegram.handlers.switch import build_switch_handler
+        self._app.add_handler(build_switch_handler())
+
         # Menu navigation callbacks
         self._app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
         self._app.add_handler(CallbackQueryHandler(start_register_callback, pattern=r"^start:register$"))

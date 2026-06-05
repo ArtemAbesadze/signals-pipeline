@@ -157,6 +157,9 @@ def config_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📊 Leverage", callback_data="cfg:leverage"),
             InlineKeyboardButton("🛡 Risk Limits", callback_data="cfg:risk"),
         ],
+        [
+            InlineKeyboardButton("🔁 Switch Exchange", callback_data="switch:start"),
+        ],
         *_back_refresh_close("menu:main"),
     ])
 

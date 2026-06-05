@@ -61,6 +61,30 @@ def _get_orchestrator(context: ContextTypes.DEFAULT_TYPE):
     return context.bot_data.get("orchestrator")
 
 
+def validate_exchange_credentials(
+    exchange: str, network: str, account_address: str, api_secret: str,
+    passphrase: str = "",
+) -> str | None:
+    """Validate credentials against the exchange with a signed read. Returns
+    None on success, or an error message string. Shared by /register and the
+    exchange-switch flow. Blofin: testnet→demo, mainnet→production host."""
+    try:
+        if exchange == "blofin":
+            blofin_network = "production" if network == "mainnet" else "demo"
+            BlofinClient(
+                api_key=account_address, api_secret=api_secret,
+                passphrase=passphrase, network=blofin_network,
+            ).get_balance()
+        else:
+            HyperliquidClient(
+                account_address=account_address, private_key=api_secret,
+                network=network,
+            ).get_account_state()
+        return None
+    except Exception as e:
+        return str(e)
+
+
 async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle /register — start the registration flow."""
     # DM-only check
@@ -402,28 +426,13 @@ async def _complete_registration(
     api_wallet = context.user_data.get("api_wallet", "")
     passphrase = context.user_data.get("passphrase", "")
 
-    try:
-        if exchange == "blofin":
-            # testnet→demo, mainnet→production (same mapping as build_exchange_client).
-            blofin_network = "production" if network == "mainnet" else "demo"
-            client = BlofinClient(
-                api_key=account_address,
-                api_secret=api_secret,
-                passphrase=passphrase,
-                network=blofin_network,
-            )
-            client.get_balance()  # signed read — proves key+secret+passphrase
-        else:
-            client = HyperliquidClient(
-                account_address=account_address,
-                private_key=api_secret,
-                network=network,
-            )
-            client.get_account_state()
-    except Exception as e:
-        logger.warning("Credential validation failed for chat %d: %s", chat_id, e)
+    err = validate_exchange_credentials(
+        exchange, network, account_address, api_secret, passphrase,
+    )
+    if err is not None:
+        logger.warning("Credential validation failed for chat %d: %s", chat_id, err)
         await progress(
-            f"❌ *Credential validation failed:*\n{e}\n\n"
+            f"❌ *Credential validation failed:*\n{err}\n\n"
             "Please check your credentials and try /register again.",
             parse_mode="Markdown",
         )
