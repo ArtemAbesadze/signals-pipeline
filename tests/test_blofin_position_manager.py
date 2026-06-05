@@ -52,6 +52,8 @@ def client():
     c.get_open_positions.return_value = []
     c.get_open_orders.return_value = []
     c.get_open_tpsl_orders.return_value = []
+    # Above the $50k entry → a long's breakeven SL (at entry) is below market = valid.
+    c.get_all_mids.return_value = {"BTC-USDT": 51000.0}
     return c
 
 
@@ -213,6 +215,37 @@ class TestMoveSl:
     def test_no_active_sl_returns_false(self, pm, db):
         _seed_trade(db, status=TradeStatus.OPEN)  # no orders submitted
         assert pm.move_sl_to_breakeven(7000001, "BTC", 50000.0) is False
+
+    def test_be_skipped_when_price_crossed_back_keeps_old_sl(self, pm, db, client):
+        # Long position, but price dropped below entry → breakeven SL (at entry)
+        # would be ABOVE market = rejected by Blofin. Must keep the old SL, not
+        # cancel it (no unprotected window). 2026-06-05 soak case.
+        ts = _seed_trade(db, status=TradeStatus.OPEN)
+        pm.submit_trade(ts)
+        client.cancel_tpsl.reset_mock()
+        client.get_all_mids.return_value = {"BTC-USDT": 49500.0}  # below entry 50000
+        assert pm.move_sl_to_breakeven(7000001, "BTC", 50000.0) is False
+        client.cancel_tpsl.assert_not_called()        # old SL untouched
+        sls = [o for o in db.get_orders_for_trade(7000001)
+               if o.order_type == OrderType.STOP_LOSS]
+        assert all(o.status == OrderStatus.SUBMITTED for o in sls)  # still protected
+
+    def test_be_reinstates_old_sl_when_new_rejected(self, pm, db, client):
+        # Valid price, but the new SL is rejected after the old is canceled →
+        # the original SL must be re-instated (never leave it unprotected).
+        ts = _seed_trade(db, status=TradeStatus.OPEN)
+        pm.submit_trade(ts)
+        client.place_tpsl.reset_mock()
+        results = iter([
+            {"code": "0", "data": {"code": "9999", "msg": "rejected"}},  # new SL rejected
+            {"code": "0", "data": {"tpslId": "T_REINSTATE", "code": "0"}},  # re-instate ok
+        ])
+        client.place_tpsl.side_effect = lambda **k: next(results)
+        assert pm.move_sl_to_breakeven(7000001, "BTC", 50000.0) is False
+        assert client.place_tpsl.call_count == 2      # new attempt + re-instate
+        sls = [o for o in db.get_orders_for_trade(7000001)
+               if o.order_type == OrderType.STOP_LOSS]
+        assert any(o.status == OrderStatus.SUBMITTED and o.oid == "T_REINSTATE" for o in sls)
 
 
 class TestSync:

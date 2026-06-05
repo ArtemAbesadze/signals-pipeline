@@ -274,7 +274,20 @@ class BlofinPositionManager:
         self._db.update_trade_status(trade_id, TradeStatus.CLOSED, close_reason=reason)
 
     def move_stop_loss(self, trade_id: int, coin: str, new_price: float) -> bool:
-        """Cancel the existing SL conditional and place a new one at *new_price*."""
+        """Move the SL conditional to *new_price* without leaving the position
+        unprotected.
+
+        Blofin rejects an SL whose trigger is on the wrong side of the current
+        price (a long's SL must be below market, a short's above). The old
+        cancel-then-place order meant a rejected new SL left the position with
+        NO stop (2026-06-05 soak: a breakeven move while price had crossed back
+        past entry). Guards:
+          1. Pre-validate the new price against the current market; if it would
+             be rejected, keep the existing SL untouched and return False.
+          2. If the new SL is still rejected after the old was canceled,
+             re-instate the original SL and alert (CRITICAL) — never silently
+             leave the position uncovered.
+        """
         sl = next(
             (o for o in self._db.get_orders_for_trade(trade_id)
              if o.order_type == OrderType.STOP_LOSS and o.status == OrderStatus.SUBMITTED),
@@ -284,6 +297,16 @@ class BlofinPositionManager:
             logger.warning("No active SL conditional for #%d to move", trade_id)
             return False
         inst = sl.coin
+
+        # (1) Pre-validate — don't cancel a working SL for a doomed replacement.
+        if not self._sl_price_valid(inst, sl.side, new_price):
+            logger.warning(
+                "SL move to %s for #%d skipped — Blofin would reject it (price "
+                "already past that level for a %s-close); keeping existing SL",
+                new_price, trade_id, sl.side,
+            )
+            return False
+
         try:
             res = self._client.cancel_tpsl(inst, sl.oid)
             if response_ok(res) or _cancel_benign(res):
@@ -299,8 +322,36 @@ class BlofinPositionManager:
             inst_id=inst, side=sl.side, size=sl.size, sl_trigger_price=new_price,
         )
         tid = self._submit_tpsl(trade_id, OrderType.STOP_LOSS, params)
+        if tid is None:
+            # (2) New SL rejected after the old is gone — re-instate the original.
+            logger.critical(
+                "SL move for #%d: new SL @ %s REJECTED after canceling old — "
+                "re-instating original SL @ %s", trade_id, new_price, sl.price,
+            )
+            reinstate = BlofinTpslParams(
+                inst_id=inst, side=sl.side, size=sl.size, sl_trigger_price=sl.price,
+            )
+            if self._submit_tpsl(trade_id, OrderType.STOP_LOSS, reinstate) is None:
+                logger.critical(
+                    "SL move for #%d: re-instate of original SL ALSO failed — "
+                    "POSITION UNPROTECTED, manual action required", trade_id,
+                )
+            return False
         logger.info("Moved SL to %s for #%d (tpslId=%s)", new_price, trade_id, tid)
-        return tid is not None
+        return True
+
+    def _sl_price_valid(self, inst: str, side: str, new_price: float) -> bool:
+        """True if an SL at *new_price* is on the valid side of the current
+        market for a *side*-close (sell = long position → SL below market;
+        buy = short → SL above). Best-effort: if the price can't be read, don't
+        block the move (the re-instate guard in move_stop_loss is the backstop)."""
+        try:
+            current = self._client.get_all_mids().get(inst)
+        except Exception:
+            return True
+        if not current or current <= 0:
+            return True
+        return new_price < current if side == "sell" else new_price > current
 
     def move_sl_to_breakeven(self, trade_id: int, coin: str, entry_price: float) -> bool:
         return self.move_stop_loss(trade_id, coin, entry_price)
