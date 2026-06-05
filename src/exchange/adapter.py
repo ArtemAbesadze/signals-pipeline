@@ -28,6 +28,7 @@ both exchanges keep CP's target-price approximation in ``_mark_order_filled``.
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 
 from src.config.settings import StrategyPreset
@@ -40,6 +41,8 @@ from src.exchange.position_manager import PositionManager
 from src.parser.signal_parser import ParsedSignal
 from src.state.database import TradeDatabase
 from src.utils.symbol_mapper import potion_to_blofin, potion_to_hyperliquid
+
+logger = logging.getLogger(__name__)
 
 # Historical HL minimum-notional bump (see ``Pipeline._handle_signal`` pre-6.8).
 # HL rejects sub-$10 orders and loses notional to ``szDecimals`` flooring, so
@@ -98,6 +101,19 @@ class ExchangeAdapter(ABC):
         fallback used when an order set could not be built (auto_execute=off)."""
         ...
 
+    def real_fill_price(self, coin: str, trade_id: int, order_type) -> float | None:
+        """The exchange's REAL executed fill price for our order, or None.
+
+        D11 (Phase 6.8b): a CP lifecycle event tells us an order *should* have
+        filled, but CP doesn't carry the real fill price. When the exchange
+        exposes executed-order history we read the true ``averagePrice`` and
+        persist that; otherwise the caller falls back to the CP target price
+        and marks the row as an estimate — never silently mixed.
+
+        Default (Hyperliquid): None — HL has no equivalent endpoint, so the HL
+        path keeps the CP target-price approximation it always used."""
+        return None
+
 
 class HyperliquidAdapter(ExchangeAdapter):
     name = "hyperliquid"
@@ -152,6 +168,35 @@ class BlofinAdapter(ExchangeAdapter):
 
     def map_symbol(self, pair: str) -> str:
         return potion_to_blofin(pair)
+
+    def real_fill_price(self, coin: str, trade_id: int, order_type) -> float | None:
+        """Look up the real executed fill price from Blofin's orders-history,
+        joined to our order by the ``potion_{trade_id}_{type}`` label we set at
+        submit time. Entries carry it as ``clientOrderId``; triggered TP/SL
+        executions carry it as ``algoClientOrderId`` (their execution orderId
+        differs from the tpslId). Returns None on no-match or query failure so
+        the caller falls back to the CP estimate. ``coin`` is the instId."""
+        target = f"potion_{trade_id}_{order_type.value}"
+        try:
+            rows = self._client.get_orders_history(coin)
+        except Exception:
+            logger.exception(
+                "orders-history query failed for #%s %s; using CP estimate",
+                trade_id, coin,
+            )
+            return None
+        for row in rows:
+            if str(row.get("state")) != "filled":
+                continue
+            coid = row.get("clientOrderId") or row.get("algoClientOrderId") or ""
+            if coid != target:
+                continue
+            try:
+                px = float(row.get("averagePrice"))
+            except (TypeError, ValueError):
+                return None
+            return px if px > 0 else None
+        return None
 
 
 _ADAPTERS: dict[str, type[ExchangeAdapter]] = {

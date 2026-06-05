@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS orders (
     oid         TEXT,
     status      TEXT    NOT NULL DEFAULT 'pending',
     fill_price  REAL,
+    fill_price_source TEXT,
     created_at  TEXT    NOT NULL,
     updated_at  TEXT    NOT NULL,
     FOREIGN KEY (user_id, trade_id) REFERENCES trades (user_id, trade_id)
@@ -152,6 +153,17 @@ class TradeDatabase:
             # HL int oids round-trip as their string form). Runs before index
             # creation so the indexes always land on the final table shape.
             self._migrate_orders_oid_to_text()
+            # Added after the oid rebuild so the rebuild's column copy can't
+            # drop it. D11 (6.8b): records whether fill_price is the exchange's
+            # real averagePrice ('exchange') or a CP target-price estimate
+            # ('cp_estimate'); NULL for legacy rows.
+            for sql in (
+                "ALTER TABLE orders ADD COLUMN fill_price_source TEXT",
+            ):
+                try:
+                    self._conn.execute(sql)
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
             for idx in _INDEXES_DDL:
                 self._conn.execute(idx)
 
@@ -407,15 +419,28 @@ class TradeDatabase:
         )
         return row_id
 
-    def update_order_status(self, oid: str | int, status: OrderStatus, fill_price: float | None = None) -> None:
-        """Update an order's status by its exchange oid (HL int or Blofin str)."""
+    def update_order_status(
+        self,
+        oid: str | int,
+        status: OrderStatus,
+        fill_price: float | None = None,
+        fill_price_source: str | None = None,
+    ) -> None:
+        """Update an order's status by its exchange oid (HL int or Blofin str).
+
+        ``fill_price_source`` (D11, 6.8b) records the provenance of
+        ``fill_price``: 'exchange' (real averagePrice read back) or
+        'cp_estimate' (CP target-price approximation). Both are COALESCE-guarded
+        so passing None leaves the existing value untouched."""
         now = _now()
         with self._conn:
             self._conn.execute(
                 """UPDATE orders
-                   SET status = ?, updated_at = ?, fill_price = COALESCE(?, fill_price)
+                   SET status = ?, updated_at = ?,
+                       fill_price = COALESCE(?, fill_price),
+                       fill_price_source = COALESCE(?, fill_price_source)
                    WHERE oid = ? AND user_id = ?""",
-                (status.value, now, fill_price, str(oid), self._user_id),
+                (status.value, now, fill_price, fill_price_source, str(oid), self._user_id),
             )
 
     def set_order_oid(self, row_id: int, oid: str | int) -> None:
@@ -488,6 +513,9 @@ class TradeDatabase:
             oid=row["oid"],
             status=OrderStatus(row["status"]),
             fill_price=row["fill_price"],
+            fill_price_source=(
+                row["fill_price_source"] if "fill_price_source" in row.keys() else None
+            ),
             created_at=_parse_dt(row["created_at"]),
             updated_at=_parse_dt(row["updated_at"]),
         )

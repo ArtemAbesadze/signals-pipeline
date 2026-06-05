@@ -90,6 +90,21 @@ FILLS = {"code": "0", "msg": "success", "data": [{
     "positionSide": "net", "fee": "0.0038", "ts": "1",
 }]}
 
+# Real demo-captured shape (2026-06-05): entry carries our clientOrderId;
+# a triggered TP/SL execution carries algoClientOrderId + algoId(=tpslId).
+ORDERS_HISTORY = {"code": "0", "msg": "success", "data": [
+    {"orderId": "1000128859744", "algoId": "10001444894",
+     "algoClientOrderId": "potion_7000001_tp1", "clientOrderId": "",
+     "instId": "INJ-USDT", "side": "buy", "filledSize": "13.4",
+     "averagePrice": "4.887", "pnl": "0.335", "fee": "0.039",
+     "orderCategory": "tp", "state": "filled"},
+    {"orderId": "1000128859372", "algoId": "",
+     "algoClientOrderId": "", "clientOrderId": "potion_7000001_entry",
+     "instId": "INJ-USDT", "side": "sell", "filledSize": "40.7",
+     "averagePrice": "4.912", "pnl": "0", "fee": "0.04",
+     "orderCategory": "normal", "state": "filled"},
+]}
+
 ORDER_OK = {"code": "0", "msg": "", "data": [
     {"orderId": "1000128754245", "clientOrderId": "potion_42_entry",
      "code": "0", "msg": "Order placed"}]}
@@ -228,6 +243,17 @@ class TestReads:
         f = client.get_fills("BTC-USDT")[0]
         assert f["fillPrice"] == "63970"
         assert "fills-history" in client._session.request.call_args[0][1]
+
+    def test_get_orders_history(self, client):
+        client._session.request.return_value = _resp(ORDERS_HISTORY)
+        rows = client.get_orders_history("INJ-USDT")
+        assert "orders-history" in client._session.request.call_args[0][1]
+        assert "instId=INJ-USDT" in client._session.request.call_args[0][1]
+        # entry row joins via clientOrderId; tp row via algoClientOrderId
+        entry = next(r for r in rows if r["clientOrderId"] == "potion_7000001_entry")
+        assert entry["averagePrice"] == "4.912"
+        tp = next(r for r in rows if r["algoClientOrderId"] == "potion_7000001_tp1")
+        assert tp["averagePrice"] == "4.887" and tp["pnl"] == "0.335"
 
 
 # Writes --------------------------------------------------------------------

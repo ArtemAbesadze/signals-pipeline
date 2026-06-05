@@ -122,5 +122,7 @@ class OrderRecord:
     oid: str | int | None = None  # Exchange order ID — HL int, or Blofin orderId/clientOrderId str (set after submission)
     status: OrderStatus = OrderStatus.PENDING
     fill_price: float | None = None
+    # D11 (6.8b): 'exchange' (real averagePrice) | 'cp_estimate' (CP target) | None (legacy)
+    fill_price_source: str | None = None
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)

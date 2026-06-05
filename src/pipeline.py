@@ -1060,16 +1060,27 @@ class Pipeline:
                 and order.status == OrderStatus.SUBMITTED
                 and order.oid is not None
             ):
-                effective_price = (
-                    fill_price if fill_price is not None else order.price
-                )
+                # D11 (6.8b): prefer the exchange's REAL fill price (read back
+                # via the adapter from order history, joined by our clientOrderId)
+                # over CP's target-price approximation. Record provenance so a
+                # post-mortem can tell real fills from estimates. HL has no such
+                # endpoint → real is None → CP estimate, exactly as before.
+                real = self._adapter.real_fill_price(order.coin, trade_id, order_type)
+                if real is not None:
+                    effective_price = real
+                    source = "exchange"
+                else:
+                    effective_price = fill_price if fill_price is not None else order.price
+                    source = "cp_estimate"
                 try:
                     self._db.update_order_status(
-                        order.oid, OrderStatus.FILLED, fill_price=effective_price,
+                        order.oid, OrderStatus.FILLED,
+                        fill_price=effective_price, fill_price_source=source,
                     )
                     logger.info(
-                        "Trade #%d: marked %s FILLED @ %s (from CP event)",
+                        "Trade #%d: marked %s FILLED @ %s (%s)",
                         trade_id, order_type.value, effective_price,
+                        "real exchange fill" if source == "exchange" else "CP estimate",
                     )
                     return True
                 except Exception:

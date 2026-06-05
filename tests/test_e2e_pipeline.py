@@ -226,6 +226,48 @@ class TestPipelineExchangeDispatch:
         assert isinstance(pipeline._adapter, BlofinAdapter)
         assert isinstance(pipeline._pm, BlofinPositionManager)
 
+    def _blofin_pipeline_with_entry(self, config, db, client):
+        """Blofin pipeline + a seeded SUBMITTED entry order (#7000001 INJ)."""
+        from src.state.models import OrderStatus, OrderType, TradeRecord
+        config.exchange.exchange = "blofin"
+        db.create_trade(TradeRecord(
+            trade_id=7000001, user_id=db.user_id, pair="INJ/USDT", coin="INJ",
+            side="SHORT", risk_level="LOW", trade_type="SWING", size_hint="1-4%",
+            entry_price=4.90, stop_loss=5.0, tp1=4.88, tp2=4.86, tp3=4.81,
+            leverage=14, signal_leverage=14, position_size_usd=200.0,
+            position_size_coin=40.7,
+        ))
+        db.record_order(7000001, OrderType.ENTRY, "INJ-USDT", "sell", 40.7, 4.90,
+                        oid="O1", status=OrderStatus.SUBMITTED)
+        return Pipeline(config=config, client=client, db=db)
+
+    def test_d11_persists_real_fill_when_history_has_it(self, config, db):
+        from src.state.models import OrderType
+        client = MagicMock()
+        client.get_asset_meta.return_value = {}
+        client.get_orders_history.return_value = [
+            {"clientOrderId": "potion_7000001_entry", "algoClientOrderId": "",
+             "averagePrice": "4.912", "state": "filled"},
+        ]
+        pipeline = self._blofin_pipeline_with_entry(config, db, client)
+        assert pipeline._mark_order_filled(7000001, OrderType.ENTRY) is True
+        order = next(o for o in db.get_orders_for_trade(7000001)
+                     if o.order_type == OrderType.ENTRY)
+        assert order.fill_price == 4.912              # real exchange averagePrice
+        assert order.fill_price_source == "exchange"  # D11: provenance recorded
+
+    def test_d11_falls_back_to_cp_estimate_when_no_history(self, config, db):
+        from src.state.models import OrderType
+        client = MagicMock()
+        client.get_asset_meta.return_value = {}
+        client.get_orders_history.return_value = []   # nothing real yet
+        pipeline = self._blofin_pipeline_with_entry(config, db, client)
+        assert pipeline._mark_order_filled(7000001, OrderType.ENTRY) is True
+        order = next(o for o in db.get_orders_for_trade(7000001)
+                     if o.order_type == OrderType.ENTRY)
+        assert order.fill_price == 4.90               # CP target (order.price)
+        assert order.fill_price_source == "cp_estimate"
+
 
 # ====================================================================
 # Full signal lifecycle

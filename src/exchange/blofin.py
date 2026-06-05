@@ -264,6 +264,24 @@ class BlofinClient:
             path += f"&instId={inst_id}"
         return self._checked("GET", path).get("data") or []
 
+    @retry_on_transient()
+    def get_orders_history(self, inst_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        """Completed orders (entries + triggered TP/SL executions) — the D11
+        read-back source for real ``averagePrice`` / ``pnl`` / ``fee``.
+
+        Unlike ``fills-history`` (keyed only by execution ``orderId``), each
+        row here carries the originating ``clientOrderId`` (entries) or
+        ``algoClientOrderId`` (triggered TP/SL — the conditional's
+        clientOrderId), so a fill can be joined back to our order via the
+        ``potion_{trade_id}_{type}`` naming we set at submit time. A triggered
+        conditional's execution ``orderId`` differs from its ``tpslId``;
+        ``algoId`` holds the tpslId and ``algoClientOrderId`` our label.
+        Demo-confirmed 2026-06-05."""
+        path = f"/api/v1/trade/orders-history?limit={int(limit)}"
+        if inst_id:
+            path += f"&instId={inst_id}"
+        return self._checked("GET", path).get("data") or []
+
     # ------------------------------------------------------------------
     # Writes — NOT auto-retried (avoid double-submit). Return the raw dict so
     # the position manager can inspect per-item codes (e.g. 102068 on cancel).

@@ -160,3 +160,54 @@ class TestBlofinAdapter:
         ts = MagicMock()
         ts.entry.size = 4.5
         assert a.entry_size(ts) == 4.5
+
+
+_ORDERS_HISTORY = [
+    {"clientOrderId": "potion_7000001_entry", "algoClientOrderId": "",
+     "averagePrice": "4.912", "state": "filled"},
+    {"clientOrderId": "", "algoClientOrderId": "potion_7000001_tp1",
+     "averagePrice": "4.887", "state": "filled"},
+    {"clientOrderId": "", "algoClientOrderId": "potion_7000001_stop_loss",
+     "averagePrice": "4.913", "state": "filled"},
+    {"clientOrderId": "", "algoClientOrderId": "potion_7000001_tp2",
+     "averagePrice": "4.863", "state": "live"},  # not filled → ignored
+]
+
+
+class _OT:
+    """Minimal order_type stand-in exposing .value."""
+    def __init__(self, value): self.value = value
+
+
+class TestRealFillPrice:
+    def test_hyperliquid_returns_none(self, hl_client, db):
+        # HL has no order-history endpoint → always None (caller keeps CP est).
+        a = HyperliquidAdapter(hl_client, db)
+        assert a.real_fill_price("BTC", 7000001, _OT("entry")) is None
+
+    def test_blofin_entry_matches_client_order_id(self, blofin_client, db):
+        blofin_client.get_orders_history.return_value = _ORDERS_HISTORY
+        a = BlofinAdapter(blofin_client, db)
+        assert a.real_fill_price("INJ-USDT", 7000001, _OT("entry")) == 4.912
+        blofin_client.get_orders_history.assert_called_once_with("INJ-USDT")
+
+    def test_blofin_tp_matches_algo_client_order_id(self, blofin_client, db):
+        blofin_client.get_orders_history.return_value = _ORDERS_HISTORY
+        a = BlofinAdapter(blofin_client, db)
+        assert a.real_fill_price("INJ-USDT", 7000001, _OT("tp1")) == 4.887
+        assert a.real_fill_price("INJ-USDT", 7000001, _OT("stop_loss")) == 4.913
+
+    def test_blofin_unfilled_state_ignored(self, blofin_client, db):
+        blofin_client.get_orders_history.return_value = _ORDERS_HISTORY
+        a = BlofinAdapter(blofin_client, db)
+        assert a.real_fill_price("INJ-USDT", 7000001, _OT("tp2")) is None  # state=live
+
+    def test_blofin_no_match_returns_none(self, blofin_client, db):
+        blofin_client.get_orders_history.return_value = _ORDERS_HISTORY
+        a = BlofinAdapter(blofin_client, db)
+        assert a.real_fill_price("INJ-USDT", 9999999, _OT("entry")) is None
+
+    def test_blofin_query_failure_returns_none(self, blofin_client, db):
+        blofin_client.get_orders_history.side_effect = RuntimeError("boom")
+        a = BlofinAdapter(blofin_client, db)
+        assert a.real_fill_price("INJ-USDT", 7000001, _OT("entry")) is None
