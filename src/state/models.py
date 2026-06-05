@@ -83,6 +83,8 @@ class TradeRecord:
     closed_at: datetime | None = None
     close_reason: str | None = None  # "all_tp_hit", "stop_hit", "manual", "canceled"
     pnl_pct: float | None = None     # Final P&L % (from signal provider or calculated)
+    # D11 6.8b-2: 'exchange' (from real realized PnL) | 'cp_estimate' | None (legacy)
+    pnl_source: str | None = None
     notes: str | None = None          # User-provided trade journal notes
     # D3 audit fields — verbatim signal text + decision snapshot captured at open
     raw_signal_text: str | None = None

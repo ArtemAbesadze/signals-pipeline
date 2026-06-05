@@ -268,6 +268,52 @@ class TestPipelineExchangeDispatch:
         assert order.fill_price == 4.90               # CP target (order.price)
         assert order.fill_price_source == "cp_estimate"
 
+    def _blofin_open_trade(self, config, db, client, size_usd=50.0):
+        from src.state.models import TradeRecord, TradeStatus
+        config.exchange.exchange = "blofin"
+        db.create_trade(TradeRecord(
+            trade_id=7000001, user_id=db.user_id, pair="BTC/USDT", coin="BTC",
+            side="LONG", risk_level="HIGH", trade_type="SWING", size_hint="1-4%",
+            entry_price=50000, stop_loss=49000, tp1=51000, tp2=52000, tp3=55000,
+            leverage=20, signal_leverage=25, position_size_usd=size_usd,
+            position_size_coin=0.0,
+        ))
+        db.update_trade_status(7000001, TradeStatus.OPEN)
+        return Pipeline(config=config, client=client, db=db)
+
+    def test_d11_realized_pnl_from_exchange(self, config, db):
+        # all-TP close: real Blofin realized PnL (sum of orders-history.pnl) is
+        # used + pnl_pct backed out as real_usd/collateral — NOT CP's 16.33%.
+        from src.state.models import TradeStatus
+        client = MagicMock()
+        client.get_asset_meta.return_value = {}
+        client.get_orders_history.return_value = [
+            {"clientOrderId": "potion_7000001_entry", "algoClientOrderId": "", "pnl": "0", "state": "filled"},
+            {"clientOrderId": "", "algoClientOrderId": "potion_7000001_tp1", "pnl": "1.0", "state": "filled"},
+            {"clientOrderId": "", "algoClientOrderId": "potion_7000001_tp2", "pnl": "0.5", "state": "filled"},
+        ]
+        pipeline = self._blofin_open_trade(config, db, client, size_usd=50.0)
+        pipeline.process_message(
+            "**🔥ALL TAKE-PROFIT TARGETS HIT**\n\n**📝PAIR:** BTC/USDT #7000001\n\n"
+            "**💰PROFIT:** 16.33% 📈\n**⏳PERIOD:** 1 Hours 2 Minutes"
+        )
+        t = db.get_trade(7000001)
+        assert t.status == TradeStatus.CLOSED
+        assert t.pnl_source == "exchange"
+        assert t.pnl_pct == pytest.approx(3.0)        # 1.5 / 50 * 100, not 16.33
+
+    def test_d11_realized_pnl_falls_back_to_cp(self, config, db):
+        from src.state.models import TradeStatus
+        client = MagicMock()
+        client.get_asset_meta.return_value = {}
+        client.get_orders_history.return_value = []   # no real fills on the exchange
+        pipeline = self._blofin_open_trade(config, db, client, size_usd=50.0)
+        pipeline.process_message("STOP TARGET HIT\n\nPAIR: BTC/USDT #7000001\n\nLOSS: -40.00%")
+        t = db.get_trade(7000001)
+        assert t.status == TradeStatus.CLOSED
+        assert t.pnl_source == "cp_estimate"
+        assert t.pnl_pct == pytest.approx(-40.0)
+
 
 class TestTerminalStateGuard:
     """Lifecycle handlers must not resurrect a CANCELED/CLOSED trade.

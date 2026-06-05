@@ -211,3 +211,39 @@ class TestRealFillPrice:
         blofin_client.get_orders_history.side_effect = RuntimeError("boom")
         a = BlofinAdapter(blofin_client, db)
         assert a.real_fill_price("INJ-USDT", 7000001, _OT("entry")) is None
+
+
+_PNL_HISTORY = [
+    {"clientOrderId": "potion_7000001_entry", "algoClientOrderId": "",
+     "pnl": "0", "state": "filled"},
+    {"clientOrderId": "", "algoClientOrderId": "potion_7000001_tp1",
+     "pnl": "0.335", "state": "filled"},
+    {"clientOrderId": "", "algoClientOrderId": "potion_7000001_stop_loss",
+     "pnl": "-0.0273", "state": "filled"},
+    {"clientOrderId": "", "algoClientOrderId": "potion_7000099_tp1",
+     "pnl": "99.0", "state": "filled"},          # different trade — excluded
+    {"clientOrderId": "", "algoClientOrderId": "potion_7000001_tp2",
+     "pnl": "5.0", "state": "live"},             # not filled — excluded
+]
+
+
+class TestRealizedPnl:
+    def test_hyperliquid_returns_none(self, hl_client, db):
+        a = HyperliquidAdapter(hl_client, db)
+        assert a.realized_pnl("BTC", 7000001) is None
+
+    def test_blofin_sums_pnl_for_trade(self, blofin_client, db):
+        blofin_client.get_orders_history.return_value = _PNL_HISTORY
+        a = BlofinAdapter(blofin_client, db)
+        # 0 + 0.335 + (-0.0273), excluding the other trade + the unfilled row
+        assert a.realized_pnl("INJ-USDT", 7000001) == pytest.approx(0.3077)
+
+    def test_blofin_no_match_returns_none(self, blofin_client, db):
+        blofin_client.get_orders_history.return_value = _PNL_HISTORY
+        a = BlofinAdapter(blofin_client, db)
+        assert a.realized_pnl("INJ-USDT", 8888888) is None
+
+    def test_blofin_query_failure_returns_none(self, blofin_client, db):
+        blofin_client.get_orders_history.side_effect = RuntimeError("boom")
+        a = BlofinAdapter(blofin_client, db)
+        assert a.realized_pnl("INJ-USDT", 7000001) is None

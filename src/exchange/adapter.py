@@ -114,6 +114,18 @@ class ExchangeAdapter(ABC):
         path keeps the CP target-price approximation it always used."""
         return None
 
+    def realized_pnl(self, inst_id: str, trade_id: int) -> float | None:
+        """The exchange's REAL realized PnL (quote ccy, USD) for this trade, or
+        None.
+
+        D11 6.8b-2: CP reports a leveraged % at the *signal* leverage, which
+        diverges from reality (e.g. when leverage was capped). When the exchange
+        exposes per-order realized PnL we sum it for the trade; otherwise the
+        caller keeps CP's number and marks it an estimate.
+
+        Default (Hyperliquid): None — no endpoint, HL keeps CP's pnl_pct."""
+        return None
+
 
 class HyperliquidAdapter(ExchangeAdapter):
     name = "hyperliquid"
@@ -197,6 +209,37 @@ class BlofinAdapter(ExchangeAdapter):
                 return None
             return px if px > 0 else None
         return None
+
+    def realized_pnl(self, inst_id: str, trade_id: int) -> float | None:
+        """Sum Blofin's per-order realized ``pnl`` over every executed order
+        belonging to this trade (matched by our ``potion_{trade_id}_`` label on
+        ``clientOrderId`` / ``algoClientOrderId``). The entry contributes 0; TP
+        and SL fills contribute the real gain/loss. Returns None if no matching
+        executed order exists (e.g. the close happened off-exchange or hasn't
+        landed yet) or on query failure, so the caller falls back to CP."""
+        prefix = f"potion_{trade_id}_"
+        try:
+            rows = self._client.get_orders_history(inst_id)
+        except Exception:
+            logger.exception(
+                "orders-history query failed for #%s %s realized-PnL; using CP",
+                trade_id, inst_id,
+            )
+            return None
+        total = 0.0
+        matched = False
+        for row in rows:
+            if str(row.get("state")) != "filled":
+                continue
+            coid = row.get("clientOrderId") or row.get("algoClientOrderId") or ""
+            if not coid.startswith(prefix):
+                continue
+            try:
+                total += float(row.get("pnl") or 0.0)
+                matched = True
+            except (TypeError, ValueError):
+                continue
+        return total if matched else None
 
 
 _ADAPTERS: dict[str, type[ExchangeAdapter]] = {

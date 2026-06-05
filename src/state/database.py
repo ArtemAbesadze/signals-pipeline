@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS trades (
     closed_at       TEXT,
     close_reason    TEXT,
     pnl_pct         REAL,
+    pnl_source      TEXT,    -- D11 6.8b-2: 'exchange' (real) | 'cp_estimate' | NULL
     notes           TEXT,
     raw_signal_text TEXT,
     decision_snapshot TEXT,    -- JSON; see pipeline._build_decision_snapshot
@@ -144,6 +145,7 @@ class TradeDatabase:
                 "ALTER TABLE trades ADD COLUMN raw_signal_text TEXT",
                 "ALTER TABLE trades ADD COLUMN decision_snapshot TEXT",
                 "ALTER TABLE trades ADD COLUMN requires_confirmation INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE trades ADD COLUMN pnl_source TEXT",
             ):
                 try:
                     self._conn.execute(sql)
@@ -304,8 +306,13 @@ class TradeDatabase:
         status: TradeStatus,
         close_reason: str | None = None,
         pnl_pct: float | None = None,
+        pnl_source: str | None = None,
     ) -> None:
-        """Update a trade's status and optionally set close fields."""
+        """Update a trade's status and optionally set close fields.
+
+        ``pnl_source`` (D11 6.8b-2) records the provenance of ``pnl_pct``:
+        'exchange' (computed from the exchange's real realized PnL) or
+        'cp_estimate' (CP's leveraged %). COALESCE-guarded like the others."""
         now = _now()
         closed_at = now if status in (TradeStatus.CLOSED, TradeStatus.CANCELED) else None
         with self._conn:
@@ -313,9 +320,10 @@ class TradeDatabase:
                 """UPDATE trades
                    SET status = ?, updated_at = ?, closed_at = COALESCE(?, closed_at),
                        close_reason = COALESCE(?, close_reason),
-                       pnl_pct = COALESCE(?, pnl_pct)
+                       pnl_pct = COALESCE(?, pnl_pct),
+                       pnl_source = COALESCE(?, pnl_source)
                    WHERE user_id = ? AND trade_id = ?""",
-                (status.value, now, closed_at, close_reason, pnl_pct,
+                (status.value, now, closed_at, close_reason, pnl_pct, pnl_source,
                  self._user_id, trade_id),
             )
         logger.info(
@@ -493,6 +501,7 @@ class TradeDatabase:
             closed_at=_parse_dt(row["closed_at"]),
             close_reason=row["close_reason"],
             pnl_pct=row["pnl_pct"],
+            pnl_source=row["pnl_source"] if "pnl_source" in row.keys() else None,
             notes=row["notes"],
             raw_signal_text=row["raw_signal_text"],
             decision_snapshot=snapshot,

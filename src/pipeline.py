@@ -642,13 +642,9 @@ class Pipeline:
             atp.trade_id, (OrderType.STOP_LOSS,),
         )
 
-        self._db.update_trade_status(
-            atp.trade_id, TradeStatus.CLOSED,
-            close_reason="all_tp_hit", pnl_pct=atp.profit_pct,
-        )
-
-        # Apply realized P&L to the user's port (D1 — withdraw/compound/watermark)
-        self._apply_pnl_to_port(trade.position_size_usd, atp.profit_pct)
+        # Close + apply realized P&L (D1 port modes; D11 6.8b-2: real exchange
+        # PnL when available, else CP's leveraged %).
+        self._close_with_realized_pnl(trade, "all_tp_hit", atp.profit_pct)
 
         self._record_event(
             trade_id=atp.trade_id,
@@ -735,13 +731,9 @@ class Pipeline:
             sh.trade_id, (OrderType.TP1, OrderType.TP2, OrderType.TP3),
         )
 
-        self._db.update_trade_status(
-            sh.trade_id, TradeStatus.CLOSED,
-            close_reason="stop_hit", pnl_pct=sh.loss_pct,
-        )
-
-        # Apply realized P&L to the user's port (D1 — withdraw/compound/watermark)
-        self._apply_pnl_to_port(trade.position_size_usd, sh.loss_pct)
+        # Close + apply realized P&L (D1 port modes; D11 6.8b-2: real exchange
+        # PnL when available, else CP's leveraged %).
+        self._close_with_realized_pnl(trade, "stop_hit", sh.loss_pct)
 
         self._record_event(
             trade_id=sh.trade_id,
@@ -1267,15 +1259,45 @@ class Pipeline:
             "why": "; ".join(why_parts),
         }
 
-    def _apply_pnl_to_port(self, position_size_usd: float, pnl_pct: float) -> None:
-        """Apply realized P&L (percent of collateral) to the user's port.
+    def _close_with_realized_pnl(self, trade, close_reason: str, cp_pnl_pct: float) -> None:
+        """Mark a trade CLOSED and apply its realized P&L to the port, preferring
+        the exchange's REAL realized PnL over CP's leveraged % (D11 6.8b-2).
 
-        No-op when there is no user_db wired up. Errors are caught and
-        logged — port mis-updates must never crash the pipeline.
-        """
+        CP's percentage is computed at the *signal* leverage and diverges from
+        reality (e.g. when we capped leverage). When the adapter can read real
+        per-order realized PnL from the exchange we use it (and back out an
+        accurate pnl_pct as real_usd / collateral), tagging pnl_source
+        'exchange'; otherwise we keep CP's number tagged 'cp_estimate'. The
+        USD applied to the port is the real figure when available. HL always
+        falls back to CP (no endpoint)."""
+        size_usd = trade.position_size_usd or 0.0
+        inst = self._adapter.map_symbol(trade.pair)
+        real_usd = self._adapter.realized_pnl(inst, trade.trade_id)
+        if real_usd is not None and size_usd > 0:
+            pnl_pct = real_usd / size_usd * 100.0
+            pnl_usd = real_usd
+            source = "exchange"
+        else:
+            pnl_pct = cp_pnl_pct
+            pnl_usd = size_usd * cp_pnl_pct / 100.0
+            source = "cp_estimate"
+        self._db.update_trade_status(
+            trade.trade_id, TradeStatus.CLOSED,
+            close_reason=close_reason, pnl_pct=pnl_pct, pnl_source=source,
+        )
+        logger.info(
+            "Trade #%d closed (%s): pnl=%.2f%% (%s)",
+            trade.trade_id, close_reason, pnl_pct,
+            "real exchange PnL" if source == "exchange" else "CP estimate",
+        )
+        self._apply_pnl_usd_to_port(pnl_usd)
+
+    def _apply_pnl_usd_to_port(self, pnl_usd: float) -> None:
+        """Apply a realized P&L amount (USD) to the user's port. No-op without a
+        user_db. Errors are caught — port mis-updates must never crash the
+        pipeline."""
         if self._user_db is None:
             return
-        pnl_usd = position_size_usd * pnl_pct / 100.0
         try:
             self._user_db.apply_pnl_to_port(self._db.user_id, pnl_usd)
         except Exception:
@@ -1283,3 +1305,8 @@ class Pipeline:
                 "Failed to apply port P&L for user %s (pnl_usd=%.2f)",
                 self._db.user_id, pnl_usd,
             )
+
+    def _apply_pnl_to_port(self, position_size_usd: float, pnl_pct: float) -> None:
+        """Back-compat shim: apply P&L given as percent-of-collateral. Prefer
+        ``_close_with_realized_pnl`` (D11 6.8b-2) for close handlers."""
+        self._apply_pnl_usd_to_port(position_size_usd * pnl_pct / 100.0)
