@@ -85,6 +85,12 @@ class TestLeverageCap:
         s = build_blofin_orders(_signal(leverage=20), 500.0, META, max_leverage=100)
         assert s.leverage == 20
 
+    def test_uncapped_zero_follows_cp_clamped_to_instrument(self):
+        # 6.12 global policy: max_leverage=0 = uncapped → follow CP, clamp only
+        # to the instrument max (BTC 150).
+        assert build_blofin_orders(_signal(leverage=200), 500.0, META, max_leverage=0).leverage == 150
+        assert build_blofin_orders(_signal(leverage=75), 500.0, META, max_leverage=0).leverage == 75
+
 
 class TestSideMapping:
     def test_long(self):

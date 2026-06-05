@@ -129,7 +129,9 @@ class StrategyConfig:
 
     active_preset: str = "even_split"
     auto_execute: bool = False
-    max_leverage: int = 20
+    # 0 = uncapped: follow CP's leverage, clamped only to the exchange's
+    # per-instrument max by the order builder (6.12 global policy). >=1 = cap.
+    max_leverage: int = 0
     size_by_risk: dict[str, float] = field(
         default_factory=lambda: {"LOW": 4.0, "MEDIUM": 2.0, "HIGH": 1.0}
     )
@@ -370,7 +372,7 @@ def load_config(
     strategy_config = StrategyConfig(
         active_preset=strategy_yaml.get("active_preset", DEFAULT_PRESET),
         auto_execute=strategy_yaml.get("auto_execute", False),
-        max_leverage=strategy_yaml.get("max_leverage", 20),
+        max_leverage=strategy_yaml.get("max_leverage", 0),
         size_by_risk=strategy_yaml.get("size_by_risk", {"LOW": 4.0, "MEDIUM": 2.0, "HIGH": 1.0}),
         presets=user_presets,
     )
@@ -465,8 +467,11 @@ def _validate(config: Config) -> None:
     except ConfigError as e:
         errors.append(str(e))
 
-    if config.strategy.max_leverage < 1:
-        errors.append(f"strategy.max_leverage must be >= 1, got {config.strategy.max_leverage}")
+    if config.strategy.max_leverage < 0:
+        errors.append(
+            f"strategy.max_leverage must be >= 0 (0 = uncapped), got "
+            f"{config.strategy.max_leverage}"
+        )
 
     # Validate all user-defined presets too
     for name, preset in config.strategy.presets.items():

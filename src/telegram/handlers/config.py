@@ -37,11 +37,16 @@ def _refresh_pipeline(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> None:
         )
 
 
+def _format_leverage(lev) -> str:
+    """0/None = uncapped (follow CP); otherwise an `Nx` personal cap (6.12)."""
+    return "Uncapped (follow CP)" if not lev else f"{lev}x"
+
+
 def _format_config(cfg: dict, account_block: str | None = None) -> str:
     """Format current config for display, with optional inline Account block."""
     preset = cfg.get("active_preset", "even_split")
     auto = "✅ ON" if cfg.get("auto_execute") else "❌ OFF"
-    lev = cfg.get("max_leverage", 20)
+    lev = _format_leverage(cfg.get("max_leverage", 0))
 
     # Get preset details
     p = BUILTIN_PRESETS.get(preset)
@@ -54,7 +59,7 @@ def _format_config(cfg: dict, account_block: str | None = None) -> str:
         "⚙️ *Configuration*\n\n"
         f"🎯 Strategy: `{preset}`{tp_desc}\n"
         f"⚡ Auto-execute: {auto}\n"
-        f"📊 Max Leverage: {lev}x\n\n"
+        f"📊 Max Leverage: {lev}\n\n"
         "🔒 *Risk Limits*\n"
         f"Max Positions: {cfg.get('max_open_positions', 10)}\n"
         f"Max Position Size: ${cfg.get('max_position_size_usd', 500):,.0f}\n"
@@ -206,8 +211,10 @@ async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data["awaiting_config"] = "max_leverage"
         cfg = user_db.get_user_config(user_id)
         await query.edit_message_text(
-            f"📊 Current max leverage: {cfg.get('max_leverage', 20)}x\n\n"
-            "Send the new max leverage value (1-50):"
+            f"📊 Current max leverage: {_format_leverage(cfg.get('max_leverage', 0))}\n\n"
+            "Send a personal cap (1-150), or *0* for uncapped — follow CP, "
+            "clamped to the exchange's per-instrument max.",
+            parse_mode="Markdown",
         )
 
     elif data.startswith("cfg:risk:"):
@@ -258,9 +265,9 @@ async def config_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         if awaiting == "max_leverage":
             value = int(text)
-            if not 1 <= value <= 50:
+            if not 0 <= value <= 150:
                 await update.message.reply_text(
-                    "⚠️ Leverage must be between 1 and 50. Try again:"
+                    "⚠️ Leverage must be 0 (uncapped) or 1-150. Try again:"
                 )
                 return
             user_db.update_user_config(user_id, max_leverage=value)

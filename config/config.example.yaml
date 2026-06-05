@@ -43,7 +43,7 @@ strategy_presets:
 strategy:
   active_preset: even_split        # which preset to use (built-in or custom)
   auto_execute: false              # true = execute immediately, false = wait for confirmation
-  max_leverage: 20                 # cap leverage regardless of signal
+  max_leverage: 0                  # 0 = uncapped (follow CP, clamp to exchange max); >=1 = personal cap
   size_by_risk:                    # override preset size_pct per risk level
     LOW: 4.0
     MEDIUM: 2.0

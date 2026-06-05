@@ -249,7 +249,7 @@ class TestUserConfig:
         cfg = db.get_user_config("alice")
         assert cfg["active_preset"] == "even_split"
         assert cfg["auto_execute"] is False
-        assert cfg["max_leverage"] == 20
+        assert cfg["max_leverage"] == 0  # 6.12: uncapped by default (follow CP)
         assert cfg["max_open_positions"] == 10
 
     def test_custom_config(self, db):
