@@ -30,6 +30,15 @@ def _get_client(context: ContextTypes.DEFAULT_TYPE, user_id: str):
     return ctx.client
 
 
+def _get_exchange(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> str:
+    """Active exchange for the user's live pipeline (6.12)."""
+    orchestrator: Orchestrator | None = context.bot_data.get("orchestrator")
+    ctx = orchestrator.pipelines.get(user_id) if orchestrator else None
+    if ctx is not None:
+        return ctx.config.exchange.exchange
+    return "hyperliquid"
+
+
 @registered_only
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /balance — show account balance."""
@@ -49,7 +58,7 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("⚠️ Failed to fetch balance. Try again later.")
         return
 
-    text = format_balance(balance)
+    text = format_balance(balance, _get_exchange(context, user_id))
     await update.message.reply_text(
         text,
         parse_mode="Markdown",

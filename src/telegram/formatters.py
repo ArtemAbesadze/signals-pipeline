@@ -57,8 +57,34 @@ def format_pct(value: float) -> str:
     return f"{sign}{value:.2f}%"
 
 
-def format_balance(balance: dict[str, str]) -> str:
-    """Format balance data into a display string."""
+def format_exchange_badge(exchange: str | None, network: str | None) -> str:
+    """One-line exchange + environment badge for menu headers (6.12).
+    Blofin's testnet host is the 'Demo' environment; HL's is 'Testnet'."""
+    ex = (exchange or "hyperliquid").lower()
+    net = (network or "testnet").lower()
+    is_mainnet = net == "mainnet"
+    if ex == "blofin":
+        return f"🟦 Blofin · {'🌐 Mainnet' if is_mainnet else '🧪 Demo'}"
+    return f"🟩 Hyperliquid · {'🌐 Mainnet' if is_mainnet else '🧪 Testnet'}"
+
+
+def extract_wallet_usd(balance: dict, exchange: str | None) -> float:
+    """Spendable balance in USD from an exchange's get_balance() shape (6.12).
+    HL reports spot ``usdc_balance``; Blofin the futures ``available``."""
+    if (exchange or "hyperliquid").lower() == "blofin":
+        return float(balance.get("available", 0) or 0)
+    return float(balance.get("usdc_balance", 0) or 0)
+
+
+def format_balance(balance: dict[str, str], exchange: str | None = "hyperliquid") -> str:
+    """Format balance data into a display string (exchange-aware, 6.12)."""
+    if (exchange or "hyperliquid").lower() == "blofin":
+        return (
+            "💰 *Account Balance* (Blofin)\n\n"
+            f"💵 Available: {format_usd(balance.get('available', 0))}\n"
+            f"📊 Equity: {format_usd(balance.get('equity', balance.get('total_equity', 0)))}\n"
+            f"🧊 Frozen (in orders): {format_usd(balance.get('frozen', 0))}"
+        )
     return (
         "💰 *Account Balance*\n\n"
         f"💵 USDC Balance: {format_usd(balance['usdc_balance'])}\n"
@@ -351,6 +377,8 @@ def format_main_menu(
     today_losses: int,
     recent_events: list[Any],
     tz: ZoneInfo = _NY,
+    exchange: str | None = None,
+    network: str | None = None,
 ) -> str:
     """Build the condensed dashboard shown as the main menu.
 
@@ -403,8 +431,12 @@ def format_main_menu(
     else:
         cp_section = "📡 *Recent CP:* nothing yet"
 
+    badge_line = (
+        f"{format_exchange_badge(exchange, network)}\n" if exchange else ""
+    )
     return (
-        f"🧪 *Potion Perps* — Hey {_md_escape(display_name)}!\n\n"
+        f"🧪 *Potion Perps* — Hey {_md_escape(display_name)}!\n"
+        f"{badge_line}\n"
         f"{port_line}\n"
         f"{pipeline_text}  |  ⚡ Auto: {auto_text}  |  🎯 `{preset_name}`\n\n"
         f"{open_section}\n\n"
@@ -480,8 +512,11 @@ def format_calls_view(trades: list) -> str:
     return header + "\n\n" + "\n\n".join(cards)
 
 
-def format_trading_hub(balance: dict[str, str] | None, positions: list | None, open_trades: int = 0) -> str:
-    """Format the trading hub summary.
+def format_trading_hub(
+    balance: dict[str, str] | None, positions: list | None, open_trades: int = 0,
+    exchange: str | None = "hyperliquid",
+) -> str:
+    """Format the trading hub summary (exchange-aware balance, 6.12).
 
     On Hyperliquid under portfolio margin, free USDC sits in the spot
     clearinghouse and only gets pulled into the perp margin summary as
@@ -489,11 +524,15 @@ def format_trading_hub(balance: dict[str, str] | None, positions: list | None, o
     Trading screen look near-empty even when the user has substantial
     spot USDC — that's bug #9 from the 2026-05-25 CP soak ($1.49 perp
     margin shown while ~$649 USDC was sitting in spot). Show both,
-    labelled clearly.
+    labelled clearly. Blofin reports a single futures account, so we show
+    available + equity.
     """
     text = "📊 *Trading*\n\n"
 
-    if balance:
+    if balance and (exchange or "hyperliquid").lower() == "blofin":
+        text += f"💵 Available: {format_usd(balance.get('available', '0'))}\n"
+        text += f"📊 Equity: {format_usd(balance.get('equity', balance.get('total_equity', '0')))}\n"
+    elif balance:
         usdc = balance.get("usdc_balance", "0")
         perp_value = balance.get("account_value", "0")
         text += f"💵 USDC: {format_usd(usdc)}\n"

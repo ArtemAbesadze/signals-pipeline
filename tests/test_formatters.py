@@ -392,3 +392,56 @@ class TestFormatAuditTrail:
         # truncated to 77 + "..." = 80 chars max
         assert "..." in text
         assert long_action not in text
+
+
+class TestExchangeAwareFormatters:
+    """6.12 — exchange/network badge + exchange-aware balance read-back."""
+
+    def test_exchange_badge(self):
+        from src.telegram.formatters import format_exchange_badge
+        assert "Hyperliquid" in format_exchange_badge("hyperliquid", "testnet")
+        assert "Testnet" in format_exchange_badge("hyperliquid", "testnet")
+        assert "Mainnet" in format_exchange_badge("hyperliquid", "mainnet")
+        assert "Blofin" in format_exchange_badge("blofin", "testnet")
+        assert "Demo" in format_exchange_badge("blofin", "testnet")     # blofin testnet = Demo
+        assert "Mainnet" in format_exchange_badge("blofin", "mainnet")
+
+    def test_extract_wallet_usd(self):
+        from src.telegram.formatters import extract_wallet_usd
+        assert extract_wallet_usd({"usdc_balance": "649.0"}, "hyperliquid") == 649.0
+        assert extract_wallet_usd({"available": "500000.5"}, "blofin") == 500000.5
+        assert extract_wallet_usd({}, "blofin") == 0.0
+
+    def test_format_balance_blofin(self):
+        from src.telegram.formatters import format_balance
+        text = format_balance(
+            {"available": "500000", "equity": "499900", "frozen": "100"}, "blofin")
+        assert "Available" in text and "Equity" in text
+        assert "usdc" not in text.lower()  # no HL-only fields
+
+    def test_format_trading_hub_blofin(self):
+        text = format_trading_hub(
+            {"available": "500000", "equity": "499900"}, [], 0, exchange="blofin")
+        assert "Available" in text
+
+    def test_main_menu_includes_exchange_badge(self):
+        text = format_main_menu(
+            display_name="Artem",
+            port_state={"port_usd": 5000.0, "port_mode": "withdraw", "port_watermark": None},
+            wallet_usd=500000.0, pipeline_active=True, auto_execute=True,
+            preset_name="even_split", open_trades=[],
+            today_count_closed=0, today_total_pnl_pct=0.0, today_wins=0, today_losses=0,
+            recent_events=[], exchange="blofin", network="testnet",
+        )
+        assert "Blofin" in text and "Demo" in text
+
+    def test_main_menu_no_badge_when_exchange_absent(self):
+        text = format_main_menu(
+            display_name="Artem",
+            port_state={"port_usd": None, "port_mode": "withdraw", "port_watermark": None},
+            wallet_usd=None, pipeline_active=True, auto_execute=False,
+            preset_name="even_split", open_trades=[],
+            today_count_closed=0, today_total_pnl_pct=0.0, today_wins=0, today_losses=0,
+            recent_events=[],
+        )
+        assert "Blofin" not in text and "Hyperliquid" not in text

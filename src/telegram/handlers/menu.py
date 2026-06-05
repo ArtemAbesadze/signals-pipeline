@@ -20,6 +20,7 @@ from src.orchestrator import Orchestrator
 from src.state.models import EventType, TradeStatus
 from src.state.user_db import UserDatabase
 from src.telegram.formatters import (
+    extract_wallet_usd,
     format_calls_view,
     format_main_menu,
     format_stats,
@@ -155,13 +156,14 @@ def _build_main_menu_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> s
 
     client = _get_client(context, user_id)
     trade_db = _get_trade_db(context, user_id)
+    active_exchange, active_network = user_db.get_active_exchange_network(user_id)
 
     wallet_usd: float | None = None
     positions_by_coin: dict = {}
     if client is not None:
         try:
             bal = client.get_balance()
-            wallet_usd = float(bal.get("usdc_balance", 0))
+            wallet_usd = extract_wallet_usd(bal, active_exchange)
         except Exception:
             logger.exception("Failed to fetch wallet for user %s", user_id)
         try:
@@ -226,6 +228,8 @@ def _build_main_menu_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> s
         today_losses=today_losses,
         recent_events=recent_events,
         tz=_LOCAL_TZ,
+        exchange=active_exchange,
+        network=active_network,
     )
 
 
@@ -277,6 +281,7 @@ def _build_calls_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> tuple
 def _build_trading_hub_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> str:
     client = _get_client(context, user_id)
     trade_db = _get_trade_db(context, user_id)
+    active_exchange, _ = _get_user_db(context).get_active_exchange_network(user_id)
 
     balance = None
     positions = None
@@ -295,7 +300,7 @@ def _build_trading_hub_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) ->
         except Exception:
             pass
 
-    return format_trading_hub(balance, positions, open_trades)
+    return format_trading_hub(balance, positions, open_trades, exchange=active_exchange)
 
 
 def _build_stats_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> str:
