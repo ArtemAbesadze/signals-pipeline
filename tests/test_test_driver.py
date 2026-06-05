@@ -610,3 +610,44 @@ class TestDotenvValue:
         env = tmp_path / ".env"
         env.write_text('# BLOFIN_API_KEY=commented\nBLOFIN_API_KEY="quoted"\n')
         assert _dotenv_value("BLOFIN_API_KEY", env) == "quoted"
+
+
+class TestHttpUserAgent:
+    """Blofin's demo WAF 403s the default Python-urllib UA (2026-06-05). Both
+    HTTP helpers must send a non-urllib User-Agent."""
+
+    def test_get_sets_user_agent(self):
+        import scripts.test_driver as td
+
+        captured = {}
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b"{}"
+
+        def fake_urlopen(req, timeout=None):
+            captured["ua"] = req.get_header("User-agent")
+            return _Resp()
+
+        with patch("scripts.test_driver.urllib.request.urlopen", fake_urlopen):
+            td._http_get_json("https://example.com/x")
+        assert captured["ua"] and "urllib" not in captured["ua"].lower()
+
+    def test_post_sets_user_agent(self):
+        import scripts.test_driver as td
+
+        captured = {}
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b"{}"
+
+        def fake_urlopen(req, timeout=None):
+            captured["ua"] = req.get_header("User-agent")
+            return _Resp()
+
+        with patch("scripts.test_driver.urllib.request.urlopen", fake_urlopen):
+            td._http_post_json("https://example.com/x", {"a": 1})
+        assert captured["ua"] and "urllib" not in captured["ua"].lower()

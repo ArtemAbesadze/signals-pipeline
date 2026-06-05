@@ -376,17 +376,22 @@ def fetch_hl_mids(network: str) -> dict[str, float]:
     return {k: float(v) for k, v in raw.items()}
 
 
+# Blofin's demo host WAF returns 403 to the default ``Python-urllib/x.y`` UA
+# (confirmed 2026-06-05). Any real UA passes; the /market endpoints are public.
+# requests (used by BlofinClient) is unaffected — only these raw urllib helpers.
+_HTTP_UA = "potion-perps-bot/1.0"
+_HTTP_HEADERS = {"Content-Type": "application/json", "User-Agent": _HTTP_UA}
+
+
 def _http_post_json(url: str, payload: dict) -> Any:
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}
-    )
+    req = urllib.request.Request(url, data=data, headers=dict(_HTTP_HEADERS))
     with urllib.request.urlopen(req, timeout=10) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
 def _http_get_json(url: str) -> Any:
-    req = urllib.request.Request(url, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(url, headers=dict(_HTTP_HEADERS))
     with urllib.request.urlopen(req, timeout=10) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
