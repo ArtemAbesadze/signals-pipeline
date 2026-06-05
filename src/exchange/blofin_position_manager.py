@@ -154,7 +154,23 @@ class BlofinPositionManager:
             self._client.set_leverage(inst, trade_set.leverage, trade_set.margin_mode)
             logger.info("Set leverage: %s %dx %s", inst, trade_set.leverage, trade_set.margin_mode)
         except Exception as e:
-            raise OrderSubmissionError(f"Failed to set leverage: {e}") from e
+            # Blofin refuses a leverage change while the instrument already has
+            # an open position / pending orders ("You have pending cross orders.
+            # Please cancel them before adjusting your leverage."). That happens
+            # when a prior trade on the same coin is still live (or the user
+            # holds a pre-existing position). Aborting the whole trade would
+            # mean silently dropping the signal — worse than trading at the
+            # leverage currently set on the instrument. So we log loudly (the
+            # leverage may differ from the signal — captured for the audit) and
+            # proceed. The 2026-06-05 demo soak surfaced this on overlapping
+            # same-coin trades. Other set-leverage failures fall into the same
+            # best-effort path; if the venue is truly unusable the entry below
+            # will fail and raise its own OrderSubmissionError.
+            logger.warning(
+                "Could not set leverage for %s to %dx (%s) — proceeding at the "
+                "leverage currently set on the instrument",
+                inst, trade_set.leverage, e,
+            )
 
         # --- Entry (regular order) ---
         e = trade_set.entry

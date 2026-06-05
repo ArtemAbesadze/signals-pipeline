@@ -105,6 +105,21 @@ class TestSubmit:
         assert sl_call["sl_trigger_price"] is not None
         assert sl_call["tp_trigger_price"] is None
 
+    def test_leverage_failure_does_not_abort_trade(self, pm, db, client):
+        # Blofin rejects a leverage change while the instrument has open
+        # orders/position; the trade must still place (at current leverage),
+        # not be dropped. Surfaced by the 2026-06-05 soak (POL/WIF collisions).
+        ts = _seed_trade(db)
+        client.set_leverage.side_effect = Exception(
+            "You have pending cross orders. Please cancel them before adjusting "
+            "your leverage."
+        )
+        assert pm.submit_trade(ts) is True
+        client.place_order.assert_called_once()        # entry still placed
+        assert client.place_tpsl.call_count == 4       # SL + 3 TPs still placed
+        orders = {o.order_type: o for o in db.get_orders_for_trade(7000001)}
+        assert orders[OrderType.ENTRY].oid == "O1"
+
     def test_entry_rejected_raises(self, pm, db, client):
         ts = _seed_trade(db)
         client.place_order.return_value = {"code": "0", "data": [

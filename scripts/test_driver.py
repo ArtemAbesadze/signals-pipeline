@@ -636,6 +636,23 @@ def generate_start_times(
     return [step * i for i in range(num_trades)]
 
 
+def select_coins(
+    rng: random.Random,
+    pool: list[tuple[str, str]],
+    num: int,
+) -> list[tuple[str, str]]:
+    """Pick *num* ``(pair_base, resolved)`` coins, distinct when the pool is
+    large enough. Two trades on the SAME instId collide on Blofin — the
+    second's ``set_leverage`` is rejected while the first still holds the
+    instrument ("pending cross orders"), and in net_mode their positions net
+    together. Sampling without replacement avoids the self-collision
+    (the 2026-06-05 soak hit it on POL/WIF). Falls back to repeats only when
+    more trades than coins are requested."""
+    if num <= len(pool):
+        return rng.sample(pool, num)
+    return [rng.choice(pool) for _ in range(num)]
+
+
 def assign_scenarios(
     rng: random.Random,
     scenario_names: list[str],
@@ -968,9 +985,11 @@ async def run_test(config: dict, db_path: Path, dry_run: bool) -> None:
     next_id = get_next_test_trade_id(db_path)
     logger.info("Starting trade_id at %d", next_id)
 
+    chosen_coins = select_coins(rng, pool, num)
+
     plans: list[TradePlan] = []
     for i in range(num):
-        pair_base, resolved = rng.choice(pool)
+        pair_base, resolved = chosen_coins[i]
         side = _weighted_choice(rng, side_dist)
         risk = _weighted_choice(rng, risk_dist)
         entry = float(mids[resolved])

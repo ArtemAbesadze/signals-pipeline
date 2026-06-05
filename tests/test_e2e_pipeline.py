@@ -269,6 +269,49 @@ class TestPipelineExchangeDispatch:
         assert order.fill_price_source == "cp_estimate"
 
 
+class TestTerminalStateGuard:
+    """Lifecycle handlers must not resurrect a CANCELED/CLOSED trade.
+
+    CP keeps emitting a trade's events after we've rejected or closed it; a
+    late/duplicate stop_hit/tp_hit/all_tp_hit must NOT flip the trade back to
+    CLOSED or apply phantom PnL. Surfaced by the 2026-06-05 soak (a
+    leverage-rejected trade was flipped canceled→closed −50%)."""
+
+    def _seed_canceled(self, db, trade_id=7000001):
+        from src.state.models import TradeRecord, TradeStatus
+        db.create_trade(TradeRecord(
+            trade_id=trade_id, user_id=db.user_id, pair="BTC/USDT", coin="BTC",
+            side="SHORT", risk_level="HIGH", trade_type="SWING", size_hint="1-4%",
+            entry_price=50000, stop_loss=51000, tp1=49000, tp2=48000, tp3=47000,
+            leverage=25, signal_leverage=25, position_size_usd=50.0,
+            position_size_coin=0.0,
+        ))
+        db.update_trade_status(trade_id, TradeStatus.CANCELED, close_reason="submission_failed")
+
+    def test_stop_hit_ignored_on_canceled_trade(self, pipeline, db):
+        from src.state.models import TradeStatus
+        self._seed_canceled(db, 7000001)
+        pipeline.process_message(
+            "STOP TARGET HIT\n\nPAIR: BTC/USDT #7000001\n\nLOSS: -50.00%"
+        )
+        trade = db.get_trade(7000001)
+        assert trade.status == TradeStatus.CANCELED   # NOT resurrected to CLOSED
+        assert trade.pnl_pct is None                   # no phantom PnL applied
+        events = db.get_events_for_trade(7000001)
+        assert any("ignored" in (e.action_taken or "") for e in events)
+
+    def test_all_tp_hit_ignored_on_canceled_trade(self, pipeline, db):
+        from src.state.models import TradeStatus
+        self._seed_canceled(db, 7000002)
+        pipeline.process_message(
+            "**🔥ALL TAKE-PROFIT TARGETS HIT**\n\n**📝PAIR:** BTC/USDT #7000002\n\n"
+            "**💰PROFIT:** 29.17% 📈\n**⏳PERIOD:** 1 Hours 2 Minutes"
+        )
+        trade = db.get_trade(7000002)
+        assert trade.status == TradeStatus.CANCELED
+        assert trade.pnl_pct is None
+
+
 # ====================================================================
 # Full signal lifecycle
 # ====================================================================

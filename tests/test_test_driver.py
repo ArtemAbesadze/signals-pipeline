@@ -56,6 +56,7 @@ from scripts.test_driver import (
     render_event,
     render_signal_alert,
     sample_timing,
+    select_coins,
 )
 from src.parser.classifier import MessageType, classify
 from src.parser.signal_parser import parse_signal
@@ -651,3 +652,25 @@ class TestHttpUserAgent:
         with patch("scripts.test_driver.urllib.request.urlopen", fake_urlopen):
             td._http_post_json("https://example.com/x", {"a": 1})
         assert captured["ua"] and "urllib" not in captured["ua"].lower()
+
+
+class TestSelectCoins:
+    """Distinct coins per run avoid the Blofin same-instId set_leverage
+    collision (2026-06-05 soak hit it on POL/WIF)."""
+
+    POOL = [(f"C{i}", f"C{i}-USDT") for i in range(8)]
+
+    def test_distinct_when_pool_large_enough(self):
+        chosen = select_coins(random.Random(1), self.POOL, 5)
+        assert len(chosen) == 5
+        assert len(set(chosen)) == 5            # all distinct
+        assert all(c in self.POOL for c in chosen)
+
+    def test_falls_back_to_repeats_when_more_trades_than_coins(self):
+        chosen = select_coins(random.Random(1), self.POOL, 12)
+        assert len(chosen) == 12                 # repeats allowed, never crashes
+
+    def test_deterministic_with_seed(self):
+        a = select_coins(random.Random(7), self.POOL, 5)
+        b = select_coins(random.Random(7), self.POOL, 5)
+        assert a == b

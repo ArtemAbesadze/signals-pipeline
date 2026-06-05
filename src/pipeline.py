@@ -556,6 +556,17 @@ class Pipeline:
             )
             return
 
+        if self._is_terminal(trade):
+            self._record_event(
+                trade_id=tp.trade_id, event_type=EventType.TP_HIT, raw_text=raw,
+                action_taken=f"TP{tp.tp_number} hit ignored — trade already {trade.status.value}",
+            )
+            logger.info(
+                "TP%d hit for #%d but trade already %s — ignoring",
+                tp.tp_number, tp.trade_id, trade.status.value,
+            )
+            return
+
         logger.info("TP%d hit for trade #%d %s (+%.2f%%)", tp.tp_number, tp.trade_id, tp.pair, tp.profit_pct)
 
         # Reconcile our local orders table — CP just told us this TP
@@ -607,6 +618,17 @@ class Pipeline:
                 event_type=EventType.TRADE_CLOSED,
                 raw_text=raw,
                 action_taken=f"all TPs hit at {atp.profit_pct:+.2f}% but trade is unknown locally",
+            )
+            return
+
+        if self._is_terminal(trade):
+            self._record_event(
+                trade_id=atp.trade_id, event_type=EventType.TRADE_CLOSED, raw_text=raw,
+                action_taken=f"all TPs hit ignored — trade already {trade.status.value}",
+            )
+            logger.info(
+                "All TPs hit for #%d but trade already %s — ignoring",
+                atp.trade_id, trade.status.value,
             )
             return
 
@@ -691,6 +713,17 @@ class Pipeline:
                 event_type=EventType.STOP_HIT,
                 raw_text=raw,
                 action_taken=f"stop hit at {sh.loss_pct:+.2f}% but trade is unknown locally",
+            )
+            return
+
+        if self._is_terminal(trade):
+            self._record_event(
+                trade_id=sh.trade_id, event_type=EventType.STOP_HIT, raw_text=raw,
+                action_taken=f"stop hit ignored — trade already {trade.status.value}",
+            )
+            logger.info(
+                "Stop hit for #%d but trade already %s — ignoring",
+                sh.trade_id, trade.status.value,
             )
             return
 
@@ -964,6 +997,19 @@ class Pipeline:
     def _handle_noise(self, raw: str) -> None:
         """Noise — ignore."""
         logger.debug("Noise message ignored")
+
+    def _is_terminal(self, trade) -> bool:
+        """True if the trade is in a terminal state (CANCELED / CLOSED).
+
+        Lifecycle handlers that mutate state + apply PnL (tp_hit, all_tp_hit,
+        stop_hit) skip terminal trades: CP keeps emitting a trade's events even
+        after we've rejected (submission_failed → CANCELED) or closed it, and
+        without this guard a late/duplicate event would resurrect a canceled
+        trade to CLOSED and apply phantom PnL — wrongly debiting a
+        compound/watermark port. Surfaced by the 2026-06-05 demo soak: a
+        leverage-rejected trade (#7000003, 0 orders) was flipped
+        canceled→closed −50% by its synthetic stop_hit."""
+        return trade.status in (TradeStatus.CANCELED, TradeStatus.CLOSED)
 
     # ------------------------------------------------------------------
     # Helpers
