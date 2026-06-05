@@ -1088,6 +1088,25 @@ def _load_dotenv() -> None:
         os.environ.setdefault(key, val)
 
 
+def _dotenv_value(key: str, env_path: Path | None = None) -> str | None:
+    """Read *key* directly from the .env FILE (first match), ignoring the
+    process environment. Used for demo creds so the file is authoritative —
+    a stale ``export BLOFIN_API_KEY=...`` in the shell can't shadow the demo
+    key the way ``_load_dotenv``'s setdefault would (cost us a debugging
+    round on 2026-06-05)."""
+    env_path = env_path or (_REPO_ROOT / ".env")
+    if not env_path.exists():
+        return None
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        if k.strip() == key:
+            return v.strip().strip('"').strip("'")
+    return None
+
+
 def _read_telethon_config() -> dict:
     """Pull TG_API_ID/TG_API_HASH/TG_PHONE/TG_SESSION_FILE from .env or env.
 
@@ -1172,10 +1191,11 @@ def top_up_demo(amount: str = "10000") -> None:
     """
     from src.exchange.blofin import BlofinClient
 
-    _load_dotenv()
-    key = os.environ.get("BLOFIN_API_KEY")
-    secret = os.environ.get("BLOFIN_API_SECRET")
-    passphrase = os.environ.get("BLOFIN_PASSPHRASE")
+    # .env is authoritative for demo creds (file wins over a shell shadow);
+    # fall back to the environment only if the file lacks the key.
+    key = _dotenv_value("BLOFIN_API_KEY") or os.environ.get("BLOFIN_API_KEY")
+    secret = _dotenv_value("BLOFIN_API_SECRET") or os.environ.get("BLOFIN_API_SECRET")
+    passphrase = _dotenv_value("BLOFIN_PASSPHRASE") or os.environ.get("BLOFIN_PASSPHRASE")
     if not (key and secret and passphrase):
         raise SystemExit(
             "top-up-demo: set BLOFIN_API_KEY / BLOFIN_API_SECRET / "

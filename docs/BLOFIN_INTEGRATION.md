@@ -118,15 +118,24 @@ row is (Phase 6.5).
 ### Demo environment facts
 
 - **Production API keys do NOT work on demo** (`152401 "Access key does not
-  exist"`) — demo needs its own key created in the demo environment.
+  exist"`) — demo needs its own key created in the demo environment. **Watch
+  for env shadowing**: a stale `export BLOFIN_API_KEY=<prod>` in the shell will
+  silently override `.env` (the loaders use `setdefault`), and the demo host
+  returns the same `152401`. The demo scripts now read `BLOFIN_*` straight from
+  the `.env` FILE (`_dotenv_value`) so the file wins — confirmed 2026-06-05
+  after this exact mix-up (`027551…` prod key shadowed the `f218a0…` demo key).
 - Demo account is **pre-funded (~500k USDT)**, in `cross` + `net_mode` by
-  default. `frozen` rises when an order rests (real margin behavior).
+  default. `frozen` rises when an order rests (real margin behavior). Balance
+  read (`get_balance`) against demo confirmed: `available≈499,999.99 USDT`.
 
 ### Still TBD (non-blocking — banked for later)
 
-- `demo-apply-money` body: returns `"Parameter toAccount cannot be empty"` —
-  the documented `{adjustType, demoApplyMoney[]}` shape is missing a
-  `toAccount` field. Demo is pre-funded so top-up isn't needed yet.
+- `demo-apply-money` body: returns `"Parameter toAccount cannot be empty"`.
+  2026-06-05 probe (`test_driver.py --top-up-demo`): setting `toAccount` at the
+  TOP level is *still* rejected, so it most likely belongs **inside each
+  `demoApplyMoney` item** — `BlofinClient.demo_apply_money` now places it there
+  and the probe matrix needs a re-run with valid `toAccount` values to confirm.
+  Demo is pre-funded so top-up isn't needed; banked.
 - Batch orders (`batch-orders`) not yet exercised — sequential single
   submits are fine for our cadence; batch is a rate-limit optimization for
   later (§ 15). Native TP/SL is fully confirmed (`order-tpsl` /

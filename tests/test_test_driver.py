@@ -39,6 +39,7 @@ from scripts.test_driver import (
     TradePlan,
     _all_tp_profit_pct,
     _cancel_user_orders,
+    _dotenv_value,
     _format_price,
     _list_test_orders_with_oid,
     _stop_loss_pct,
@@ -585,3 +586,27 @@ class TestCancelDispatch:
                 "hyperliquid", creds, [("1", "BTC", "entry")],
             )
         assert (canceled, errors) == (0, 1)
+
+
+class TestDotenvValue:
+    """`.env` file is authoritative for demo creds — a shell shadow can't win
+    (regression for the 2026-06-05 wrong-key debugging round)."""
+
+    def test_reads_value_from_file(self, tmp_path):
+        env = tmp_path / ".env"
+        env.write_text("# c\nBLOFIN_API_KEY=f218a0a8\nTG_PHONE=+100\n")
+        assert _dotenv_value("BLOFIN_API_KEY", env) == "f218a0a8"
+        assert _dotenv_value("TG_PHONE", env) == "+100"
+
+    def test_missing_key_returns_none(self, tmp_path):
+        env = tmp_path / ".env"
+        env.write_text("OTHER=1\n")
+        assert _dotenv_value("BLOFIN_API_KEY", env) is None
+
+    def test_missing_file_returns_none(self, tmp_path):
+        assert _dotenv_value("BLOFIN_API_KEY", tmp_path / "nope.env") is None
+
+    def test_ignores_comments_and_strips_quotes(self, tmp_path):
+        env = tmp_path / ".env"
+        env.write_text('# BLOFIN_API_KEY=commented\nBLOFIN_API_KEY="quoted"\n')
+        assert _dotenv_value("BLOFIN_API_KEY", env) == "quoted"

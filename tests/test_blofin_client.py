@@ -251,6 +251,19 @@ class TestWrites:
         body = json.loads(client._session.request.call_args[1]["data"])
         assert "price" not in body
 
+    def test_demo_apply_money_puts_to_account_inside_item(self, client):
+        # 2026-06-05 probe: toAccount at the top level is rejected, so it goes
+        # inside each demoApplyMoney item. Returns raw (not _checked).
+        client._session.request.return_value = _resp({"code": "0", "data": {}})
+        client.demo_apply_money(amount="1000", currency="USDT",
+                                adjust_type="1", to_account="futures")
+        body = json.loads(client._session.request.call_args[1]["data"])
+        assert "demo-apply-money" in client._session.request.call_args[0][1]
+        assert body["adjustType"] == "1"
+        item = body["demoApplyMoney"][0]
+        assert item == {"currency": "USDT", "amountStr": "1000", "toAccount": "futures"}
+        assert "toAccount" not in body  # not at the top level
+
     def test_place_reduce_only_tp(self, client):
         client._session.request.return_value = _resp(ORDER_OK)
         client.place_order(

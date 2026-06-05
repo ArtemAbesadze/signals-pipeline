@@ -48,24 +48,29 @@ DEFAULT_USER_ID = "blofin_demo"
 DEFAULT_PORT_USD = 5000.0
 
 
-def _load_dotenv() -> None:
-    """Populate os.environ from .env if not already set. Idempotent."""
-    env_path = _REPO_ROOT / ".env"
+def _dotenv_value(key: str, env_path: Path | None = None) -> str | None:
+    """Read *key* directly from the .env FILE (first match), ignoring the
+    process environment, so the file is authoritative for demo creds. A stale
+    ``export BLOFIN_API_KEY=...`` in the shell can't shadow the demo key here
+    (that bit us on 2026-06-05 — see test_driver._dotenv_value)."""
+    env_path = env_path or (_REPO_ROOT / ".env")
     if not env_path.exists():
-        return
+        return None
     for line in env_path.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
-        key, _, val = line.partition("=")
-        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+        k, _, v = line.partition("=")
+        if k.strip() == key:
+            return v.strip().strip('"').strip("'")
+    return None
 
 
 def _demo_creds() -> dict[str, str]:
-    _load_dotenv()
-    key = os.environ.get("BLOFIN_API_KEY")
-    secret = os.environ.get("BLOFIN_API_SECRET")
-    passphrase = os.environ.get("BLOFIN_PASSPHRASE")
+    # .env is authoritative; fall back to the environment only if absent there.
+    key = _dotenv_value("BLOFIN_API_KEY") or os.environ.get("BLOFIN_API_KEY")
+    secret = _dotenv_value("BLOFIN_API_SECRET") or os.environ.get("BLOFIN_API_SECRET")
+    passphrase = _dotenv_value("BLOFIN_PASSPHRASE") or os.environ.get("BLOFIN_PASSPHRASE")
     if not (key and secret and passphrase):
         raise SystemExit(
             "Missing demo creds — set BLOFIN_API_KEY / BLOFIN_API_SECRET / "
