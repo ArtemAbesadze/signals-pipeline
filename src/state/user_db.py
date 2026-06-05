@@ -32,25 +32,32 @@ def _now() -> str:
 
 _USERS_DDL = """\
 CREATE TABLE IF NOT EXISTS users (
-    user_id       TEXT PRIMARY KEY,
-    display_name  TEXT NOT NULL,
-    status        TEXT NOT NULL DEFAULT 'active',
-    created_at    TEXT NOT NULL,
-    updated_at    TEXT NOT NULL
+    user_id         TEXT PRIMARY KEY,
+    display_name    TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'active',
+    active_exchange TEXT,                 -- which credential combo is live (6.12)
+    active_network  TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
 );
 """
 
+# 6.12: credentials are stored per (exchange, network) so a user can keep e.g.
+# HL-testnet AND Blofin-demo creds and switch between them without re-entering.
+# The ACTIVE combo (users.active_exchange/active_network) is what the pipeline
+# uses. Blofin demo/mainnet keys differ → each (exchange, network) is its own row.
 _USER_CREDENTIALS_DDL = """\
 CREATE TABLE IF NOT EXISTS user_credentials (
-    user_id             TEXT PRIMARY KEY REFERENCES users(user_id),
+    user_id             TEXT NOT NULL REFERENCES users(user_id),
+    exchange            TEXT NOT NULL DEFAULT 'hyperliquid',
+    network             TEXT NOT NULL DEFAULT 'testnet',
     account_address_enc TEXT NOT NULL,
     api_wallet_enc      TEXT NOT NULL,
     api_secret_enc      TEXT NOT NULL,
-    network             TEXT NOT NULL DEFAULT 'testnet',
-    exchange            TEXT NOT NULL DEFAULT 'hyperliquid',
     passphrase_enc      TEXT,
     created_at          TEXT NOT NULL,
-    updated_at          TEXT NOT NULL
+    updated_at          TEXT NOT NULL,
+    PRIMARY KEY (user_id, exchange, network)
 );
 """
 
@@ -133,7 +140,9 @@ class UserDatabase:
             self._conn.execute(_TELEGRAM_ADMINS_DDL)
             self._migrate_user_config()
             self._migrate_drop_saas_columns()
+            self._migrate_users_active_pointer()
             self._migrate_user_credentials()
+            self._migrate_user_credentials_to_composite()
 
     # ------------------------------------------------------------------
     # User CRUD
@@ -163,28 +172,31 @@ class UserDatabase:
         now = _now()
         config = config or {}
         passphrase = credentials.get("passphrase")
+        exchange = credentials.get("exchange", "hyperliquid")
+        network = credentials.get("network", "testnet")
 
         with self._conn:
-            # Insert user
+            # Insert user with the active-combo pointer (6.12)
             self._conn.execute(
-                "INSERT INTO users (user_id, display_name, status, created_at, updated_at) "
-                "VALUES (?, ?, 'active', ?, ?)",
-                (user_id, display_name, now, now),
+                "INSERT INTO users (user_id, display_name, status, "
+                "active_exchange, active_network, created_at, updated_at) "
+                "VALUES (?, ?, 'active', ?, ?, ?, ?)",
+                (user_id, display_name, exchange, network, now, now),
             )
 
-            # Insert encrypted credentials
+            # Insert encrypted credentials for this (exchange, network) combo
             self._conn.execute(
                 "INSERT INTO user_credentials "
-                "(user_id, account_address_enc, api_wallet_enc, api_secret_enc, "
-                "network, exchange, passphrase_enc, created_at, updated_at) "
+                "(user_id, exchange, network, account_address_enc, api_wallet_enc, "
+                "api_secret_enc, passphrase_enc, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     user_id,
+                    exchange,
+                    network,
                     encrypt(credentials["account_address"]),
                     encrypt(credentials["api_wallet"]),
                     encrypt(credentials["api_secret"]),
-                    credentials.get("network", "testnet"),
-                    credentials.get("exchange", "hyperliquid"),
                     encrypt(passphrase) if passphrase else None,
                     now,
                     now,
@@ -281,56 +293,143 @@ class UserDatabase:
     # Credentials
     # ------------------------------------------------------------------
 
-    def get_user_credentials_decrypted(self, user_id: str) -> dict[str, str] | None:
-        """Decrypt and return user credentials."""
+    # --- Active-combo pointer (6.12) ------------------------------------
+
+    def get_active_exchange_network(self, user_id: str) -> tuple[str, str]:
+        """Return the user's active ``(exchange, network)``. Falls back to
+        ('hyperliquid', 'testnet') if the pointer is unset."""
         row = self._conn.execute(
-            "SELECT * FROM user_credentials WHERE user_id = ?", (user_id,)
+            "SELECT active_exchange, active_network FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if not row or not row["active_exchange"]:
+            return ("hyperliquid", "testnet")
+        return (row["active_exchange"], row["active_network"] or "testnet")
+
+    def set_active_exchange_network(self, user_id: str, exchange: str, network: str) -> None:
+        """Point the user at a different credential combo. The combo's creds
+        must already exist (see ``has_credentials`` / ``save_credentials``)."""
+        with self._conn:
+            self._conn.execute(
+                "UPDATE users SET active_exchange = ?, active_network = ?, "
+                "updated_at = ? WHERE user_id = ?",
+                (exchange, network, _now(), user_id),
+            )
+        logger.info("User %s active combo → %s/%s", user_id, exchange, network)
+
+    def has_credentials(self, user_id: str, exchange: str, network: str) -> bool:
+        """True if saved credentials exist for this (exchange, network) combo."""
+        row = self._conn.execute(
+            "SELECT 1 FROM user_credentials WHERE user_id = ? AND exchange = ? AND network = ?",
+            (user_id, exchange, network),
+        ).fetchone()
+        return row is not None
+
+    def list_credential_combos(self, user_id: str) -> list[tuple[str, str]]:
+        """List the (exchange, network) combos this user has saved creds for."""
+        rows = self._conn.execute(
+            "SELECT exchange, network FROM user_credentials WHERE user_id = ? "
+            "ORDER BY exchange, network",
+            (user_id,),
+        ).fetchall()
+        return [(r["exchange"], r["network"]) for r in rows]
+
+    def save_credentials(
+        self, user_id: str, exchange: str, network: str, *,
+        account_address: str, api_secret: str,
+        api_wallet: str = "", passphrase: str = "",
+    ) -> None:
+        """UPSERT credentials for a (exchange, network) combo (encrypted).
+        Does NOT change the active pointer — call ``set_active_exchange_network``
+        to switch. ``api_wallet`` is HL-only; ``passphrase`` Blofin-only."""
+        now = _now()
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO user_credentials "
+                "(user_id, exchange, network, account_address_enc, api_wallet_enc, "
+                "api_secret_enc, passphrase_enc, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(user_id, exchange, network) DO UPDATE SET "
+                "account_address_enc = excluded.account_address_enc, "
+                "api_wallet_enc = excluded.api_wallet_enc, "
+                "api_secret_enc = excluded.api_secret_enc, "
+                "passphrase_enc = excluded.passphrase_enc, "
+                "updated_at = excluded.updated_at",
+                (
+                    user_id, exchange, network,
+                    encrypt(account_address), encrypt(api_wallet), encrypt(api_secret),
+                    encrypt(passphrase) if passphrase else None, now, now,
+                ),
+            )
+        logger.info("Saved credentials for user %s combo %s/%s", user_id, exchange, network)
+
+    # --- Decrypt / update ----------------------------------------------
+
+    def get_user_credentials_decrypted(
+        self, user_id: str, exchange: str | None = None, network: str | None = None,
+    ) -> dict[str, str] | None:
+        """Decrypt and return credentials for a combo. Defaults to the user's
+        ACTIVE (exchange, network) so existing callers are unchanged."""
+        if exchange is None or network is None:
+            a_ex, a_net = self.get_active_exchange_network(user_id)
+            exchange = exchange or a_ex
+            network = network or a_net
+        row = self._conn.execute(
+            "SELECT * FROM user_credentials WHERE user_id = ? AND exchange = ? AND network = ?",
+            (user_id, exchange, network),
         ).fetchone()
         if not row:
             return None
-        keys = row.keys()
-        passphrase_enc = row["passphrase_enc"] if "passphrase_enc" in keys else None
+        passphrase_enc = row["passphrase_enc"]
         return {
             "account_address": decrypt(row["account_address_enc"]),
             "api_wallet": decrypt(row["api_wallet_enc"]),
             "api_secret": decrypt(row["api_secret_enc"]),
             "network": row["network"],
-            "exchange": row["exchange"] if "exchange" in keys else "hyperliquid",
+            "exchange": row["exchange"],
             "passphrase": decrypt(passphrase_enc) if passphrase_enc else "",
         }
 
     def update_user_credentials(self, user_id: str, **kwargs: str) -> None:
-        """Update specific credential fields. Values are encrypted before storage."""
-        now = _now()
-        updates = []
-        params: list[Any] = []
+        """Update credential fields for a combo (back-compat shim over the
+        per-combo model).
 
-        enc_fields = {"account_address": "account_address_enc",
-                       "api_wallet": "api_wallet_enc",
-                       "api_secret": "api_secret_enc",
-                       "passphrase": "passphrase_enc"}
+        - With only cred fields (account_address / api_wallet / api_secret /
+          passphrase): updates the ACTIVE combo in place.
+        - With ``exchange`` and/or ``network``: targets that combo — if it
+          differs from the active one, the active combo's creds are copied
+          forward (with the given overrides), UPSERTed under the target combo,
+          and the active pointer is moved there. This preserves the old
+          "flip network/exchange" behaviour (e.g. /promote_to_mainnet) on top
+          of per-combo storage.
+        """
+        a_ex, a_net = self.get_active_exchange_network(user_id)
+        target_ex = kwargs.get("exchange", a_ex)
+        target_net = kwargs.get("network", a_net)
+        cred_keys = ("account_address", "api_wallet", "api_secret", "passphrase")
 
-        for key, value in kwargs.items():
-            if key in enc_fields:
-                updates.append(f"{enc_fields[key]} = ?")
-                params.append(encrypt(value))
-            elif key in ("network", "exchange"):
-                updates.append(f"{key} = ?")
-                params.append(value)
-
-        if not updates:
+        if (target_ex, target_net) == (a_ex, a_net):
+            # In-place update of the active combo.
+            existing = self.get_user_credentials_decrypted(user_id, a_ex, a_net) or {}
+            self.save_credentials(
+                user_id, a_ex, a_net,
+                account_address=kwargs.get("account_address", existing.get("account_address", "")),
+                api_wallet=kwargs.get("api_wallet", existing.get("api_wallet", "")),
+                api_secret=kwargs.get("api_secret", existing.get("api_secret", "")),
+                passphrase=kwargs.get("passphrase", existing.get("passphrase", "")),
+            )
             return
 
-        updates.append("updated_at = ?")
-        params.append(now)
-        params.append(user_id)
-
-        with self._conn:
-            self._conn.execute(
-                f"UPDATE user_credentials SET {', '.join(updates)} WHERE user_id = ?",
-                params,
-            )
-        logger.info("Updated credentials for user %s", user_id)
+        # Combo change: copy active creds forward with overrides, then switch.
+        base = self.get_user_credentials_decrypted(user_id, a_ex, a_net) or {}
+        self.save_credentials(
+            user_id, target_ex, target_net,
+            account_address=kwargs.get("account_address", base.get("account_address", "")),
+            api_wallet=kwargs.get("api_wallet", base.get("api_wallet", "")),
+            api_secret=kwargs.get("api_secret", base.get("api_secret", "")),
+            passphrase=kwargs.get("passphrase", base.get("passphrase", "")),
+        )
+        self.set_active_exchange_network(user_id, target_ex, target_net)
 
     # ------------------------------------------------------------------
     # Config
@@ -647,6 +746,62 @@ class UserDatabase:
             if col not in existing:
                 self._conn.execute(sql)
                 logger.info("Migrated user_credentials: added column %s", col)
+
+    def _migrate_users_active_pointer(self) -> None:
+        """Add active_exchange/active_network to ``users`` (6.12). They point at
+        the live credential combo. Idempotent ALTER-if-missing."""
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(users)")}
+        for col in ("active_exchange", "active_network"):
+            if col not in existing:
+                self._conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
+                logger.info("Migrated users: added column %s", col)
+
+    def _migrate_user_credentials_to_composite(self) -> None:
+        """Rebuild ``user_credentials`` from single-row-per-user (PK=user_id) to
+        per-combo (PK=user_id, exchange, network) — 6.12. SQLite can't change a
+        PK in place, so we rebuild. Each existing row becomes that user's one
+        combo and is set as their active pointer. Idempotent: returns early once
+        ``exchange`` is part of the PK.
+        """
+        cols = self._conn.execute("PRAGMA table_info(user_credentials)").fetchall()
+        # PRAGMA columns: (cid, name, type, notnull, dflt_value, pk)
+        if any(c[1] == "exchange" and c[5] > 0 for c in cols):
+            return  # already composite
+        logger.info("Migrating user_credentials → composite PK (user_id, exchange, network)")
+        self._conn.execute("""
+            CREATE TABLE user_credentials_new (
+                user_id             TEXT NOT NULL REFERENCES users(user_id),
+                exchange            TEXT NOT NULL DEFAULT 'hyperliquid',
+                network             TEXT NOT NULL DEFAULT 'testnet',
+                account_address_enc TEXT NOT NULL,
+                api_wallet_enc      TEXT NOT NULL,
+                api_secret_enc      TEXT NOT NULL,
+                passphrase_enc      TEXT,
+                created_at          TEXT NOT NULL,
+                updated_at          TEXT NOT NULL,
+                PRIMARY KEY (user_id, exchange, network)
+            )
+        """)
+        self._conn.execute("""
+            INSERT INTO user_credentials_new
+                (user_id, exchange, network, account_address_enc, api_wallet_enc,
+                 api_secret_enc, passphrase_enc, created_at, updated_at)
+            SELECT user_id, COALESCE(exchange, 'hyperliquid'),
+                   COALESCE(network, 'testnet'), account_address_enc,
+                   api_wallet_enc, api_secret_enc, passphrase_enc,
+                   created_at, updated_at
+            FROM user_credentials
+        """)
+        self._conn.execute("DROP TABLE user_credentials")
+        self._conn.execute("ALTER TABLE user_credentials_new RENAME TO user_credentials")
+        # Point each user at their (only) existing combo.
+        self._conn.execute("""
+            UPDATE users SET
+              active_exchange = COALESCE(active_exchange,
+                  (SELECT exchange FROM user_credentials c WHERE c.user_id = users.user_id LIMIT 1)),
+              active_network = COALESCE(active_network,
+                  (SELECT network FROM user_credentials c WHERE c.user_id = users.user_id LIMIT 1))
+        """)
 
     def _migrate_drop_saas_columns(self) -> None:
         """One-shot D4 migration: drop the SaaS-era invite_codes table and

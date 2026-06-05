@@ -655,3 +655,90 @@ class TestBuiltinPresets:
             cfg = Config()
             cfg.strategy.active_preset = name
             assert cfg.get_active_preset().tp_split == BUILTIN_PRESETS[name].tp_split
+
+
+class TestPerComboCredentials:
+    """6.12 — credentials stored per (exchange, network); active pointer."""
+
+    def test_create_sets_active_pointer(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        assert db.get_active_exchange_network("alice") == ("hyperliquid", "testnet")
+
+    def test_save_and_read_specific_combo(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        db.save_credentials("alice", "blofin", "testnet",
+                            account_address="BKEY", api_secret="BSEC", passphrase="pp")
+        # active combo unchanged by save_credentials
+        assert db.get_active_exchange_network("alice") == ("hyperliquid", "testnet")
+        # the new combo is readable explicitly
+        bc = db.get_user_credentials_decrypted("alice", "blofin", "testnet")
+        assert bc["account_address"] == "BKEY"
+        assert bc["passphrase"] == "pp"
+        # active read still returns HL
+        assert db.get_user_credentials_decrypted("alice")["exchange"] == "hyperliquid"
+
+    def test_has_credentials_and_list_combos(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        db.save_credentials("alice", "blofin", "testnet",
+                            account_address="BKEY", api_secret="BSEC", passphrase="pp")
+        assert db.has_credentials("alice", "hyperliquid", "testnet") is True
+        assert db.has_credentials("alice", "blofin", "testnet") is True
+        assert db.has_credentials("alice", "blofin", "mainnet") is False
+        assert set(db.list_credential_combos("alice")) == {
+            ("hyperliquid", "testnet"), ("blofin", "testnet")}
+
+    def test_switch_active_persists_both_combos(self, db):
+        # The core requirement: switching exchanges keeps BOTH credential sets.
+        db.create_user("alice", "Alice", SAMPLE_CREDS)
+        db.save_credentials("alice", "blofin", "testnet",
+                            account_address="BKEY", api_secret="BSEC", passphrase="pp")
+        db.set_active_exchange_network("alice", "blofin", "testnet")
+        assert db.get_user_credentials_decrypted("alice")["exchange"] == "blofin"
+        # switch back — HL creds were remembered (not re-entered)
+        db.set_active_exchange_network("alice", "hyperliquid", "testnet")
+        hl = db.get_user_credentials_decrypted("alice")
+        assert hl["exchange"] == "hyperliquid"
+        assert hl["account_address"] == "0xABC123"
+
+    def test_get_config_uses_active_combo(self, db):
+        db.create_user("alice", "Alice", SAMPLE_CREDS, SAMPLE_CONFIG)
+        db.save_credentials("alice", "blofin", "demo",
+                            account_address="BKEY", api_secret="BSEC", passphrase="pp")
+        db.set_active_exchange_network("alice", "blofin", "demo")
+        cfg = db.get_user_config_as_config("alice", Config())
+        assert cfg.exchange.exchange == "blofin"
+        assert cfg.exchange.network == "demo"
+        assert cfg.exchange.passphrase == "pp"
+
+
+class TestCredentialMigration:
+    """The single-row → composite-PK migration must preserve existing creds."""
+
+    def test_legacy_single_row_db_migrates(self, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        now = "2026-01-01T00:00:00+00:00"
+        # Build the OLD schema by hand: users without active cols, single-PK creds.
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE users (user_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, "
+                     "status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        conn.execute("CREATE TABLE user_credentials (user_id TEXT PRIMARY KEY REFERENCES users(user_id), "
+                     "account_address_enc TEXT NOT NULL, api_wallet_enc TEXT NOT NULL, api_secret_enc TEXT NOT NULL, "
+                     "network TEXT NOT NULL DEFAULT 'testnet', exchange TEXT NOT NULL DEFAULT 'hyperliquid', "
+                     "passphrase_enc TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        conn.execute("INSERT INTO users VALUES ('bob','Bob','active',?,?)", (now, now))
+        conn.execute("INSERT INTO user_credentials VALUES ('bob',?,?,?,'testnet','blofin',?,?,?)",
+                     (encrypt("BKEY"), encrypt(""), encrypt("BSEC"), encrypt("pp"), now, now))
+        conn.commit(); conn.close()
+
+        # Opening UserDatabase runs the migrations.
+        udb = UserDatabase(db_path=db_path)
+        try:
+            pks = [r[0] for r in udb._conn.execute(
+                "SELECT name FROM pragma_table_info('user_credentials') WHERE pk>0")]
+            assert pks == ["user_id", "exchange", "network"]
+            assert udb.get_active_exchange_network("bob") == ("blofin", "testnet")
+            creds = udb.get_user_credentials_decrypted("bob")
+            assert creds["account_address"] == "BKEY"
+            assert creds["passphrase"] == "pp"
+        finally:
+            udb.close()
