@@ -38,14 +38,17 @@ from scripts.test_driver import (
     TEST_TRADE_ID_MIN,
     TradePlan,
     _all_tp_profit_pct,
+    _cancel_user_orders,
     _format_price,
     _list_test_orders_with_oid,
     _stop_loss_pct,
     _tp_profit_pct,
     assign_scenarios,
+    build_market_pool,
     cleanup_test_data,
     compute_price_levels,
     extract_pairs_from_samples,
+    filter_to_blofin_universe,
     filter_to_hl_universe,
     generate_start_times,
     get_next_test_trade_id,
@@ -353,12 +356,14 @@ class TestHlOrphanOrderCleanup:
             (7_000_008, "bob",   22222, "INJ", "filled"),
         ])
         rows = _list_test_orders_with_oid(db)
-        # Order from query is unspecified; sort for stable assertions
+        # Order from query is unspecified; sort for stable assertions.
+        # oid comes back as a string (TEXT column; Blofin ids are non-numeric)
+        # and order_type is included to route Blofin cancels.
         rows = sorted(rows, key=lambda r: (r[0], r[1]))
         assert rows == [
-            ("alice", 12345, "ETH"),
-            ("alice", 67890, "BTC"),
-            ("bob",   22222, "INJ"),
+            ("alice", "12345", "ETH", "entry"),
+            ("alice", "67890", "BTC", "entry"),
+            ("bob",   "22222", "INJ", "entry"),
         ]
 
     def test_returns_empty_when_no_db(self, tmp_path):
@@ -472,3 +477,111 @@ class TestScenarios:
         # Find the next tp_hit after BE
         idx_tp2 = events.index("tp_hit", idx_be + 1)
         assert idx_tp1 < idx_be < idx_tp2
+
+
+# ============================================================================
+# Phase 6.10 — exchange dispatch (Blofin universe, market pool, cancel routing)
+# ============================================================================
+
+from unittest.mock import MagicMock, patch  # noqa: E402
+
+from src.state.models import OrderType  # noqa: E402
+
+_BLOFIN_INSTRUMENTS = {
+    "BTC-USDT": {"contractValue": "0.001", "lotSize": "0.1", "minSize": "0.1",
+                 "tickSize": "0.1", "maxLeverage": "150"},
+    "ETH-USDT": {"contractValue": "0.01", "lotSize": "0.1", "minSize": "0.1",
+                 "tickSize": "0.01", "maxLeverage": "100"},
+}
+
+
+class TestBlofinUniverseFilter:
+    def test_resolves_pairs_to_inst_ids(self):
+        pool = filter_to_blofin_universe({"BTC", "ETH"}, _BLOFIN_INSTRUMENTS)
+        assert sorted(pool) == [("BTC", "BTC-USDT"), ("ETH", "ETH-USDT")]
+
+    def test_drops_unknown_instruments(self):
+        pool = filter_to_blofin_universe({"BTC", "DOGECOINX"}, _BLOFIN_INSTRUMENTS)
+        assert pool == [("BTC", "BTC-USDT")]
+
+    def test_excluded_coins_dropped(self):
+        pool = filter_to_blofin_universe(
+            {"BTC", "ETH"}, _BLOFIN_INSTRUMENTS, exclude={"ETH"},
+        )
+        assert pool == [("BTC", "BTC-USDT")]
+
+
+class TestBuildMarketPoolDispatch:
+    def test_blofin_uses_blofin_sources(self, tmp_path):
+        samples = tmp_path / "samples"
+        samples.mkdir()
+        (samples / "s.txt").write_text("PAIR: BTC/USDT #1\nPAIR: ETH/USDT #2\n")
+        with patch("scripts.test_driver.fetch_blofin_instruments", return_value=_BLOFIN_INSTRUMENTS) as m_inst, \
+             patch("scripts.test_driver.fetch_blofin_mids", return_value={"BTC-USDT": 50000.0, "ETH-USDT": 3000.0}) as m_mid, \
+             patch("scripts.test_driver.fetch_hl_asset_meta") as m_hl:
+            pool, mids = build_market_pool("blofin", "testnet", samples, set())
+        assert sorted(pool) == [("BTC", "BTC-USDT"), ("ETH", "ETH-USDT")]
+        assert mids["BTC-USDT"] == 50000.0
+        m_inst.assert_called_once_with("testnet")
+        m_mid.assert_called_once_with("testnet")
+        m_hl.assert_not_called()  # HL sources never touched for a Blofin run
+
+    def test_hyperliquid_uses_hl_sources(self, tmp_path):
+        samples = tmp_path / "samples"
+        samples.mkdir()
+        (samples / "s.txt").write_text("PAIR: BTC/USDT #1\n")
+        hl_meta = {"BTC": {"szDecimals": 5, "maxLeverage": 50}}
+        with patch("scripts.test_driver.fetch_hl_asset_meta", return_value=hl_meta), \
+             patch("scripts.test_driver.fetch_hl_mids", return_value={"BTC": 50000.0}), \
+             patch("scripts.test_driver.fetch_blofin_instruments") as m_blofin:
+            pool, mids = build_market_pool("hyperliquid", "testnet", samples, set())
+        assert pool == [("BTC", "BTC")]
+        m_blofin.assert_not_called()
+
+
+class TestCancelDispatch:
+    def test_hyperliquid_cancel_casts_oid_to_int(self):
+        creds = {"account_address": "0xA", "api_secret": "0xS", "network": "testnet"}
+        items = [("12345", "BTC", "entry")]
+        with patch("src.exchange.hyperliquid.HyperliquidClient") as MockHL:
+            canceled, errors = _cancel_user_orders("hyperliquid", creds, items)
+        client = MockHL.return_value
+        client.exchange.cancel.assert_called_once_with("BTC", 12345)  # int, not str
+        assert (canceled, errors) == (1, 0)
+
+    def test_blofin_routes_entry_vs_tpsl(self):
+        creds = {
+            "account_address": "KEY", "api_secret": "SEC",
+            "passphrase": "PASS", "network": "testnet",
+        }
+        items = [
+            ("O1", "BTC-USDT", OrderType.ENTRY.value),
+            ("T_SL", "BTC-USDT", OrderType.STOP_LOSS.value),
+            ("T_TP1", "BTC-USDT", OrderType.TP1.value),
+        ]
+        with patch("src.exchange.blofin.BlofinClient") as MockBlofin:
+            canceled, errors = _cancel_user_orders("blofin", creds, items)
+        client = MockBlofin.return_value
+        # demo network mapping (testnet → demo)
+        assert MockBlofin.call_args.kwargs["network"] == "demo"
+        client.cancel_order.assert_called_once_with("BTC-USDT", order_id="O1")
+        assert client.cancel_tpsl.call_count == 2  # SL + TP1
+        assert (canceled, errors) == (3, 0)
+
+    def test_blofin_mainnet_maps_to_production(self):
+        creds = {
+            "account_address": "KEY", "api_secret": "SEC",
+            "passphrase": "PASS", "network": "mainnet",
+        }
+        with patch("src.exchange.blofin.BlofinClient") as MockBlofin:
+            _cancel_user_orders("blofin", creds, [("O1", "BTC-USDT", "entry")])
+        assert MockBlofin.call_args.kwargs["network"] == "production"
+
+    def test_cancel_error_counted_not_raised(self):
+        creds = {"account_address": "0xA", "api_secret": "0xS", "network": "testnet"}
+        with patch("src.exchange.hyperliquid.HyperliquidClient") as MockHL:
+            MockHL.return_value.exchange.cancel.side_effect = RuntimeError("boom")
+            canceled, errors = _cancel_user_orders(
+                "hyperliquid", creds, [("1", "BTC", "entry")],
+            )
+        assert (canceled, errors) == (0, 1)

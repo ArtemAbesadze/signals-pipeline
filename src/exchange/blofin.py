@@ -347,3 +347,26 @@ class BlofinClient:
             "instId": inst_id, "marginMode": margin_mode,
             "positionSide": position_side,
         })
+
+    def demo_apply_money(
+        self, amount: str | float = "1000", currency: str = "USDT",
+        adjust_type: str = "1", to_account: str | None = None,
+    ) -> dict:
+        """**Experimental, demo-only** — request more play money on the demo
+        environment.
+
+        The exact body shape is NOT confirmed: the public docs document
+        ``{adjustType, demoApplyMoney:[{currency, amountStr}]}`` but the demo
+        rejected it with "Parameter toAccount cannot be empty" (see
+        BLOFIN_INTEGRATION.md § "Demo environment facts"). The demo account is
+        pre-funded (~500k USDT) so this is rarely needed. Returns the RAW
+        response dict (NOT ``_checked``) so the caller can inspect the code/msg
+        and resolve the shape empirically. Only call against ``network='demo'``.
+        """
+        body: dict[str, Any] = {
+            "adjustType": adjust_type,
+            "demoApplyMoney": [{"currency": currency, "amountStr": str(amount)}],
+        }
+        if to_account is not None:
+            body["toAccount"] = to_account
+        return self._request("POST", "/api/v1/asset/demo-apply-money", body)

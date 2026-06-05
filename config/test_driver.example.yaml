@@ -11,6 +11,13 @@
 # inspect / cleanup via `python3 scripts/test_driver.py --cleanup`.
 
 test_driver:
+  # Target exchange for coin-pool + price planning. Omit (or leave null) to
+  # follow config/config.yaml's exchange.exchange. Set explicitly to soak a
+  # specific exchange — "blofin" draws coins from the Blofin instrument
+  # universe priced from Blofin's public tickers; "hyperliquid" from HL's.
+  # Network (testnet/demo vs mainnet/production) still comes from config.yaml.
+  exchange: null               # null | hyperliquid | blofin
+
   # Volume + cadence
   trade_count: 5               # how many test trades to fire across the run
   duration_minutes: 60         # wall-clock window — trades randomly distributed
@@ -41,8 +48,8 @@ test_driver:
     cancel_after_fill:     [90,  300]
 
   # Coin selection — randomly drawn from coins seen in signals/samples/.
-  # Coins missing from the HL asset universe (e.g. XRP on testnet) are
-  # filtered out automatically at startup; `exclude_coins` lets you also
+  # Coins missing from the target exchange's universe (e.g. XRP on HL testnet)
+  # are filtered out automatically at startup; `exclude_coins` lets you also
   # blacklist specific ones (e.g. if testnet liquidity is too thin).
   coin_pool_from: signals/samples/
   exclude_coins: [XRP]

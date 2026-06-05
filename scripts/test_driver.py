@@ -21,6 +21,12 @@ Run:
     python3 scripts/test_driver.py --config <path>  # alt config
     python3 scripts/test_driver.py --cleanup        # bulk delete test trades
     python3 scripts/test_driver.py --dry-run        # render scenarios, don't post
+    python3 scripts/test_driver.py --top-up-demo    # (Blofin demo) request play money
+
+Exchange-aware (Phase 6.10): the coin pool + prices are drawn from the target
+exchange (config `exchange:` key, else config.yaml's exchange.exchange), so a
+Blofin run generates Blofin-valid signals. Orphan-order cleanup routes each
+user's cancels to their own exchange.
 
 Foreground only — see config/test_driver.example.yaml for tunables.
 """
@@ -62,7 +68,7 @@ from src.parser.update_parser import (
     parse_tp_hit,
     parse_trade_live,
 )
-from src.utils.symbol_mapper import potion_to_hyperliquid
+from src.utils.symbol_mapper import potion_to_blofin, potion_to_hyperliquid
 
 logger = logging.getLogger("test_driver")
 
@@ -79,6 +85,12 @@ TEST_TRADE_ID_MAX = 7_999_999
 
 HL_TESTNET_API = "https://api.hyperliquid-testnet.xyz"
 HL_MAINNET_API = "https://api.hyperliquid.xyz"
+
+# Blofin public market hosts. testnet→demo, mainnet→production (same mapping as
+# src/orchestrator.py build_exchange_client). The /market/* endpoints are
+# unauthenticated, so coin-pool + price planning needs no credentials.
+BLOFIN_DEMO_API = "https://demo-trading-openapi.blofin.com"
+BLOFIN_PROD_API = "https://openapi.blofin.com"
 
 # Cancel reasons — pulled from real samples so the cancel parser handles them.
 _CANCEL_REASONS = (
@@ -373,6 +385,97 @@ def _http_post_json(url: str, payload: dict) -> Any:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _http_get_json(url: str) -> Any:
+    req = urllib.request.Request(url, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+# ============================================================================
+# Blofin public API (market data — unauthenticated)
+# ============================================================================
+
+def _blofin_base(network: str) -> str:
+    return BLOFIN_PROD_API if network == "mainnet" else BLOFIN_DEMO_API
+
+
+def fetch_blofin_instruments(network: str) -> dict[str, dict]:
+    """Return {instId: meta} from the public instruments endpoint. Each meta
+    carries contractValue/lotSize/minSize/tickSize/maxLeverage."""
+    raw = _http_get_json(f"{_blofin_base(network)}/api/v1/market/instruments")
+    return {a["instId"]: a for a in (raw.get("data") or []) if a.get("instId")}
+
+
+def fetch_blofin_mids(network: str) -> dict[str, float]:
+    """Return {instId: last_price} from the public tickers endpoint."""
+    raw = _http_get_json(f"{_blofin_base(network)}/api/v1/market/tickers")
+    out: dict[str, float] = {}
+    for t in raw.get("data") or []:
+        inst = t.get("instId")
+        last = t.get("last")
+        if inst and last:
+            try:
+                out[inst] = float(last)
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def filter_to_blofin_universe(
+    potion_pairs: set[str],
+    instruments: dict[str, dict],
+    exclude: set[str] | None = None,
+) -> list[tuple[str, str]]:
+    """Resolve each Potion pair to a Blofin instId and drop unknowns.
+
+    Returns ``(pair_basename, inst_id)`` tuples for instruments the driver
+    can use. Mirrors ``filter_to_hl_universe`` for the Blofin universe."""
+    exclude = exclude or set()
+    out: list[tuple[str, str]] = []
+    for base in sorted(potion_pairs):
+        if base in exclude:
+            continue
+        try:
+            inst = potion_to_blofin(f"{base}/USDT", available_instruments=instruments)
+        except Exception:
+            continue
+        if inst not in instruments:
+            continue
+        out.append((base, inst))
+    return out
+
+
+# ============================================================================
+# Market-source dispatch (Phase 6.10)
+# ============================================================================
+
+def build_market_pool(
+    exchange: str,
+    network: str,
+    samples_dir: Path,
+    exclude: set[str],
+) -> tuple[list[tuple[str, str]], dict[str, float]]:
+    """Return ``(pool, mids)`` for the target exchange.
+
+    ``pool`` is a list of ``(pair_basename, resolved_symbol)`` where
+    resolved_symbol is the HL coin or the Blofin instId; ``mids`` maps that
+    same resolved_symbol to a current price. Selected by ``exchange`` so the
+    synthetic signals reference coins the target user's exchange supports,
+    priced from that exchange's own market data (Blofin planning is
+    credential-free — the /market endpoints are public)."""
+    sample_pairs = extract_pairs_from_samples(samples_dir)
+    if exchange == "blofin":
+        meta = fetch_blofin_instruments(network)
+        mids = fetch_blofin_mids(network)
+        pool = filter_to_blofin_universe(sample_pairs, meta, exclude)
+    else:
+        meta = fetch_hl_asset_meta(network)
+        mids = fetch_hl_mids(network)
+        pool = filter_to_hl_universe(sample_pairs, meta, exclude)
+    pool = [(p, c) for (p, c) in pool if c in mids]
+    return pool, mids
+
+
 # ============================================================================
 # Telegram posting
 #
@@ -608,97 +711,139 @@ def cleanup_test_data(db_path: Path) -> dict[str, int]:
         conn.close()
 
 
-def _list_test_orders_with_oid(db_path: Path) -> list[tuple[str, int, str]]:
-    """Return ``(user_id, oid, coin)`` for every test order whose oid is
-    set in the local DB. Used by ``cancel_orphan_orders_on_hl`` to pair
-    HL cancel calls with the right user's credentials.
+def _list_test_orders_with_oid(db_path: Path) -> list[tuple[str, str, str, str]]:
+    """Return ``(user_id, oid, coin, order_type)`` for every test order whose
+    oid is set in the local DB. Used by ``cancel_orphan_orders`` to pair
+    exchange cancel calls with the right user's credentials.
 
-    The bot's DB may say these orders are FILLED or CANCELED — that's
-    the design-limitation ghost the test driver creates (synthetic CP
-    events don't trigger real HL state changes). They're still resting
-    on HL and need an actual HL cancel call.
+    ``oid`` is returned as a STRING — HL oids are numeric but Blofin
+    orderIds/tpslIds are arbitrary strings (orders.oid is TEXT since the
+    Phase 6.7 migration). The HL cancel path casts back to int. ``order_type``
+    routes Blofin cancels (entry → cancel-order, SL/TP → cancel-tpsl).
+
+    The bot's DB may say these orders are FILLED or CANCELED — that's the
+    design-limitation ghost the test driver creates (synthetic CP events don't
+    trigger real exchange state changes). They may still be resting on the
+    exchange and need an actual cancel call.
     """
     if not db_path.exists():
         return []
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         rows = conn.execute(
-            """SELECT user_id, oid, coin
+            """SELECT user_id, oid, coin, order_type
                FROM orders
                WHERE trade_id BETWEEN ? AND ?
                  AND oid IS NOT NULL""",
             (TEST_TRADE_ID_MIN, TEST_TRADE_ID_MAX),
         ).fetchall()
-        return [(r[0], int(r[1]), r[2]) for r in rows]
+        return [(r[0], str(r[1]), r[2], r[3]) for r in rows]
     finally:
         conn.close()
 
 
-def cancel_orphan_orders_on_hl(db_path: Path) -> dict[str, int]:
-    """Cancel any test orders still resting on HL.
+def cancel_orphan_orders(db_path: Path) -> dict[str, dict[str, int]]:
+    """Cancel any test orders still resting on the exchange, per user.
 
-    Walks every order row in the test trade ID range that has an oid
-    (i.e. actually made it to the exchange at some point), groups by
-    user_id, builds a HyperliquidClient per user, and fires a cancel
-    against each oid. Already-canceled orders return OK from HL — the
-    call is idempotent. Errors per-order are caught + logged so one
-    failure doesn't block the rest.
+    Walks every test-range order row with an oid (i.e. it reached the exchange
+    at some point), groups by user_id, and dispatches the cancel on each user's
+    own ``exchange`` (read from their credentials). HL uses
+    ``exchange.cancel(coin, int(oid))``; Blofin routes entry orders to
+    ``cancel-order`` and SL/TP conditionals to ``cancel-tpsl`` (the order_type
+    column drives the split). Already-gone orders are idempotent/benign on both.
+    Per-order errors are caught + logged so one failure doesn't block the rest.
 
     Returns ``{user_id: {"canceled": N, "errors": M}}``.
     """
-    from src.exchange.hyperliquid import HyperliquidClient  # local — keep top of file dep-free
     from src.state.user_db import UserDatabase
 
     rows = _list_test_orders_with_oid(db_path)
     if not rows:
         return {}
 
-    # Group oids by user_id so we build one HL client per user.
-    by_user: dict[str, list[tuple[int, str]]] = {}
-    for user_id, oid, coin in rows:
-        by_user.setdefault(user_id, []).append((oid, coin))
+    by_user: dict[str, list[tuple[str, str, str]]] = {}
+    for user_id, oid, coin, order_type in rows:
+        by_user.setdefault(user_id, []).append((oid, coin, order_type))
 
     udb = UserDatabase()
     results: dict[str, dict[str, int]] = {}
     try:
-        for user_id, oid_coin_pairs in by_user.items():
+        for user_id, items in by_user.items():
             creds = udb.get_user_credentials_decrypted(user_id)
             if not creds:
                 logger.warning(
                     "Skipping cancel for user %s — no credentials in DB", user_id,
                 )
                 continue
+            exchange = (creds.get("exchange") or "hyperliquid").lower()
             try:
-                client = HyperliquidClient(
-                    account_address=creds["account_address"],
-                    private_key=creds["api_secret"],
-                    network=creds.get("network", "testnet"),
-                )
+                canceled, errors = _cancel_user_orders(exchange, creds, items)
             except Exception:
-                logger.exception("Skipping cancel for user %s — client init failed", user_id)
+                logger.exception(
+                    "Skipping cancel for user %s — client init failed", user_id,
+                )
                 continue
-            canceled = 0
-            errors = 0
-            for oid, coin in oid_coin_pairs:
-                try:
-                    client.exchange.cancel(coin, oid)
-                    canceled += 1
-                except Exception as e:
-                    # HL returns OK for already-canceled orders; this catch
-                    # is for real transport / signing failures.
-                    logger.warning(
-                        "Cancel failed for %s oid=%s (user=%s): %s",
-                        coin, oid, user_id, e,
-                    )
-                    errors += 1
             results[user_id] = {"canceled": canceled, "errors": errors}
             logger.info(
-                "User %s: canceled %d test orders on HL (%d errors)",
-                user_id, canceled, errors,
+                "User %s: canceled %d test orders on %s (%d errors)",
+                user_id, canceled, exchange, errors,
             )
     finally:
         udb.close()
     return results
+
+
+def _cancel_user_orders(
+    exchange: str,
+    creds: dict,
+    items: list[tuple[str, str, str]],
+) -> tuple[int, int]:
+    """Cancel one user's orphan orders on their exchange. Returns
+    ``(canceled, errors)``. Raises only on client construction failure."""
+    from src.state.models import OrderType
+
+    canceled = errors = 0
+    if exchange == "blofin":
+        from src.exchange.blofin import BlofinClient
+
+        network = "production" if creds.get("network") == "mainnet" else "demo"
+        client = BlofinClient(
+            api_key=creds["account_address"],
+            api_secret=creds["api_secret"],
+            passphrase=creds.get("passphrase", ""),
+            network=network,
+        )
+        for oid, coin, order_type in items:
+            try:
+                if order_type == OrderType.ENTRY.value:
+                    client.cancel_order(coin, order_id=oid)
+                else:
+                    client.cancel_tpsl(coin, oid)
+                canceled += 1  # 102068 (already gone) returns without raising
+            except Exception as e:
+                logger.warning(
+                    "Blofin cancel failed for %s oid=%s: %s", coin, oid, e,
+                )
+                errors += 1
+        return canceled, errors
+
+    from src.exchange.hyperliquid import HyperliquidClient
+
+    client = HyperliquidClient(
+        account_address=creds["account_address"],
+        private_key=creds["api_secret"],
+        network=creds.get("network", "testnet"),
+    )
+    for oid, coin, _order_type in items:
+        try:
+            client.exchange.cancel(coin, int(oid))
+            canceled += 1
+        except Exception as e:
+            # HL returns OK for already-canceled orders; this catch is for
+            # real transport / signing failures.
+            logger.warning("HL cancel failed for %s oid=%s: %s", coin, oid, e)
+            errors += 1
+    return canceled, errors
 
 
 # ============================================================================
@@ -782,28 +927,28 @@ async def run_test(config: dict, db_path: Path, dry_run: bool) -> None:
     rng = random.Random(seed)
 
     network = _read_network_from_config()
+    # Target exchange: cfg override wins, else config.yaml's exchange.exchange.
+    exchange = (cfg.get("exchange") or _read_exchange_from_config()).lower()
     channel_id = int(cfg["signals_channel_id"])
 
     logger.info(
-        "Test run: %d trades over %d min on %s (channel=%d, seed=%s, dry_run=%s)",
-        cfg["trade_count"], cfg["duration_minutes"], network,
+        "Test run: %d trades over %d min on %s/%s (channel=%d, seed=%s, dry_run=%s)",
+        cfg["trade_count"], cfg["duration_minutes"], exchange, network,
         channel_id, seed, dry_run,
     )
 
     if cfg.get("stop_real_forwarder_on_start", True) and not dry_run:
         stop_real_forwarder()
 
-    # Build the coin pool: samples ∩ HL universe \ excluded
-    logger.info("Fetching HL asset meta + mids (%s)...", network)
-    asset_meta = fetch_hl_asset_meta(network)
-    mids = fetch_hl_mids(network)
+    # Build the coin pool: samples ∩ target-exchange universe \ excluded.
+    logger.info("Fetching %s asset meta + mids (%s)...", exchange, network)
     samples_dir = _REPO_ROOT / cfg["coin_pool_from"]
-    sample_pairs = extract_pairs_from_samples(samples_dir)
     exclude = set(cfg.get("exclude_coins", []))
-    pool = filter_to_hl_universe(sample_pairs, asset_meta, exclude)
-    pool = [(p, c) for (p, c) in pool if c in mids]
+    pool, mids = build_market_pool(exchange, network, samples_dir, exclude)
     if not pool:
-        raise SystemExit("Empty coin pool after filtering — check samples + HL universe")
+        raise SystemExit(
+            f"Empty coin pool after filtering — check samples + {exchange} universe"
+        )
     logger.info("Coin pool: %d coins (%s ...)", len(pool), [c for _, c in pool[:6]])
 
     # Schedule + assign scenarios
@@ -820,14 +965,18 @@ async def run_test(config: dict, db_path: Path, dry_run: bool) -> None:
 
     plans: list[TradePlan] = []
     for i in range(num):
-        pair_base, hl_coin = rng.choice(pool)
+        pair_base, resolved = rng.choice(pool)
         side = _weighted_choice(rng, side_dist)
         risk = _weighted_choice(rng, risk_dist)
-        entry = float(mids[hl_coin])
+        entry = float(mids[resolved])
         levels = compute_price_levels(side, entry)
+        # ``coin`` is the LIVE-header label: HL coin name for HL; for Blofin the
+        # instId is "BTC-USDT", so use the base symbol there (the pipeline maps
+        # the pair → instId itself via potion_to_blofin).
+        coin_label = pair_base if exchange == "blofin" else resolved
         plan = TradePlan(
             trade_id=next_id + i,
-            coin=hl_coin,
+            coin=coin_label,
             pair=f"{pair_base}/USDT",
             side=side,
             risk=risk,
@@ -982,6 +1131,95 @@ def _read_network_from_config() -> str:
         return "testnet"
 
 
+def _read_exchange_from_config() -> str:
+    """Pull exchange.exchange from config/config.yaml (hyperliquid/blofin)."""
+    cfg_path = _REPO_ROOT / "config" / "config.yaml"
+    if not cfg_path.exists():
+        return "hyperliquid"
+    try:
+        with open(cfg_path) as f:
+            data = yaml.safe_load(f) or {}
+        return data.get("exchange", {}).get("exchange", "hyperliquid")
+    except Exception:
+        return "hyperliquid"
+
+
+# ============================================================================
+# Demo top-up (Phase 6.10) — experimental
+# ============================================================================
+
+# Body-shape candidates for demo-apply-money. The public docs are truncated and
+# the demo rejected the documented shape ("Parameter toAccount cannot be
+# empty"). We try a small matrix and print each raw response so the working
+# shape can be confirmed on the live demo. toAccount candidates cover the
+# documented futures-account ids. See BLOFIN_INTEGRATION.md § "Demo facts".
+_TOPUP_CANDIDATES = [
+    {"adjust_type": "1", "to_account": "futures"},
+    {"adjust_type": "1", "to_account": "3"},
+    {"adjust_type": "1", "to_account": None},
+    {"adjust_type": "2", "to_account": "futures"},
+]
+
+
+def top_up_demo(amount: str = "10000") -> None:
+    """**Experimental** — request more demo play money and print balances.
+
+    Builds a demo BlofinClient from BLOFIN_API_KEY/SECRET/PASSPHRASE in the
+    env, prints the current balance (a confirmed signed read), then attempts
+    ``demo-apply-money`` across the candidate body shapes, printing each raw
+    response. The demo is pre-funded (~500k USDT) so this is usually
+    unnecessary — its real value right now is resolving the exact body shape.
+    """
+    from src.exchange.blofin import BlofinClient
+
+    _load_dotenv()
+    key = os.environ.get("BLOFIN_API_KEY")
+    secret = os.environ.get("BLOFIN_API_SECRET")
+    passphrase = os.environ.get("BLOFIN_PASSPHRASE")
+    if not (key and secret and passphrase):
+        raise SystemExit(
+            "top-up-demo: set BLOFIN_API_KEY / BLOFIN_API_SECRET / "
+            "BLOFIN_PASSPHRASE (demo key) in .env or the environment."
+        )
+
+    client = BlofinClient(
+        api_key=key, api_secret=secret, passphrase=passphrase, network="demo",
+    )
+    try:
+        bal = client.get_balance()
+        logger.info("Demo balance before: available=%s equity=%s",
+                    bal.get("available"), bal.get("total_equity"))
+    except Exception as e:
+        raise SystemExit(f"top-up-demo: balance read failed (bad demo key?): {e}")
+
+    for cand in _TOPUP_CANDIDATES:
+        try:
+            resp = client.demo_apply_money(
+                amount=amount,
+                adjust_type=cand["adjust_type"],
+                to_account=cand["to_account"],
+            )
+            code = str(resp.get("code"))
+            logger.info("  apply-money %s → code=%s msg=%s", cand, code, resp.get("msg"))
+            if code == "0":
+                logger.info("  ✓ accepted with %s", cand)
+                break
+        except Exception as e:
+            logger.info("  apply-money %s → error %s", cand, e)
+    else:
+        logger.warning(
+            "Demo top-up not confirmed — none of the candidate shapes returned "
+            "code 0. Note the responses above to resolve the body shape.",
+        )
+
+    try:
+        bal = client.get_balance()
+        logger.info("Demo balance after:  available=%s equity=%s",
+                    bal.get("available"), bal.get("total_equity"))
+    except Exception:
+        pass
+
+
 # ============================================================================
 # CLI entrypoint
 # ============================================================================
@@ -1009,25 +1247,33 @@ def main() -> None:
         "--dry-run", action="store_true",
         help="Print the plan but don't post messages or touch the forwarder",
     )
+    parser.add_argument(
+        "--top-up-demo", action="store_true",
+        help="(Blofin demo, experimental) request more demo play money and exit",
+    )
     args = parser.parse_args()
 
     db_path = _REPO_ROOT / "data" / "trades.db"
 
+    if args.top_up_demo:
+        top_up_demo()
+        return
+
     if args.cleanup:
-        # Cancel orphan HL orders FIRST — once we delete the DB rows
-        # we lose the oid → user_id mapping needed to know which
-        # credentials to use for the cancel call. HL cancel is
-        # idempotent so already-canceled orders are no-ops.
+        # Cancel orphan exchange orders FIRST — once we delete the DB rows
+        # we lose the oid → user_id mapping needed to know which credentials
+        # to use for the cancel call. Cancels are idempotent/benign on both
+        # exchanges, and each user is routed to their own exchange.
         try:
-            hl_result = cancel_orphan_orders_on_hl(db_path)
+            cancel_result = cancel_orphan_orders(db_path)
         except Exception:
             logger.exception(
-                "HL orphan cleanup failed — proceeding with DB cleanup anyway",
+                "Orphan order cleanup failed — proceeding with DB cleanup anyway",
             )
-            hl_result = {}
-        for uid, counts in hl_result.items():
+            cancel_result = {}
+        for uid, counts in cancel_result.items():
             logger.info(
-                "  HL: user=%s canceled=%d errors=%d",
+                "  exchange: user=%s canceled=%d errors=%d",
                 uid, counts["canceled"], counts["errors"],
             )
 
