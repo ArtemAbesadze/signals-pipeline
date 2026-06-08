@@ -64,7 +64,7 @@ def format_exchange_badge(exchange: str | None, network: str | None) -> str:
     net = (network or "testnet").lower()
     is_mainnet = net == "mainnet"
     if ex == "blofin":
-        return f"🟦 Blofin · {'🌐 Mainnet' if is_mainnet else '🧪 Demo'}"
+        return f"🟧 Blofin · {'🌐 Mainnet' if is_mainnet else '🧪 Demo'}"
     return f"🟩 Hyperliquid · {'🌐 Mainnet' if is_mainnet else '🧪 Testnet'}"
 
 

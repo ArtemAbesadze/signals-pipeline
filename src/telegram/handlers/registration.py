@@ -139,7 +139,7 @@ async def receive_exchange(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if exchange == "blofin":
         await query.edit_message_text(
-            "🟦 *Blofin* selected.\n\n"
+            "🟧 *Blofin* selected.\n\n"
             "I'll need an *API Transaction* key (Read + Trade; **no** Withdraw).\n"
             "Make sure you're in a private chat — I delete each message after reading.\n\n"
             "🔑 Send your *API Key*:",
@@ -482,7 +482,7 @@ async def _complete_registration(
         if network == "mainnet" else 500.0
     )
     if exchange == "blofin":
-        exchange_label = "🟦 *Blofin*"
+        exchange_label = "🟧 *Blofin*"
         network_label = "🌐 *Live*" if network == "mainnet" else "🧪 *Demo*"
     else:
         exchange_label = "🟩 *Hyperliquid*"

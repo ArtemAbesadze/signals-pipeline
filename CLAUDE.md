@@ -55,7 +55,7 @@ potion-perps-bot/
 │   ├── strategy/position_sizer.py       # sizing + pre-trade risk gate
 │   ├── telegram/                        # bot + handlers + notifications + monitors + confirmation_sweeper
 │   └── utils/                           # structlog setup, symbol mapper
-├── tests/                               # 952 tests across 40 files
+├── tests/                               # 974 tests across 41 files
 └── signals/
     ├── samples/                         # Real CP samples for parser tests (Discord format — still valid via forwarder)
     └── test/                            # E2E test fixtures
@@ -85,7 +85,7 @@ Key files when something breaks:
 5. **Per-user isolation.** Composite PK `(user_id, trade_id)` on `trades` and `orders`. All queries filter by `user_id`. One user's bug cannot touch another user's data.
 6. **DM-only for Telegram.** `dm_only_filter` middleware rejects group messages. Credential-collection messages are deleted on receipt.
 7. **No Discord edit handling.** CP sends all updates as new messages, never edits existing ones. `on_message` only — do not add `on_message_edit`.
-8. **Tests close behind code.** 952 tests today across `tests/`. New features land with tests, not after.
+8. **Tests close behind code.** 974 tests today across `tests/`. New features land with tests, not after.
 9. **Branch first during rework.** Active branch: `rework/scope-v1`. No commits to `main` until the rework is feature-complete.
 10. **README is current.** Phase 3.4 rewrote it for the private-tool scope. Keep it accurate as the codebase evolves — no longer frozen.
 11. **Test trade IDs live in `[7_000_000, 7_999_999]`.** Real CP IDs are 4 digits (max ~3000), so any 7-digit `trade_id` in `trades` / `orders` / `trade_events` is synthetic from `scripts/test_driver.py`. Bulk-delete with `python3 scripts/test_driver.py --cleanup`. Don't intermix this range with real CP trade IDs anywhere.
@@ -112,21 +112,30 @@ Key files when something breaks:
 
 ## Current phase
 
-**Phase 6 (Blofin migration) is functionally complete on the demo and
-validated. The full Blofin stack ships (client + order builder + position
-manager), wired into the shared pipeline via an exchange-adapter, with
-`/register` exchange choice, an exchange-aware test driver, D11 fill +
-realized-PnL read-back, and SL-move safety. Three demo soaks ran — the last
-all-green — surfacing and fixing 3 bugs. The one thing left to reach the
-actual goal is `6.12 per-user migration` (move a real user to Blofin, HL
-stays the fallback). Phase 4.2 (real CP soak) is paused; both agents stopped.**
+**Phase 6 (Blofin migration) is functionally complete and validated on the
+demo, including in-bot exchange switching. The full Blofin stack ships, wired
+into the shared pipeline via an exchange-adapter, with `/register` exchange
+choice, an exchange-aware test driver, D11 fill + realized-PnL read-back,
+SL-move safety, per-(exchange,network) credential storage, exchange-aware
+menus, and a Telegram `🔁 Switch Exchange` flow (6.12). Three demo soaks
+(last all-green) found+fixed 3 bugs; Artem migrated his own account
+HL→Blofin-demo→HL through the live flow on 2026-06-08 (credentials persist
+per combo, no re-entry). What remains is the **production cutover** (real
+Blofin keys, real money — deferred; testnet/demo only for now) and one open
+hardening item (BE-SL move). Phase 4.2 (real CP soak) is paused; agents stopped.**
 
-Where we are today (2026-06-05):
+Where we are today (2026-06-08):
 
-- **Branch**: `rework/scope-v1`. HEAD on GitHub matches local (`0b8cffe`).
-- **Tests**: 952/952 across 40 files.
-- **Live state**: both launchd agents **STOPPED**; demo account **flat**.
-  Restart with `deploy/launchd/install.sh all` when ready.
+- **Branch**: `rework/scope-v1`. HEAD ≈ `1f07f82` (+ this refresh on top).
+- **Tests**: 974/974 across 41 files.
+- **Live state**: launchd agents **STOPPED** (the bot may be running in the
+  foreground/background for an interactive session — check `pgrep -f main.py`).
+  Demo account **flat**.
+- **Exchange switching is now in-bot** (6.12): `/menu → ⚙️ Config → 🔁 Switch
+  Exchange`. Credentials persist per `(exchange, network)`; switching to a
+  used combo reuses the saved key (re-validated, never re-typed). New users
+  pick the exchange at `/register`. Hard-blocks switching while open trades
+  exist.
 - **Users** (`python3 scripts/seed_blofin_demo_user.py --list`): the 2 HL
   users (`7441245554` Artem port $500, `7375268438` swaag no port) +
   **`blofin_demo`** — a Blofin **demo** soak fixture (exchange=blofin,
@@ -159,6 +168,10 @@ Phase 6 commits (this migration, HL untouched — both exchanges coexist):
 | 6.8d | `6ed6367` | **BE/SL-move safety** — pre-validate new SL vs market (keep old if invalid); re-instate original SL if new placement fails. |
 | 6.8b-2 | `0b8cffe` | **D11 realized-PnL read-back** — close handlers use real `orders-history.pnl` (sum over `potion_{id}_*`), back out `pnl_pct`; `trades.pnl_source`. HL keeps CP. |
 | 6.11 | `5a84d22` (doc) | **Demo soak ✅ green** — 3 runs. Validated end-to-end (see below). |
+| 6.12-1 | `f7e8e54` | **Per-(exchange,network) credential storage** — `user_credentials` PK→(user_id,exchange,network); `users.active_exchange/active_network` pointer; `save_credentials`/`has_credentials`/`get`/`set_active_exchange_network`. Live DB migrated. |
+| 6.12-lev | `3bf3169` | **Uncapped leverage = global policy** — `max_leverage=0` = follow CP, clamp to instrument max. Validator allows 0; /config UI accepts 0 or 1-150. |
+| 6.12-2 | `092d25b` | **D11 menus** — `format_exchange_badge` on the main menu; `extract_wallet_usd` + exchange-aware `format_balance`/`format_trading_hub` (HL usdc vs Blofin available/equity; positions already normalized). |
+| 6.12-3 | `1e1ec90` | **Switch flow** — `src/telegram/handlers/switch.py` (Config → 🔁 Switch Exchange): hard-block on open trades, saved-combo reuse, atomic commit + reactivate, mainnet-token gate. Shared `registration.validate_exchange_credentials`. |
 
 **Soak results (2026-06-05, `blofin_demo` on the live demo):** order placement
 (entry+SL+3TP, real ids, 0 rejections), all 5 lifecycles LONG+SHORT up to 25x,
@@ -175,19 +188,18 @@ limitation, not a bug.
   (§ 0 = demo-confirmed endpoint map). Full row-by-row Phase 6 table in
   `docs/REWORK_BRIEF.md`.
 
-**What's left in Phase 6:**
+**What's left in Phase 6 (6.12 code is done — the rest is operational/optional):**
 
-- **6.12 — per-user migration (the goal).** Move a real user (Artem first)
-  from HL to Blofin: register/obtain a real Blofin "API Transaction" key,
-  switch their `user_credentials.exchange`, validate, soak on their account,
-  keep HL as the fallback adapter. One user at a time. **To be planned
-  together next.**
-- **D11 Telegram menus** (noted in 6.9): the balance/positions/PnL screens
-  still read HL-shaped data — Blofin menu read-back is the remaining D11 piece
-  for a Blofin user's `/menu`.
-- **Optional:** 6.8b-2's realized-PnL path only books real PnL when the
-  closing conditionals actually triggered on the exchange (real CP + real
-  price); confirm on a real Blofin trade during 6.12.
+- **Production cutover** (deferred). Everything above runs on testnet/demo. To
+  go live: obtain a real Blofin "API Transaction" key (Read+Trade, no Withdraw;
+  real key sits commented in `.env`), switch via `🔁 Switch Exchange` → Blofin →
+  **Mainnet** (typed `MAINNET` gate), soak on the real account. HL stays the
+  fallback. One user at a time (Artem first, then friends).
+- **BE-SL-move hardening was DONE** (6.8d) — the 6.11 open finding is closed.
+- **Optional:** 6.8b-2's realized-PnL path only books real PnL when the closing
+  conditionals actually triggered on the exchange (real CP + real price);
+  confirm on a real Blofin trade during the cutover soak.
+- **D11 Telegram menus: DONE** (6.12-2) — badge + exchange-aware balance/hub.
 
 Shipped (Phase 1–4.3):
 
@@ -307,7 +319,7 @@ git log --oneline -5
 git status
 
 # 3. Tests pass
-python3 -m pytest tests/ -q | tail -2  # expect 952 passed
+python3 -m pytest tests/ -q | tail -2  # expect 974 passed
 
 # 4. launchd agents — currently INTENTIONALLY STOPPED for Phase 6 dev (not an
 #    error). Phase 4.2 soak is paused. Only start them for a real CP soak.
@@ -450,12 +462,14 @@ Phase 5 = parking lot (weekly performance report, VPS, CI/CD, backtest tooling).
 
 ## Tests
 
-**952/952 passing** across 40 files. Phase 6 added `test_blofin_client.py`,
+**974/974 passing** across 41 files. Phase 6 added `test_blofin_client.py`,
 `test_blofin_order_builder.py`, `test_blofin_position_manager.py`,
-`test_exchange_adapter.py`, `test_registration_exchange.py`, and
-`test_seed_blofin_demo_user.py`; the test driver + e2e suites grew
-exchange-dispatch, D11 read-back (fill + realized-PnL), terminal-state-guard,
-and BE/SL-safety coverage. Recent additions worth knowing about:
+`test_exchange_adapter.py`, `test_registration_exchange.py`,
+`test_seed_blofin_demo_user.py`, and `test_switch.py` (6.12 switch flow);
+`test_user_db.py` covers per-combo creds + the composite-PK migration; the
+test driver + e2e + formatters suites grew exchange-dispatch, D11 read-back
+(fill + realized-PnL), terminal-state-guard, BE/SL-safety, and exchange-aware
+menu coverage. Recent additions worth knowing about:
 
 - `tests/test_e2e_pipeline.py::TestPendingToOpenPromotion` (5 tests, Bug #20) — TRADE_LIVE/TP_HIT promote a resting-entry trade PENDING→OPEN (D10: HL-confirmed, falls back to CP fill on query failure); the core regression asserts TP1 on a still-PENDING trade fires the breakeven SL move.
 - `tests/test_test_driver.py` (41 tests) — scenarios, template fidelity (each event round-trips through classify+parse), scheduling determinism, cleanup, realistic-percentage math, orphan-order helper.

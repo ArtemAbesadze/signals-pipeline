@@ -114,7 +114,7 @@ async def switch_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     cur_ex, cur_net = user_db.get_active_exchange_network(user_id)
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("🟩 Hyperliquid", callback_data="swex:hyperliquid"),
-        InlineKeyboardButton("🟦 Blofin", callback_data="swex:blofin"),
+        InlineKeyboardButton("🟧 Blofin", callback_data="swex:blofin"),
     ]])
     await update.effective_chat.send_message(
         f"🔁 *Switch exchange*\n\nCurrently: {format_exchange_badge(cur_ex, cur_net)}\n\n"
@@ -217,7 +217,7 @@ async def _proceed_after_target(update: Update, context: ContextTypes.DEFAULT_TY
     # No saved creds — collect them.
     if target_ex == "blofin":
         await update.effective_chat.send_message(
-            "🟦 Send your Blofin *API Key* (Read+Trade, no Withdraw):",
+            "🟧 Send your Blofin *API Key* (Read+Trade, no Withdraw):",
             parse_mode="Markdown",
         )
         return SW_BF_KEY
@@ -252,7 +252,7 @@ async def sw_confirm_saved(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         # fall through to credential collection
         if target_ex == "blofin":
-            await update.effective_chat.send_message("🟦 Send your Blofin *API Key*:", parse_mode="Markdown")
+            await update.effective_chat.send_message("🟧 Send your Blofin *API Key*:", parse_mode="Markdown")
             return SW_BF_KEY
         await update.effective_chat.send_message("🟩 Send your *Account Address* (0x...):", parse_mode="Markdown")
         return SW_HL_ADDR
