@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 from src.config.settings import Config, StrategyPreset
 from src.exchange.adapter import build_adapter
+from src.exchange.errors import InstrumentNotAvailableError
 from src.exchange.hyperliquid import HyperliquidClient
 from src.exchange.position_manager import OrderSubmissionError
 from src.parser.classifier import MessageType, classify
@@ -428,16 +429,29 @@ class Pipeline:
             )
         except (ValueError, KeyError) as e:
             if auto_execute:
-                logger.error("Trade #%d order build failed: %s", signal.trade_id, e)
+                # Distinguish "coin not on this venue" (Rec #3) from a real
+                # sizing/rounding bug, so the audit row + Telegram alert say
+                # plainly what happened (TON-USDT on the Blofin demo, #2273).
+                if isinstance(e, InstrumentNotAvailableError):
+                    reason = (
+                        f"{signal.pair} not listed on "
+                        f"{self._config.exchange.exchange} "
+                        f"{self._config.exchange.network} — signal skipped "
+                        f"(coin not available on this venue)"
+                    )
+                    logger.warning("Trade #%d skipped — %s", signal.trade_id, reason)
+                else:
+                    reason = f"order build failed: {e}"
+                    logger.error("Trade #%d order build failed: %s", signal.trade_id, e)
                 self._record_event(
                     trade_id=signal.trade_id,
                     event_type=EventType.ERROR,
                     raw_text=raw,
-                    action_taken=f"order build failed: {e}",
+                    action_taken=reason,
                 )
                 if self._notifier:
                     self._notify(self._notifier.notify_signal_skipped(
-                        signal.trade_id, signal.pair, str(e),
+                        signal.trade_id, signal.pair, reason,
                     ))
                 return
             logger.info("Trade #%d order build failed but recording as PENDING (auto_execute=OFF): %s", signal.trade_id, e)

@@ -147,7 +147,11 @@ class TestValidation:
             build_blofin_orders(_signal(), 500.0, META, tp_split=[0.5, 0.5])
 
     def test_missing_instrument_raises(self):
-        with pytest.raises(ValueError, match="not found in Blofin metadata"):
+        # Distinct type (Rec #3) so the pipeline can tell "coin not on this
+        # venue" apart from a sizing bug — still a ValueError subclass, so the
+        # existing build-failure handling keeps catching it.
+        from src.exchange.errors import InstrumentNotAvailableError
+        with pytest.raises(InstrumentNotAvailableError, match="not found in Blofin metadata"):
             build_blofin_orders(_signal(pair="FAKE/USDT"), 500.0, META)
 
     def test_inst_id_and_coin(self):

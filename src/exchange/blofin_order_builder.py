@@ -27,6 +27,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.exchange.errors import InstrumentNotAvailableError
 from src.parser.signal_parser import ParsedSignal, Side
 from src.utils.symbol_mapper import potion_to_blofin
 
@@ -137,7 +138,9 @@ def build_blofin_orders(
 
     inst_id = potion_to_blofin(signal.pair)
     if inst_id not in instruments_meta:
-        raise ValueError(f"Instrument '{inst_id}' not found in Blofin metadata")
+        raise InstrumentNotAvailableError(
+            f"Instrument '{inst_id}' not found in Blofin metadata"
+        )
 
     meta = instruments_meta[inst_id]
     contract_value = float(meta["contractValue"])

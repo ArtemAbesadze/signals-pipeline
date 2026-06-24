@@ -2423,3 +2423,32 @@ class TestReconcilePositions:
             "closed": [], "canceled": [], "verified": [2271], "orphans": []})
         pipeline.reconcile_positions()
         assert pipeline._db.get_events_for_trade(2271) == []
+
+
+class TestUnavailableSymbol:
+    """Rec #3: a coin not listed on the active venue is skipped with a clear,
+    distinct audit row + Telegram alert (TON-USDT on the Blofin demo, #2273) —
+    not lumped in with generic 'order build failed' sizing/rounding errors."""
+
+    def test_unavailable_coin_skipped_with_clear_message(self, pipeline, db):
+        from unittest.mock import AsyncMock
+        from src.exchange.errors import InstrumentNotAvailableError
+        from src.state.models import EventType
+
+        notifier = AsyncMock()
+        pipeline._notifier = notifier
+        pipeline._adapter.build_trade_set = MagicMock(
+            side_effect=InstrumentNotAvailableError(
+                "Instrument 'ADA-USDT' not found in Blofin metadata"))
+
+        pipeline.process_message(_load("signal_alert_06.txt"))  # ADA/USDT #1259
+
+        assert db.get_trade(1259) is None or db.get_trade(1259).status != TradeStatus.OPEN
+        errs = [e for e in db.get_events_for_trade(1259)
+                if e.event_type == EventType.ERROR]
+        assert errs, "expected an ERROR audit row for the skipped signal"
+        msg = errs[-1].action_taken
+        assert "not listed on" in msg and "not available on this venue" in msg
+        # And the Telegram alert carried that same clear reason.
+        assert notifier.notify_signal_skipped.called
+        assert "not listed on" in notifier.notify_signal_skipped.call_args[0][2]
