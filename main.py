@@ -200,6 +200,14 @@ async def run(config: Config) -> None:
         )
     )
 
+    # --- Start position reconciliation sweeper (recommendation #2) ---
+    # Periodic D10/D11 safety net: re-reads real positions from the exchange
+    # and reconciles the DB, so a missed/delayed CP close (laptop sleep,
+    # dropped DM) can't leave a trade stale-open. Runs regardless of Telegram.
+    from src.reconciliation_sweeper import ReconciliationSweeper
+    reconciliation_sweeper = ReconciliationSweeper(orchestrator=orchestrator)
+    await reconciliation_sweeper.start()
+
     # --- Run ---
     adapter_task = asyncio.create_task(adapter.start())
 
@@ -227,6 +235,7 @@ async def run(config: Config) -> None:
             await asyncio.wait_for(backup_task, timeout=5.0)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             backup_task.cancel()
+        await reconciliation_sweeper.stop()
         if pnl_monitor:
             await pnl_monitor.stop()
         if confirmation_sweeper:

@@ -2382,3 +2382,44 @@ class TestPipelineKeepsRunning:
         from src.pipeline import _truncate
         s = "short reason"
         assert _truncate(s) == s
+
+
+class TestReconcilePositions:
+    """Pipeline.reconcile_positions (recommendation #2) wraps sync_positions
+    and writes an audit row for every trade it transitions, so a reconciled
+    close is traceable rather than an unexplained status flip."""
+
+    def _seed(self, db, trade_id, status=TradeStatus.OPEN):
+        from src.state.models import TradeRecord
+        db.create_trade(TradeRecord(
+            trade_id=trade_id, user_id=db.user_id, pair="ADA/USDT", coin="ADA",
+            side="SHORT", risk_level="LOW", trade_type="POSITION", size_hint="1-4%",
+            entry_price=0.16, stop_loss=0.17, tp1=0.15, tp2=0.14, tp3=0.13,
+            leverage=10, signal_leverage=10, position_size_usd=40.0,
+            position_size_coin=250.0,
+        ))
+        db.update_trade_status(trade_id, status)
+
+    def test_writes_audit_rows_for_reconciled_trades(self, pipeline, db):
+        from src.state.models import EventType
+        self._seed(db, 2262)
+        self._seed(db, 2300)
+        pipeline._pm.sync_positions = MagicMock(return_value={
+            "closed": [2262], "canceled": [2300], "verified": [], "orphans": []})
+
+        summary = pipeline.reconcile_positions()
+
+        assert summary["closed"] == [2262]
+        closed_ev = pipeline._db.get_events_for_trade(2262)
+        assert any(e.event_type == EventType.TRADE_CLOSED
+                   and "reconciled" in (e.action_taken or "") for e in closed_ev)
+        canceled_ev = pipeline._db.get_events_for_trade(2300)
+        assert any(e.event_type == EventType.CANCEL
+                   and "reconciled" in (e.action_taken or "") for e in canceled_ev)
+
+    def test_noop_writes_no_events(self, pipeline, db):
+        self._seed(db, 2271)
+        pipeline._pm.sync_positions = MagicMock(return_value={
+            "closed": [], "canceled": [], "verified": [2271], "orphans": []})
+        pipeline.reconcile_positions()
+        assert pipeline._db.get_events_for_trade(2271) == []

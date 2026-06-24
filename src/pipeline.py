@@ -180,6 +180,39 @@ class Pipeline:
         """
         self._config = new_config
 
+    def reconcile_positions(self) -> dict[str, list]:
+        """Periodic safety net (D10/D11): re-read real positions from the
+        exchange and reconcile the local DB.
+
+        CP lifecycle messages can be missed/delayed (laptop sleep, dropped
+        DMs), which silently leaves a trade OPEN locally after the exchange has
+        already closed it — ADA #2262 (2026-06-19) closed on Blofin but stayed
+        'open' in our DB for days because no startup sync ran in between and the
+        final close message never arrived. The bot only reconciled at startup
+        and on CP events; this method is the missing between-events sync.
+
+        Delegates the state diff to ``sync_positions`` (same logic as startup
+        sync) and writes an audit row for every trade it transitions, so a
+        reconciled close is traceable in trade_events instead of looking like an
+        unexplained status flip. Blocking HTTP — callers run it off-thread.
+        Returns the sync summary.
+        """
+        summary = self._pm.sync_positions()
+        for trade_id in summary.get("closed", []):
+            self._record_event(
+                trade_id=trade_id, event_type=EventType.TRADE_CLOSED, raw_text=None,
+                action_taken="reconciled from exchange: position gone, no local close event",
+            )
+        for trade_id in summary.get("canceled", []):
+            self._record_event(
+                trade_id=trade_id, event_type=EventType.CANCEL, raw_text=None,
+                action_taken="reconciled from exchange: no resting order or position",
+            )
+        moved = len(summary.get("closed", [])) + len(summary.get("canceled", []))
+        if moved:
+            logger.info("Reconcile: transitioned %d trade(s) from exchange state", moved)
+        return summary
+
     def process_message(self, raw_message: str) -> None:
         """Classify and process a single raw message.
 
