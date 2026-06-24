@@ -404,9 +404,16 @@ class PositionManager:
         )
 
     def move_stop_loss(self, trade_id: int, coin: str, new_price: float) -> bool:
-        """Cancel the existing SL and place a new one at *new_price*.
+        """Move the SL to *new_price* without leaving the position unprotected.
 
-        Returns True if the new SL was placed, False otherwise.
+        Mirrors the BlofinPositionManager guards (ADA #2262, 2026-06-19):
+          1. Idempotent — if the active SL is already at *new_price*, do nothing
+             (a duplicate breakeven message must not trigger a destructive
+             re-move).
+          2. Place the NEW SL first; only cancel the old one once the new is
+             accepted. A rejected replacement leaves the existing stop in place.
+             Both are reduce-only during the brief overlap, so a trigger can
+             never over-close the position.
         """
         orders = self._db.get_orders_for_trade(trade_id)
         sl_order = next(
@@ -417,20 +424,15 @@ class PositionManager:
             logger.warning("No active SL found for trade #%d to move", trade_id)
             return False
 
-        # Cancel old SL
-        try:
-            # HL SDK expects an int oid; DB stores it as TEXT.
-            self._client.exchange.cancel(coin, int(sl_order.oid))
-            self._db.update_order_status(sl_order.oid, OrderStatus.CANCELED)
-            logger.info("Canceled old SL oid=%s for trade #%d", sl_order.oid, trade_id)
-        except Exception as e:
-            logger.error("Failed to cancel old SL oid=%s: %s", sl_order.oid, e)
-            return False
+        # (1) Idempotent — already at target → no-op.
+        if sl_order.price is not None and abs(sl_order.price - new_price) <= abs(new_price) * 1e-6:
+            logger.info("SL for trade #%d already at %.6f — no move needed", trade_id, new_price)
+            return True
 
         # Determine direction: if original SL was a BUY (closing a short), new one is also BUY
         is_buy = sl_order.side == "BUY"
 
-        # Place new SL at the requested price
+        # (2) Place the NEW SL FIRST. If rejected, the old SL stays live.
         new_sl = OrderParams(
             coin=coin,
             is_buy=is_buy,
@@ -445,9 +447,27 @@ class PositionManager:
             },
             reduce_only=True,
         )
-        oid = self._submit_and_record(trade_id, OrderType.STOP_LOSS, new_sl, coin)
+        new_oid = self._submit_and_record(trade_id, OrderType.STOP_LOSS, new_sl, coin)
+        if new_oid is None:
+            logger.warning(
+                "SL move to %.6f for trade #%d rejected — keeping existing SL "
+                "(position still protected)", new_price, trade_id,
+            )
+            return False
+
+        # (3) New SL is live → cancel the old one (best-effort; two reduce-only
+        #     SLs are safe). HL SDK expects an int oid; DB stores it as TEXT.
+        try:
+            self._client.exchange.cancel(coin, int(sl_order.oid))
+            self._db.update_order_status(sl_order.oid, OrderStatus.CANCELED)
+        except Exception as e:
+            logger.error(
+                "New SL placed for trade #%d but cancel of old SL oid=%s failed: "
+                "%s (two reduce-only SLs live)", trade_id, sl_order.oid, e,
+            )
+
         logger.info("Moved SL to %.6f for trade #%d", new_price, trade_id)
-        return oid is not None
+        return True
 
     def move_sl_to_breakeven(self, trade_id: int, coin: str, entry_price: float) -> bool:
         """Convenience wrapper — move SL to the entry price."""
@@ -476,7 +496,9 @@ class PositionManager:
         error = _get_error(result)
         if error:
             logger.error("Order %s rejected for #%d: %s", order_type.value, trade_id, error)
-            self._db.update_order_status(row_id, OrderStatus.REJECTED)
+            # Mark by row id — a rejected order has no exchange oid, so
+            # update_order_status (keyed on oid) would silently no-op.
+            self._db.set_order_status_by_row(row_id, OrderStatus.REJECTED)
             return None
 
         oid = _extract_oid(result)

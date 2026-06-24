@@ -217,6 +217,7 @@ class BlofinPositionManager:
         err = _result_error(result)
         if err:
             logger.error("TPSL %s rejected for #%d: %s", order_type.value, trade_id, err)
+            self._db.set_order_status_by_row(row, OrderStatus.REJECTED)
             return None
         tid = tpsl_id_of(result)
         if tid:
@@ -274,19 +275,21 @@ class BlofinPositionManager:
         self._db.update_trade_status(trade_id, TradeStatus.CLOSED, close_reason=reason)
 
     def move_stop_loss(self, trade_id: int, coin: str, new_price: float) -> bool:
-        """Move the SL conditional to *new_price* without leaving the position
-        unprotected.
+        """Move the SL conditional to *new_price* without ever leaving the
+        position unprotected.
 
-        Blofin rejects an SL whose trigger is on the wrong side of the current
-        price (a long's SL must be below market, a short's above). The old
-        cancel-then-place order meant a rejected new SL left the position with
-        NO stop (2026-06-05 soak: a breakeven move while price had crossed back
-        past entry). Guards:
-          1. Pre-validate the new price against the current market; if it would
-             be rejected, keep the existing SL untouched and return False.
-          2. If the new SL is still rejected after the old was canceled,
-             re-instate the original SL and alert (CRITICAL) — never silently
-             leave the position uncovered.
+        Two things burned us on ADA #2262 (2026-06-19): a *duplicate* breakeven
+        message re-moved an already-at-BE SL, and by then the market had crossed
+        the level so the replacement was rejected — the old cancel-first ordering
+        had already removed the existing SL, leaving the position with NO stop
+        (and the re-instate, using the same now-invalid price, also failed).
+
+        Guards:
+          1. Idempotent — if the active SL is already at *new_price*, do nothing.
+          2. Place the NEW SL first; only cancel the old one once the new is
+             accepted. A rejected replacement leaves the existing SL untouched.
+             During the brief overlap both SLs are reduce-only, so a trigger can
+             never over-close the position.
         """
         sl = next(
             (o for o in self._db.get_orders_for_trade(trade_id)
@@ -298,7 +301,14 @@ class BlofinPositionManager:
             return False
         inst = sl.coin
 
-        # (1) Pre-validate — don't cancel a working SL for a doomed replacement.
+        # (1) Idempotent — already at target → no-op. Kills the destructive
+        #     re-move a duplicate breakeven message would otherwise trigger.
+        if sl.price is not None and abs(sl.price - new_price) <= abs(new_price) * 1e-6:
+            logger.info("SL for #%d already at %s — no move needed", trade_id, new_price)
+            return True
+
+        # (2) Fast skip if the new level is plainly on the wrong side of market
+        #     (saves a doomed place + a rejected row). Best-effort.
         if not self._sl_price_valid(inst, sl.side, new_price):
             logger.warning(
                 "SL move to %s for #%d skipped — Blofin would reject it (price "
@@ -307,37 +317,38 @@ class BlofinPositionManager:
             )
             return False
 
+        # (3) Place the NEW SL FIRST. If rejected, the old SL is still live —
+        #     the position is never left uncovered.
+        params = BlofinTpslParams(
+            inst_id=inst, side=sl.side, size=sl.size, sl_trigger_price=new_price,
+        )
+        new_tid = self._submit_tpsl(trade_id, OrderType.STOP_LOSS, params)
+        if new_tid is None:
+            logger.warning(
+                "SL move to %s for #%d rejected — keeping existing SL @ %s "
+                "(position still protected)", new_price, trade_id, sl.price,
+            )
+            return False
+
+        # (4) New SL is live → cancel the old. If the cancel fails we briefly
+        #     hold two reduce-only SLs (safe — neither can over-close); log it.
         try:
             res = self._client.cancel_tpsl(inst, sl.oid)
             if response_ok(res) or _cancel_benign(res):
                 self._db.update_order_status(sl.oid, OrderStatus.CANCELED)
             else:
-                logger.error("Failed to cancel old SL tpsl %s: %s", sl.oid, response_error(res))
-                return False
-        except Exception as e:
-            logger.error("Error canceling old SL %s: %s", sl.oid, e)
-            return False
-
-        params = BlofinTpslParams(
-            inst_id=inst, side=sl.side, size=sl.size, sl_trigger_price=new_price,
-        )
-        tid = self._submit_tpsl(trade_id, OrderType.STOP_LOSS, params)
-        if tid is None:
-            # (2) New SL rejected after the old is gone — re-instate the original.
-            logger.critical(
-                "SL move for #%d: new SL @ %s REJECTED after canceling old — "
-                "re-instating original SL @ %s", trade_id, new_price, sl.price,
-            )
-            reinstate = BlofinTpslParams(
-                inst_id=inst, side=sl.side, size=sl.size, sl_trigger_price=sl.price,
-            )
-            if self._submit_tpsl(trade_id, OrderType.STOP_LOSS, reinstate) is None:
-                logger.critical(
-                    "SL move for #%d: re-instate of original SL ALSO failed — "
-                    "POSITION UNPROTECTED, manual action required", trade_id,
+                logger.error(
+                    "New SL %s placed for #%d but cancel of old SL %s failed: %s "
+                    "(two reduce-only SLs live)",
+                    new_tid, trade_id, sl.oid, response_error(res),
                 )
-            return False
-        logger.info("Moved SL to %s for #%d (tpslId=%s)", new_price, trade_id, tid)
+        except Exception as e:
+            logger.error(
+                "New SL %s placed for #%d but error canceling old SL %s: %s "
+                "(two reduce-only SLs live)", new_tid, trade_id, sl.oid, e,
+            )
+
+        logger.info("Moved SL to %s for #%d (tpslId=%s)", new_price, trade_id, new_tid)
         return True
 
     def _sl_price_valid(self, inst: str, side: str, new_price: float) -> bool:

@@ -230,22 +230,52 @@ class TestMoveSl:
                if o.order_type == OrderType.STOP_LOSS]
         assert all(o.status == OrderStatus.SUBMITTED for o in sls)  # still protected
 
-    def test_be_reinstates_old_sl_when_new_rejected(self, pm, db, client):
-        # Valid price, but the new SL is rejected after the old is canceled →
-        # the original SL must be re-instated (never leave it unprotected).
+    def test_new_sl_rejected_keeps_old_sl(self, pm, db, client):
+        # Price passes the fast pre-check but the venue still rejects the new SL.
+        # Place-then-cancel means the old SL is never touched — position stays
+        # protected (ADA #2262 fix; replaces the old cancel-then-reinstate path).
         ts = _seed_trade(db, status=TradeStatus.OPEN)
         pm.submit_trade(ts)
-        client.place_tpsl.reset_mock()
-        results = iter([
-            {"code": "0", "data": {"code": "9999", "msg": "rejected"}},  # new SL rejected
-            {"code": "0", "data": {"tpslId": "T_REINSTATE", "code": "0"}},  # re-instate ok
-        ])
-        client.place_tpsl.side_effect = lambda **k: next(results)
+        client.cancel_tpsl.reset_mock()
+        client.place_tpsl.side_effect = lambda **k: {
+            "code": "0", "data": {"code": "9999", "msg": "rejected"}}  # new SL rejected
         assert pm.move_sl_to_breakeven(7000001, "BTC", 50000.0) is False
-        assert client.place_tpsl.call_count == 2      # new attempt + re-instate
+        client.cancel_tpsl.assert_not_called()          # old SL never canceled
         sls = [o for o in db.get_orders_for_trade(7000001)
                if o.order_type == OrderType.STOP_LOSS]
-        assert any(o.status == OrderStatus.SUBMITTED and o.oid == "T_REINSTATE" for o in sls)
+        # original SL still live; the rejected attempt is marked REJECTED (no orphan)
+        assert any(o.status == OrderStatus.SUBMITTED and o.oid == "T_SL" for o in sls)
+        assert any(o.status == OrderStatus.REJECTED for o in sls)
+
+    def test_duplicate_breakeven_is_noop(self, pm, db, client):
+        # The exact ADA #2262 scenario: a 2nd breakeven message must NOT re-move
+        # an already-at-BE SL (the old code canceled it, then failed to replace
+        # it, leaving the position unprotected). Idempotent → no API calls.
+        ts = _seed_trade(db, status=TradeStatus.OPEN)
+        pm.submit_trade(ts)
+        client.place_tpsl.side_effect = lambda **k: {
+            "code": "0", "data": {"tpslId": "T_BE", "code": "0"}}
+        assert pm.move_sl_to_breakeven(7000001, "BTC", 50000.0) is True   # 1st move
+        client.place_tpsl.reset_mock()
+        client.cancel_tpsl.reset_mock()
+        assert pm.move_sl_to_breakeven(7000001, "BTC", 50000.0) is True   # 2nd (dup)
+        client.place_tpsl.assert_not_called()           # no destructive re-move
+        client.cancel_tpsl.assert_not_called()
+
+    def test_new_sl_placed_before_old_canceled(self, pm, db, client):
+        # Ordering guarantee: the new SL is placed BEFORE the old is canceled,
+        # so there is never a window without a stop on the book.
+        ts = _seed_trade(db, status=TradeStatus.OPEN)
+        pm.submit_trade(ts)
+        calls = []
+        client.place_tpsl.side_effect = lambda **k: (
+            calls.append("place"),
+            {"code": "0", "data": {"tpslId": "T_NEW_SL", "code": "0"}})[1]
+        client.cancel_tpsl.side_effect = lambda *a, **k: (
+            calls.append("cancel"),
+            {"code": "0", "data": [{"tpslId": "T", "code": "0"}]})[1]
+        assert pm.move_sl_to_breakeven(7000001, "BTC", 50000.0) is True
+        assert calls == ["place", "cancel"]   # place first, then cancel
 
 
 class TestSync:

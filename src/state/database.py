@@ -461,6 +461,22 @@ class TradeDatabase:
                 (str(oid), now, row_id, self._user_id),
             )
 
+    def set_order_status_by_row(self, row_id: int, status: OrderStatus) -> None:
+        """Set an order's status by its row id.
+
+        Needed for orders that never got an exchange oid — e.g. a TP/SL
+        conditional the venue rejected. ``update_order_status`` keys on oid,
+        which a rejected order doesn't have, so it would silently no-op and
+        leave the row stuck at ``submitted`` (the orphan rows seen on ADA
+        #2262, 2026-06-19)."""
+        now = _now()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE orders SET status = ?, updated_at = ? "
+                "WHERE id = ? AND user_id = ?",
+                (status.value, now, row_id, self._user_id),
+            )
+
     def get_orders_for_trade(self, trade_id: int) -> list[OrderRecord]:
         """Return all orders associated with a trade."""
         rows = self._conn.execute(
