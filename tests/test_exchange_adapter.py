@@ -202,6 +202,17 @@ class TestRealFillPrice:
         a = BlofinAdapter(blofin_client, db)
         assert a.real_fill_price("INJ-USDT", 7000001, _OT("tp2")) is None  # state=live
 
+    def test_blofin_moved_sl_suffix_matches(self, blofin_client, db):
+        # A breakeven-moved SL is placed as potion_{id}_stop_loss_{n} (the
+        # unique-clientOrderId fix, 2026-06-26). Its real fill price must still
+        # resolve for order_type stop_loss via the suffix-aware match.
+        blofin_client.get_orders_history.return_value = [
+            {"clientOrderId": "", "algoClientOrderId": "potion_7000001_stop_loss_1",
+             "averagePrice": "4.901", "state": "filled"},
+        ]
+        a = BlofinAdapter(blofin_client, db)
+        assert a.real_fill_price("INJ-USDT", 7000001, _OT("stop_loss")) == 4.901
+
     def test_blofin_no_match_returns_none(self, blofin_client, db):
         blofin_client.get_orders_history.return_value = _ORDERS_HISTORY
         a = BlofinAdapter(blofin_client, db)

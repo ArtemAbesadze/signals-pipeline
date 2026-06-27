@@ -201,7 +201,10 @@ class BlofinAdapter(ExchangeAdapter):
             if str(row.get("state")) != "filled":
                 continue
             coid = row.get("clientOrderId") or row.get("algoClientOrderId") or ""
-            if coid != target:
+            # Exact, or a suffixed variant — a moved SL is placed as
+            # ``potion_{id}_stop_loss_{n}`` (unique-clientOrderId fix), so its
+            # real fill price still resolves here.
+            if coid != target and not coid.startswith(target + "_"):
                 continue
             try:
                 px = float(row.get("averagePrice"))

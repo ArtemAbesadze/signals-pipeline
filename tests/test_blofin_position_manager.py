@@ -277,6 +277,23 @@ class TestMoveSl:
         assert pm.move_sl_to_breakeven(7000001, "BTC", 50000.0) is True
         assert calls == ["place", "cancel"]   # place first, then cancel
 
+    def test_sl_move_uses_unique_client_order_id(self, pm, db, client):
+        # Regression (48h soak, 2026-06-26): the replacement SL reused the
+        # original's clientOrderId → Blofin "Duplicate customized order ID" →
+        # every breakeven move failed. The move must use a UNIQUE id, with the
+        # potion_{id}_ prefix preserved so D11 read-back still joins.
+        ts = _seed_trade(db, status=TradeStatus.OPEN)
+        pm.submit_trade(ts)
+        seen = []
+        def _place(**k):
+            seen.append(k.get("client_order_id"))
+            return {"code": "0", "data": {"tpslId": f"T_{len(seen)}", "code": "0"}}
+        client.place_tpsl.side_effect = _place   # only the move goes through this
+        assert pm.move_sl_to_breakeven(7000001, "BTC", 50000.0) is True
+        moved_cloid = seen[-1]
+        assert moved_cloid != "potion_7000001_stop_loss"           # not reused
+        assert moved_cloid.startswith("potion_7000001_stop_loss")  # prefix kept (D11)
+
 
 class TestSync:
     def test_open_no_position_closed(self, pm, db, client):

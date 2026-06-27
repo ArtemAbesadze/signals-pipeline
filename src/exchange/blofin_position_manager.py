@@ -199,9 +199,18 @@ class BlofinPositionManager:
 
         return True
 
-    def _submit_tpsl(self, trade_id: int, order_type: OrderType, params: BlofinTpslParams) -> str | None:
+    def _submit_tpsl(
+        self, trade_id: int, order_type: OrderType, params: BlofinTpslParams,
+        client_order_id: str | None = None,
+    ) -> str | None:
         """Place one TP/SL conditional and record it. SL/TP rejection is
-        logged but does not abort the trade (mirrors HL)."""
+        logged but does not abort the trade (mirrors HL).
+
+        ``client_order_id`` overrides the default ``potion_{id}_{type}`` label —
+        used by ``move_stop_loss`` to give a replacement SL a UNIQUE id (Blofin
+        rejects a duplicate clientOrderId while the old order still exists). The
+        override keeps the ``potion_{id}_`` prefix so D11 read-back still joins.
+        """
         price = params.tp_trigger_price if params.tp_trigger_price is not None else params.sl_trigger_price
         row = self._db.record_order(
             trade_id, order_type, params.inst_id, params.side, params.size, price or 0.0,
@@ -212,7 +221,7 @@ class BlofinPositionManager:
             sl_trigger_price=params.sl_trigger_price,
             margin_mode=params.margin_mode, position_side=params.position_side,
             reduce_only=params.reduce_only,
-            client_order_id=f"potion_{trade_id}_{order_type.value}",
+            client_order_id=client_order_id or f"potion_{trade_id}_{order_type.value}",
         )
         err = _result_error(result)
         if err:
@@ -290,9 +299,15 @@ class BlofinPositionManager:
              accepted. A rejected replacement leaves the existing SL untouched.
              During the brief overlap both SLs are reduce-only, so a trigger can
              never over-close the position.
+          3. The replacement SL gets a UNIQUE clientOrderId
+             (``potion_{id}_stop_loss_{n}``) — reusing the original's id made
+             Blofin reject the placement with "Duplicate customized order ID"
+             while the old SL still existed, so every breakeven move failed
+             (the 48h soak, 2026-06-26).
         """
+        orders = self._db.get_orders_for_trade(trade_id)
         sl = next(
-            (o for o in self._db.get_orders_for_trade(trade_id)
+            (o for o in orders
              if o.order_type == OrderType.STOP_LOSS and o.status == OrderStatus.SUBMITTED),
             None,
         )
@@ -300,6 +315,11 @@ class BlofinPositionManager:
             logger.warning("No active SL conditional for #%d to move", trade_id)
             return False
         inst = sl.coin
+        # Unique id for the replacement; count ALL prior SL rows (incl. canceled
+        # /rejected) so it stays unique across repeated moves. Prefix preserved
+        # → D11 read-back still joins.
+        sl_seq = sum(1 for o in orders if o.order_type == OrderType.STOP_LOSS)
+        new_cloid = f"potion_{trade_id}_stop_loss_{sl_seq}"
 
         # (1) Idempotent — already at target → no-op. Kills the destructive
         #     re-move a duplicate breakeven message would otherwise trigger.
@@ -322,7 +342,9 @@ class BlofinPositionManager:
         params = BlofinTpslParams(
             inst_id=inst, side=sl.side, size=sl.size, sl_trigger_price=new_price,
         )
-        new_tid = self._submit_tpsl(trade_id, OrderType.STOP_LOSS, params)
+        new_tid = self._submit_tpsl(
+            trade_id, OrderType.STOP_LOSS, params, client_order_id=new_cloid,
+        )
         if new_tid is None:
             logger.warning(
                 "SL move to %s for #%d rejected — keeping existing SL @ %s "
