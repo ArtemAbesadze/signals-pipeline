@@ -61,3 +61,29 @@ async def test_sweep_noop_when_nothing_moved():
     moved = await sw.sweep_once()
     assert moved == {}
     pipeline.reconcile_positions.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_runs_on_calling_thread():
+    # Regression (48h soak, 2026-06-26): the sweeper offloaded reconcile to a
+    # worker thread (asyncio.to_thread), but the pipeline's SQLite connection is
+    # bound to the event-loop thread → sqlite3.ProgrammingError every tick, so
+    # reconciliation never ran. Reconcile must execute on the calling thread.
+    import threading
+    main_tid = threading.get_ident()
+    seen = {}
+
+    def _reconcile():
+        seen["tid"] = threading.get_ident()
+        return {"closed": [], "canceled": [], "verified": [], "orphans": []}
+
+    pipeline = MagicMock()
+    pipeline.reconcile_positions.side_effect = _reconcile
+    ctx = MagicMock()
+    ctx.pipeline = pipeline
+    ctx.paused = False
+    orch = MagicMock()
+    orch.pipelines = {"u1": ctx}
+
+    await ReconciliationSweeper(orchestrator=orch).sweep_once()
+    assert seen["tid"] == main_tid   # ran inline, not in a worker thread

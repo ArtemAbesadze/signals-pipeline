@@ -60,16 +60,20 @@ class ReconciliationSweeper:
     async def sweep_once(self) -> dict[str, int]:
         """One reconciliation pass across all active pipelines.
 
-        Each pipeline's ``reconcile_positions`` is blocking HTTP — run it in a
-        worker thread so the event loop (and message processing) stays live.
-        Returns a per-user count of trades transitioned (closed + canceled).
+        ``reconcile_positions`` is called INLINE (not via a worker thread): the
+        pipeline's SQLite connection is bound to this event-loop thread, so
+        offloading to ``asyncio.to_thread`` raised ``sqlite3.ProgrammingError``
+        on every tick (the 48h soak, 2026-06-26 — the sweeper never actually
+        ran). The blocking exchange reads (~1-3s every 5 min) are the same shape
+        PnLMonitor already runs inline. Returns a per-user count of trades
+        transitioned (closed + canceled).
         """
         moved: dict[str, int] = {}
         for user_id, ctx in list(self._orchestrator.pipelines.items()):
             if ctx.paused:
                 continue
             try:
-                summary = await asyncio.to_thread(ctx.pipeline.reconcile_positions)
+                summary = ctx.pipeline.reconcile_positions()
             except Exception:
                 logger.exception(
                     "ReconciliationSweeper: reconcile failed for user %s", user_id,
